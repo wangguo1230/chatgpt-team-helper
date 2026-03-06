@@ -427,7 +427,7 @@ const isGroupExpanded = (key: string) => {
   transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
-/* 内容进入动画 */
+/* 内容进入动画 — 使用 backwards 而非 forwards，避免动画结束后残留 transform 破坏后代 sticky 定位 */
 @keyframes fadeInUp {
   from {
     opacity: 0;
@@ -440,7 +440,7 @@ const isGroupExpanded = (key: string) => {
 }
 
 .animate-fade-in-up {
-  animation: fadeInUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: fadeInUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 
 /* 隐藏滚动条但保留功能 (可选) */

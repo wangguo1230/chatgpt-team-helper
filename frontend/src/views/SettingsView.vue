@@ -29,10 +29,21 @@ import {
 } from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnnouncementAdminPanel from '@/components/AnnouncementAdminPanel.vue'
-import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw } from 'lucide-vue-next'
+import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw, Settings, CreditCard, Link, Mail, Shield } from 'lucide-vue-next'
 
 const teleportReady = ref(false)
 const activeTab = ref<'settings' | 'announcements'>('settings')
+const settingsSubTab = ref('general')
+
+const settingsNav = [
+  { id: 'general', label: '基础设置', desc: '功能开关、白名单与补录', icon: Settings },
+  { id: 'billing', label: '支付与财务', desc: '商品、支付通道与提现', icon: CreditCard },
+  { id: 'integrations', label: '第三方集成', desc: 'OAuth、验证与机器人', icon: Link },
+  { id: 'notifications', label: '邮件与通知', desc: 'SMTP 告警邮件配置', icon: Mail },
+  { id: 'security', label: '核心与安全', desc: 'API 密钥与渠道管理', icon: Shield },
+]
+
+const activeNavItem = computed(() => settingsNav.find(n => n.id === settingsSubTab.value))
 
 // 版本检查相关
 const versionLoading = ref(false)
@@ -439,6 +450,20 @@ const toggleChannelActive = async (channel: Channel) => {
   }
 }
 
+const deleteChannel = async (channel: Channel) => {
+  if (!confirm(`确定要删除渠道「${channel.name || channel.key}」吗？此操作不可撤销。`)) return
+  channelsError.value = ''
+  channelsSuccess.value = ''
+  try {
+    await adminService.deleteChannel(channel.key)
+    await loadChannels()
+    channelsSuccess.value = '已删除'
+    setTimeout(() => (channelsSuccess.value = ''), 3000)
+  } catch (err: any) {
+    channelsError.value = err.response?.data?.error || '删除失败'
+  }
+}
+
 const loadPurchaseProducts = async () => {
   if (purchaseProductsLoading.value) return
   purchaseProductsLoading.value = true
@@ -540,16 +565,17 @@ const togglePurchaseProductActive = async (product: PurchaseProduct) => {
   }
 }
 
-const disablePurchaseProduct = async (product: PurchaseProduct) => {
+const deletePurchaseProduct = async (product: PurchaseProduct) => {
+  if (!confirm(`确定要删除商品「${product.productName || product.productKey}」吗？此操作不可撤销。`)) return
   purchaseProductsError.value = ''
   purchaseProductsSuccess.value = ''
   try {
     await adminService.deletePurchaseProduct(product.productKey)
     await Promise.all([loadPurchaseProducts(), loadPurchaseAvailability()])
-    purchaseProductsSuccess.value = '已下架'
+    purchaseProductsSuccess.value = '已删除'
     setTimeout(() => (purchaseProductsSuccess.value = ''), 3000)
   } catch (err: any) {
-    purchaseProductsError.value = err.response?.data?.error || '下架失败'
+    purchaseProductsError.value = err.response?.data?.error || '删除失败'
   }
 }
 
@@ -1219,7 +1245,6 @@ const savePointsWithdrawSettings = async () => {
     </Dialog>
 
     <TabsContent value="settings" class="mt-0">
-      <div class="grid gap-8 lg:grid-cols-2">
       <!-- 非超级管理员提示 -->
       <Card
         v-if="!isSuperAdmin"
@@ -1231,10 +1256,49 @@ const savePointsWithdrawSettings = async () => {
         </CardHeader>
       </Card>
 
-      <!-- API密钥管理 -->
+      <div v-else class="space-y-6">
+        <!-- 顶部分类导航 (sticky) -->
+        <div class="sticky -top-4 lg:-top-8 z-20 -mx-4 px-4 lg:-mx-8 lg:px-8 pt-4 lg:pt-8 pb-3 bg-[#F5F5F7]/90 backdrop-blur-md border-b border-gray-200/60">
+          <nav class="flex items-center gap-1.5 overflow-x-auto scrollbar-hide -mb-px">
+            <button
+              v-for="nav in settingsNav"
+              :key="nav.id"
+              @click="settingsSubTab = nav.id"
+              class="group relative flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all shrink-0"
+              :class="settingsSubTab === nav.id
+                ? 'text-blue-700 bg-blue-50'
+                : 'text-gray-500 hover:text-gray-800 hover:bg-gray-50'"
+            >
+              <component
+                :is="nav.icon"
+                class="w-4 h-4 shrink-0"
+                :class="settingsSubTab === nav.id ? 'text-blue-600' : 'text-gray-400 group-hover:text-gray-600'"
+              />
+              <span>{{ nav.label }}</span>
+            </button>
+          </nav>
+        </div>
+
+        <!-- 内容区 -->
+        <div class="space-y-6">
+          <!-- 当前分类标题 -->
+          <div class="flex items-center gap-3">
+            <div class="flex items-center justify-center w-9 h-9 rounded-xl bg-blue-50 text-blue-600">
+              <component :is="activeNavItem?.icon" class="w-[18px] h-[18px]" />
+            </div>
+            <div>
+              <h2 class="text-base font-bold text-gray-900">{{ activeNavItem?.label }}</h2>
+              <p class="text-xs text-gray-500">{{ activeNavItem?.desc }}</p>
+            </div>
+          </div>
+
+          <!-- 卡片列表 -->
+          <div class="grid gap-6 lg:grid-cols-2">
+            <template v-if="settingsSubTab === 'security'">
+            <!-- API密钥管理 -->
       <Card
         v-if="isSuperAdmin"
-        class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col"
+        class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2"
       >
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <div class="flex items-center gap-3 mb-1">
@@ -1313,8 +1377,11 @@ const savePointsWithdrawSettings = async () => {
         </CardContent>
       </Card>
 
-      <!-- 邮箱后缀白名单 -->
-      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col">
+            </template>
+
+            <template v-if="settingsSubTab === 'general'">
+            <!-- 邮箱后缀白名单 -->
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">邮箱后缀白名单</CardTitle>
           <CardDescription class="text-gray-500">用于注册时校验邮箱域名（逗号分隔）。留空表示不限制。</CardDescription>
@@ -1514,7 +1581,10 @@ const savePointsWithdrawSettings = async () => {
         </CardContent>
       </Card>
 
-      <!-- 渠道管理 -->
+            </template>
+
+            <template v-if="settingsSubTab === 'security'">
+            <!-- 渠道管理 -->
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">渠道管理</CardTitle>
@@ -1576,6 +1646,9 @@ const savePointsWithdrawSettings = async () => {
                       <Button type="button" variant="outline" class="h-9 px-3 border-gray-200 rounded-xl" @click="toggleChannelActive(channel)">
                         {{ channel.isActive ? '停用' : '启用' }}
                       </Button>
+                      <Button v-if="!channel.isBuiltin" type="button" variant="outline" class="h-9 px-3 border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 rounded-xl" @click="deleteChannel(channel)">
+                        删除
+                      </Button>
                     </div>
                   </td>
                 </tr>
@@ -1588,7 +1661,10 @@ const savePointsWithdrawSettings = async () => {
         </CardContent>
       </Card>
 
-      <!-- 支付商品管理 -->
+            </template>
+
+            <template v-if="settingsSubTab === 'billing'">
+            <!-- 支付商品管理 -->
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">支付商品管理</CardTitle>
@@ -1650,10 +1726,10 @@ const savePointsWithdrawSettings = async () => {
                         编辑
                       </Button>
                       <Button type="button" variant="outline" class="h-9 px-3 border-gray-200 rounded-xl" @click="togglePurchaseProductActive(product)">
-                        {{ product.isActive ? '下架' : '上架' }}
+                        {{ product.isActive ? '停用' : '启用' }}
                       </Button>
-                      <Button type="button" variant="outline" class="h-9 px-3 border-gray-200 rounded-xl" @click="disablePurchaseProduct(product)">
-                        停用
+                      <Button type="button" variant="outline" class="h-9 px-3 border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 rounded-xl" @click="deletePurchaseProduct(product)">
+                        删除
                       </Button>
                     </div>
                   </td>
@@ -1780,7 +1856,10 @@ const savePointsWithdrawSettings = async () => {
         </DialogContent>
       </Dialog>
 
-      <!-- SMTP / 第三方配置 -->
+            </template>
+
+            <template v-if="settingsSubTab === 'notifications'">
+            <!-- SMTP / 第三方配置 -->
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">SMTP 邮件告警配置</CardTitle>
@@ -1911,8 +1990,11 @@ const savePointsWithdrawSettings = async () => {
           </div>
         </CardContent>
       </Card>
+      </template>
 
-      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col">
+      <template v-if="settingsSubTab === 'integrations'">
+      <!-- Linux DO OAuth 配置 -->
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">Linux DO OAuth 配置</CardTitle>
           <CardDescription class="text-gray-500">用于 Linux DO 登录/授权（保存后实时生效）。</CardDescription>
@@ -1996,7 +2078,7 @@ const savePointsWithdrawSettings = async () => {
         </CardContent>
       </Card>
 
-      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col">
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">Linux DO Credit 配置</CardTitle>
           <CardDescription class="text-gray-500">用于 Credit 积分支付/回调验签（保存后实时生效）。</CardDescription>
@@ -2069,7 +2151,9 @@ const savePointsWithdrawSettings = async () => {
           </div>
         </CardContent>
       </Card>
+      </template>
 
+      <template v-if="settingsSubTab === 'billing'">
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">ZPAY 支付配置</CardTitle>
@@ -2155,7 +2239,9 @@ const savePointsWithdrawSettings = async () => {
           </div>
         </CardContent>
       </Card>
+      </template>
 
+      <template v-if="settingsSubTab === 'integrations'">
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">Cloudflare Turnstile 配置</CardTitle>
@@ -2362,7 +2448,9 @@ const savePointsWithdrawSettings = async () => {
           </div>
         </CardContent>
       </Card>
+      </template>
 
+      <template v-if="settingsSubTab === 'billing'">
       <!-- 积分提现设置 -->
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
 	          <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
@@ -2436,6 +2524,9 @@ const savePointsWithdrawSettings = async () => {
             </div>
           </CardContent>
       </Card>
+      </template>
+          </div>
+        </div>
       </div>
     </TabsContent>
 

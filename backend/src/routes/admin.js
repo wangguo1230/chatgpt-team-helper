@@ -3494,15 +3494,7 @@ router.delete('/channels/:key', async (req, res) => {
       return res.status(400).json({ error: '内置渠道不可删除' })
     }
 
-    db.run(
-      `
-        UPDATE channels
-        SET is_active = 0,
-            updated_at = DATETIME('now', 'localtime')
-        WHERE key = ?
-      `,
-      [key]
-    )
+    db.run('DELETE FROM channels WHERE key = ?', [key])
     saveDatabase()
     invalidateChannelsCache()
     return res.json({ ok: true })
@@ -3716,8 +3708,9 @@ router.delete('/purchase-products/:productKey', async (req, res) => {
       return res.status(404).json({ error: '商品不存在' })
     }
 
-    const product = await disablePurchaseProduct(db, productKey)
-    return res.json({ product })
+    db.run('DELETE FROM purchase_products WHERE product_key = ?', [productKey])
+    saveDatabase()
+    return res.json({ ok: true })
   } catch (error) {
     console.error('[Admin] delete purchase-product error:', error)
     return res.status(500).json({ error: 'Internal server error' })

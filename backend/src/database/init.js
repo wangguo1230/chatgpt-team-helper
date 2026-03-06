@@ -32,7 +32,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'code',
     allowCommonFallback: 0,
     isActive: 1,
-    isBuiltin: 1,
+    isBuiltin: 0,
     sortOrder: 20
   },
   {
@@ -68,7 +68,7 @@ const BUILTIN_CHANNELS = [
     redeemMode: 'api',
     allowCommonFallback: 0,
     isActive: 1,
-    isBuiltin: 1,
+    isBuiltin: 0,
     sortOrder: 60
   }
 ]
@@ -1245,6 +1245,12 @@ const ensureChannelsTable = (database) => {
   }
 
   try {
+    const NON_BUILTIN_KEYS = ['paypal', 'artisan-flow']
+    database.run(
+      `UPDATE channels SET is_builtin = 0, updated_at = DATETIME('now', 'localtime') WHERE key IN (${NON_BUILTIN_KEYS.map(() => '?').join(',')}) AND is_builtin = 1`,
+      NON_BUILTIN_KEYS
+    )
+
     for (const channel of BUILTIN_CHANNELS) {
       const existing = database.exec('SELECT id FROM channels WHERE key = ? LIMIT 1', [channel.key])
       if (existing[0]?.values?.length) continue
