@@ -372,6 +372,24 @@ const parseJsonOrThrow = (text, { logContext, message }) => {
 }
 
 /**
+ * 删除指定账号关联的所有未使用兑换码
+ */
+async function deleteUnusedCodesByAccountId(db, accountId) {
+  try {
+    const account = await fetchAccountById(db, accountId)
+    if (account?.email) {
+      db.run(
+        'DELETE FROM redemption_codes WHERE LOWER(TRIM(account_email)) = LOWER(TRIM(?)) AND is_redeemed = 0',
+        [account.email]
+      )
+      console.log(`[AccountSync] 已清理账号 ${account.email} 的所有未使用兑换码`)
+    }
+  } catch (error) {
+    console.error(`[AccountSync] 清理账号 ${accountId} 兑换码失败:`, error)
+  }
+}
+
+/**
  * 标记账号为失效并下架（用于 401 彻底无法修复的场景）
  */
 export const markAccountAsInvalid = async (db, accountId, reason) => {
@@ -388,6 +406,9 @@ export const markAccountAsInvalid = async (db, accountId, reason) => {
     )
     await saveDatabase()
     console.warn(`[AccountSync] 账号已标记为失效并下架: ID=${accountId}, 原因=${reason}`)
+
+    // 清理该账号关联的未使用兑换码
+    await deleteUnusedCodesByAccountId(db, accountId)
 
     // 触发即时邮件告警
     try {
@@ -507,6 +528,9 @@ const throwChatgptApiStatusError = async ({ status, errorText, logContext, label
             )
             await saveDatabase()
             console.warn('[AccountSync] upstream account_deactivated; auto-banned', { accountId })
+
+            // 清理该账号关联的未使用兑换码
+            await deleteUnusedCodesByAccountId(db, accountId)
 
             // 触发即时邮件告警
             try {

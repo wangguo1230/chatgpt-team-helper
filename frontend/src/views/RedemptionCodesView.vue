@@ -85,6 +85,8 @@ const accountsByEmail = computed(() => {
   return map
 })
 
+const activeAccounts = computed(() => accounts.value.filter(account => account.isOpen && !account.isBanned))
+
 const isAccountBanned = (accountEmail?: string | null) => {
   const normalizedEmail = String(accountEmail || '').trim().toLowerCase()
   if (!normalizedEmail) return false
@@ -386,7 +388,7 @@ const truncateText = (text?: string | null, maxLength: number = 20) => {
 
 const openBatchDialog = () => {
   batchCount.value = 10
-  selectedAccountEmail.value = accounts.value.length > 0 ? (accounts.value[0]?.email || '') : ''
+  selectedAccountEmail.value = activeAccounts.value.length > 0 ? (activeAccounts.value[0]?.email || '') : ''
   selectedBatchChannel.value = 'common'
   showBatchDialog.value = true
 }
@@ -1500,7 +1502,7 @@ const handleInviteSubmit = async () => {
                   <SelectValue placeholder="选择账号" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem v-for="account in accounts" :key="account.id" :value="account.email">
+                  <SelectItem v-for="account in activeAccounts" :key="account.id" :value="account.email">
                     {{ account.email }} (当前{{ account.userCount }}人)
                   </SelectItem>
                 </SelectContent>
