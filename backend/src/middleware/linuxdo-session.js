@@ -48,6 +48,7 @@ export function authenticateLinuxDoSession(req, res, next) {
   const token = typeof rawToken === 'string' ? rawToken.trim() : ''
 
   if (!token) {
+    console.warn(`[LinuxDoSession] 鉴权失败: 头部缺少 x-linuxdo-token, 路径: ${req.path}`)
     return res.status(401).json({ error: '缺少 Linux DO session token' })
   }
 
@@ -56,6 +57,7 @@ export function authenticateLinuxDoSession(req, res, next) {
     req.linuxdo = decoded
     next()
   } catch (error) {
+    console.warn(`[LinuxDoSession] 鉴权失败: Token 无效或已过期, 路径: ${req.path}, 错误: ${error.message}`)
     return res.status(403).json({ error: 'Linux DO session token 无效或已过期' })
   }
 }

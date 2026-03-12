@@ -456,6 +456,7 @@
 	const accounts = ref<OpenAccountItem[]>([])
 	const loading = ref(false)
 	const loadError = ref('')
+  const boardError = ref('')
   const serverMaintenance = ref(false)
   const serverMaintenanceMessage = ref('')
 	const userEmail = ref('')
@@ -588,6 +589,7 @@ const loadMe = async () => {
 	  if (!sessionToken.value) return
 	  loading.value = true
 	  loadError.value = ''
+    boardError.value = ''
     serverMaintenance.value = false
     serverMaintenanceMessage.value = ''
 	  try {
@@ -862,11 +864,12 @@ const doBoard = async (accountId: number) => {
         openNoWarrantySwitchDialog(message)
         return
       }
-	    loadError.value = message
-			  } finally {
-			    selectingAccountId.value = null
-			  }
-			}
+      boardError.value = message
+      showErrorToast(message)
+    } finally {
+      selectingAccountId.value = null
+    }
+  }
 
 const board = async (accountId: number) => {
   await doBoard(accountId)

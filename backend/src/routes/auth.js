@@ -23,7 +23,6 @@ const USER_INFO_URL = process.env.LINUXDO_USER_INFO_URL || 'https://connect.linu
 const normalizeUid = (value) => String(value ?? '').trim()
 const normalizeUsername = (value) => String(value ?? '').trim()
 const normalizeName = (value) => String(value ?? '').trim()
-const INVITE_REGISTER_REWARD_POINTS = 2
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
 

@@ -26,24 +26,6 @@ const handleLogin = async () => {
   }
 }
 
-const handleLinuxDoLogin = async () => {
-  error.value = ''
-  loading.value = true
-
-  try {
-    const data = await authService.getLinuxDoAuthUrl(window.location.origin + '/login/linuxdo/callback')
-    if (data && data.url) {
-      window.location.href = data.url
-    } else {
-      error.value = '无法获取登录链接，请重试'
-      loading.value = false
-    }
-  } catch (err: any) {
-    console.error('Fetch Linux DO Auth URL error:', err)
-    error.value = err.response?.data?.error || '无法获取登录链接，请重试'
-    loading.value = false
-  }
-}
 </script>
 
 <template>
@@ -109,28 +91,6 @@ const handleLinuxDoLogin = async () => {
           >
             <span v-if="loading" class="mr-2 w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
             {{ loading ? '正在登录...' : '登 录' }}
-          </Button>
-
-           <div class="text-center text-sm text-gray-500 font-medium my-4 relative">
-            <div class="absolute inset-0 flex items-center">
-              <div class="w-full border-t border-gray-200"></div>
-            </div>
-            <span class="relative bg-white px-2 text-gray-400">或</span>
-          </div>
-
-          <Button 
-            type="button" 
-            @click="handleLinuxDoLogin"
-            class="w-full h-12 rounded-2xl bg-black text-white font-medium text-[15px] shadow-lg hover:shadow-xl hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 flex items-center justify-center space-x-2"
-            :disabled="loading"
-          >
-            <!-- 替换为 Linux DO 的 SVG 或简单的字母图标 -->
-            <svg class="w-5 h-5 text-current" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M8 12L12 16L16 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M12 8V16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <span>使用 Linux DO 登录</span>
           </Button>
 
           <div class="text-center text-sm text-gray-500 font-medium mt-4">

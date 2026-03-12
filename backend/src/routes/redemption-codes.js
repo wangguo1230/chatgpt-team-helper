@@ -4,8 +4,7 @@ import { authenticateToken } from '../middleware/auth.js'
 import { requireMenu } from '../middleware/rbac.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { verifyLinuxDoSessionToken } from '../middleware/linuxdo-session.js'
-import { fetchAccountUsersList, syncAccountInviteCount, syncAccountUserCount } from '../services/account-sync.js'
-import { inviteUserToChatGPTTeam } from '../services/chatgpt-invite.js'
+import { fetchAccountUsersList, syncAccountInviteCount, syncAccountUserCount, inviteAccountUser } from '../services/account-sync.js'
 import {
   getXhsConfig,
   getXhsOrderByNumber,
@@ -667,12 +666,16 @@ export async function redeemCodeInternal({
   let syncedInviteCount = null
 
   if (chatgptAccountId && accountToken) {
-    inviteResult = await inviteUserToChatGPTTeam(normalizedEmail, accountData, { proxyKey: accountId })
-
-    if (!inviteResult.success) {
-      console.error(`邀请用户 ${normalizedEmail} 失败:`, inviteResult.error)
-    } else {
+    try {
+      const inviteResp = await inviteAccountUser(accountId, normalizedEmail)
+      inviteResult = { success: true, response: inviteResp.invite }
       console.log(`成功邀请用户 ${normalizedEmail} 加入账号 ${chatgptAccountId}`)
+    } catch (error) {
+      inviteResult = { success: false, error: error.message || '邀请失败' }
+      console.error(`邀请用户 ${normalizedEmail} 失败:`, error.message)
+    }
+
+    if (inviteResult.success) {
       try {
         const userSync = await syncAccountUserCount(accountId, {
           userListParams: { offset: 0, limit: 1, query: '' }
@@ -913,15 +916,16 @@ router.post('/:id/reinvite', authenticateToken, requireMenu('redemption_codes'),
         return res.status(400).json({ error: '所属账号缺少 token 或 chatgpt_account_id，无法重新邀请' })
       }
 
-      const inviteResult = await inviteUserToChatGPTTeam(inviteEmail, {
-        token,
-        chatgpt_account_id: chatgptAccountId,
-        oai_device_id: oaiDeviceId
-      }, { proxyKey: targetAccountId })
+      let inviteResult
+      try {
+        const inviteResp = await inviteAccountUser(targetAccountId, inviteEmail)
+        inviteResult = { success: true, response: inviteResp.invite }
+      } catch (error) {
+        inviteResult = { success: false, error: error.message || '重新邀请失败' }
+      }
 
       if (!inviteResult.success) {
-        const errorMessage = typeof inviteResult.error === 'string' ? inviteResult.error : '重新邀请失败'
-        return res.status(503).json({ error: errorMessage })
+        return res.status(503).json({ error: inviteResult.error })
       }
 
       return res.json({ message: '重新邀请已发送' })

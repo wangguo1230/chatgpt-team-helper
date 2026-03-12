@@ -4,7 +4,7 @@ import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { requireMenu } from '../middleware/rbac.js'
-import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite } from '../services/account-sync.js'
+import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite, refreshAccessTokenWithRefreshToken, persistAccountTokens } from '../services/account-sync.js'
 
 const router = express.Router()
 const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -151,69 +151,7 @@ const eachWithConcurrency = async (items, concurrency, fn) => {
   await Promise.all(workers)
 }
 
-const refreshAccessTokenWithRefreshToken = async (refreshToken) => {
-  const normalized = String(refreshToken || '').trim()
-  if (!normalized) {
-    throw new AccountSyncError('该账号未配置 refresh token', 400)
-  }
-
-  const requestData = new URLSearchParams({
-    grant_type: 'refresh_token',
-    client_id: OPENAI_CLIENT_ID,
-    refresh_token: normalized,
-    scope: 'openid profile email'
-  }).toString()
-
-  const requestOptions = {
-    method: 'POST',
-    url: 'https://auth.openai.com/oauth/token',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Content-Length': requestData.length
-    },
-    data: requestData,
-    timeout: 60000
-  }
-
-  try {
-    const response = await axios(requestOptions)
-    if (response.status !== 200 || !response.data?.access_token) {
-      throw new AccountSyncError('刷新 token 失败，未返回有效凭证', 502)
-    }
-
-    const resultData = response.data
-    return {
-      accessToken: resultData.access_token,
-      refreshToken: resultData.refresh_token || normalized,
-      idToken: resultData.id_token,
-      expiresIn: resultData.expires_in || 3600
-    }
-  } catch (error) {
-    if (error?.response) {
-      const message =
-        error.response.data?.error?.message ||
-        error.response.data?.error_description ||
-        error.response.data?.error ||
-        '刷新 token 失败'
-
-      throw new AccountSyncError(message, 502)
-    }
-
-    throw new AccountSyncError(error?.message || '刷新 token 网络错误', 503)
-  }
-}
-
-const persistAccountTokens = async (db, accountId, tokens) => {
-  if (!tokens?.accessToken) return null
-  const nextRefreshToken = tokens.refreshToken ? String(tokens.refreshToken).trim() : ''
-
-  db.run(
-    `UPDATE gpt_accounts SET token = ?, refresh_token = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
-    [tokens.accessToken, nextRefreshToken || null, accountId]
-  )
-  await saveDatabase()
-  return { accessToken: tokens.accessToken, refreshToken: nextRefreshToken || null }
-}
+// 已将此处的重复逻辑迁移至 account-sync.js
 
 const loadAccountsForStatusCheck = async (db, { threshold }) => {
   const countResult = db.exec(
@@ -307,51 +245,8 @@ const checkSingleAccountStatus = async (db, account, nowMs) => {
       return { ...base, status: 'banned', reason: message || null }
     }
 
-    if (status === 401) {
-      const storedRefreshToken = String(account.refreshToken || '').trim()
-      if (!storedRefreshToken) {
-        const reason = message
-          ? `${message}`
-          : 'Token 已过期或无效（未配置 refresh token）'
-        return { ...base, status: 'expired', reason }
-      }
-
-      // Best-effort: try to refresh and re-check once.
-      try {
-        const refreshedTokens = await refreshAccessTokenWithRefreshToken(storedRefreshToken)
-        const persisted = await persistAccountTokens(db, account.id, refreshedTokens)
-
-        const nextAccount = {
-          ...account,
-          token: persisted?.accessToken || account.token,
-          refreshToken: persisted?.refreshToken || account.refreshToken
-        }
-
-        try {
-          await fetchAccountUsersList(account.id, {
-            accountRecord: nextAccount,
-            userListParams: { offset: 0, limit: 1, query: '' }
-          })
-          return { ...base, status: 'normal', refreshed: true, reason: 'Token 已过期，已使用 refresh token 自动刷新' }
-        } catch (recheckError) {
-          const reMsg = recheckError?.message ? String(recheckError.message) : String(recheckError || '')
-          const reStatus = Number(recheckError?.status || 0)
-
-          if (reMsg.includes('account_deactivated') || reMsg.includes('已自动标记为封号')) {
-            return { ...base, status: 'banned', refreshed: true, reason: reMsg || null }
-          }
-          if (reStatus === 401) {
-            return { ...base, status: 'expired', refreshed: true, reason: reMsg || 'Token 已过期，已尝试刷新但仍无效' }
-          }
-          return { ...base, status: 'failed', refreshed: true, reason: reMsg || 'Token 已过期，已刷新但校验失败' }
-        }
-      } catch (refreshError) {
-        const refreshMsg = refreshError?.message ? String(refreshError.message) : String(refreshError || '')
-        const reason = refreshMsg
-          ? `Token 已过期，refresh token 刷新失败：${refreshMsg}`
-          : 'Token 已过期，refresh token 刷新失败'
-        return { ...base, status: 'expired', reason }
-      }
+    if (status === 401 || status === 403) {
+      return { ...base, status: 'expired', reason: message || 'Token 已过期或无效，请更新账号 token' }
     }
 
     return { ...base, status: 'failed', reason: message || '检查失败' }
@@ -1105,19 +1000,17 @@ router.delete('/:id', async (req, res) => {
 // 同步账号用户数量
 router.post('/:id/sync-user-count', async (req, res) => {
   const accountId = Number(req.params.id)
+  if (!Number.isFinite(accountId) || accountId <= 0) {
+    return res.status(400).json({ error: '无效的账号 ID' })
+  }
 
-  const syncOnce = async () => {
+  try {
     const userSync = await syncAccountUserCount(accountId)
     const inviteSync = await syncAccountInviteCount(accountId, {
       accountRecord: userSync.account,
       inviteListParams: { offset: 0, limit: 1, query: '' }
     })
 
-    return { userSync, inviteSync }
-  }
-
-  try {
-    const { userSync, inviteSync } = await syncOnce()
     res.json({
       message: '账号同步成功',
       account: inviteSync.account,
@@ -1126,45 +1019,10 @@ router.post('/:id/sync-user-count', async (req, res) => {
       users: userSync.users
     })
   } catch (error) {
-    let finalError = error
+    console.error('同步账号人数错误:', error)
 
-    const status = Number(finalError?.status || 0)
-    const message = finalError?.message ? String(finalError.message) : ''
-
-    const isBannedOrDeactivated =
-      message.includes('account_deactivated') ||
-      message.includes('已自动标记为封号') ||
-      message.includes('封号')
-
-    if (status === 401 && !isBannedOrDeactivated && Number.isFinite(accountId) && accountId > 0) {
-      try {
-        const db = await getDatabase()
-        const refreshResult = db.exec('SELECT refresh_token FROM gpt_accounts WHERE id = ?', [accountId])
-        const storedRefreshToken = refreshResult?.[0]?.values?.[0]?.[0]
-        const normalizedRefreshToken = String(storedRefreshToken || '').trim()
-
-        if (normalizedRefreshToken) {
-          const refreshedTokens = await refreshAccessTokenWithRefreshToken(normalizedRefreshToken)
-          await persistAccountTokens(db, accountId, refreshedTokens)
-
-          const { userSync, inviteSync } = await syncOnce()
-          return res.json({
-            message: '账号同步成功',
-            account: inviteSync.account,
-            syncedUserCount: userSync.syncedUserCount,
-            inviteCount: inviteSync.inviteCount,
-            users: userSync.users
-          })
-        }
-      } catch (retryError) {
-        finalError = retryError
-      }
-    }
-
-    console.error('同步账号人数错误:', finalError)
-
-    if (finalError instanceof AccountSyncError || finalError?.status) {
-      return res.status(finalError.status || 500).json({ error: finalError.message })
+    if (error instanceof AccountSyncError || error?.status) {
+      return res.status(error.status || 500).json({ error: error.message })
     }
 
     res.status(500).json({ error: '内部服务器错误' })
@@ -1266,87 +1124,67 @@ router.delete('/:id/invites', async (req, res) => {
 router.post('/:id/refresh-token', async (req, res) => {
   try {
     const db = await getDatabase()
+    const accountId = Number(req.params.id)
 
-	    const result = db.exec(
-	      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, created_at, updated_at FROM gpt_accounts WHERE id = ?',
-	      [req.params.id]
-	    )
+    const checkResult = db.exec(
+      'SELECT id, refresh_token, proxy FROM gpt_accounts WHERE id = ?',
+      [accountId]
+    )
 
-    if (result.length === 0 || result[0].values.length === 0) {
+    if (checkResult.length === 0 || checkResult[0].values.length === 0) {
       return res.status(404).json({ error: '账号不存在' })
     }
 
-    const row = result[0].values[0]
-    const refreshToken = row[3]
+    const row = checkResult[0].values[0]
+    const refreshToken = row[1]
+    const proxy = row[2]
 
     if (!refreshToken) {
       return res.status(400).json({ error: '该账号未配置 refresh token' })
     }
 
-    const requestData = new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: OPENAI_CLIENT_ID,
-      refresh_token: refreshToken,
-      scope: 'openid profile email'
-    }).toString()
+    // 使用统一的刷新函数，支持代理
+    const tokens = await refreshAccessTokenWithRefreshToken(refreshToken, {
+      proxy: proxy || null,
+      accountId
+    })
 
-    const requestOptions = {
-      method: 'POST',
-      url: 'https://auth.openai.com/oauth/token',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': requestData.length
-      },
-      data: requestData,
-      timeout: 60000
-    }
+    const persisted = await persistAccountTokens(db, accountId, tokens)
 
-    const response = await axios(requestOptions)
-
-    if (response.status !== 200 || !response.data?.access_token) {
-      return res.status(500).json({ error: '刷新 token 失败，未返回有效凭证' })
-    }
-
-    const resultData = response.data
-
-    db.run(
-      `UPDATE gpt_accounts SET token = ?, refresh_token = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
-      [resultData.access_token, resultData.refresh_token || refreshToken, req.params.id]
+    const updatedResult = db.exec(
+      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, created_at, updated_at FROM gpt_accounts WHERE id = ?',
+      [accountId]
     )
-    saveDatabase()
-
-	    const updatedResult = db.exec(
-	      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, created_at, updated_at FROM gpt_accounts WHERE id = ?',
-	      [req.params.id]
-	    )
     const updatedRow = updatedResult[0].values[0]
-	    const account = {
-	      id: updatedRow[0],
-	      email: updatedRow[1],
-	      token: updatedRow[2],
-	      refreshToken: updatedRow[3],
-	      userCount: updatedRow[4],
-	      inviteCount: updatedRow[5],
-	      chatgptAccountId: updatedRow[6],
-	      oaiDeviceId: updatedRow[7],
-	      expireAt: updatedRow[8] || null,
-	      isOpen: Boolean(updatedRow[9]),
-	      isDemoted: false,
-	      isBanned: Boolean(updatedRow[10]),
-	      createdAt: updatedRow[11],
-	      updatedAt: updatedRow[12]
-	    }
+    const account = {
+      id: updatedRow[0],
+      email: updatedRow[1],
+      token: updatedRow[2],
+      refreshToken: updatedRow[3],
+      userCount: updatedRow[4],
+      inviteCount: updatedRow[5],
+      chatgptAccountId: updatedRow[6],
+      oaiDeviceId: updatedRow[7],
+      expireAt: updatedRow[8] || null,
+      isOpen: Boolean(updatedRow[9]),
+      isDemoted: false,
+      isBanned: Boolean(updatedRow[10]),
+      createdAt: updatedRow[11],
+      updatedAt: updatedRow[12]
+    }
 
     res.json({
       message: 'Token 刷新成功',
       account,
-      accessToken: resultData.access_token,
-      idToken: resultData.id_token,
-      refreshToken: resultData.refresh_token || refreshToken,
-      expiresIn: resultData.expires_in || 3600
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken || refreshToken
     })
   } catch (error) {
-    console.error('刷新 token 错误:', error?.response?.data || error.message || error)
+    console.error('刷新 token 错误:', error?.message || error)
+
+    if (error instanceof AccountSyncError || error?.status) {
+      return res.status(error.status || 500).json({ error: error.message })
+    }
 
     if (error.response) {
       const message =
@@ -1355,7 +1193,6 @@ router.post('/:id/refresh-token', async (req, res) => {
         error.response.data?.error ||
         '刷新 token 失败'
 
-      // 不直接透传 OpenAI 的状态码，统一返回 502 表示上游服务错误
       return res.status(502).json({
         error: message,
         upstream_status: error.response.status
