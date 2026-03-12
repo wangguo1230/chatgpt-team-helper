@@ -86,6 +86,25 @@ export const authService = {
     return userStr ? JSON.parse(userStr) : null
   },
 
+  async getLinuxDoAuthUrl(redirectUri?: string) {
+    const params = new URLSearchParams()
+    if (redirectUri) params.append('redirectUri', redirectUri)
+    const response = await api.get(`/auth/linuxdo-url?${params.toString()}`)
+    return response.data
+  },
+
+  async linuxDoLogin(code: string, redirectUri?: string) {
+    const payload: any = { code }
+    if (redirectUri) payload.redirectUri = redirectUri
+    const response = await api.post('/auth/linuxdo-login', payload)
+    if (response.data.token) {
+      localStorage.setItem('token', response.data.token)
+      localStorage.setItem('user', JSON.stringify(response.data.user))
+      notifyAuthUpdated()
+    }
+    return response.data
+  },
+
   isAuthenticated() {
     return !!localStorage.getItem('token')
   }

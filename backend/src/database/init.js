@@ -166,6 +166,7 @@ const ensureRbacTables = (database) => {
     addUserColumn('points', 'points INTEGER DEFAULT 0')
     addUserColumn('invite_enabled', 'invite_enabled INTEGER DEFAULT 0')
     addUserColumn('telegram_id', 'telegram_id TEXT')
+    addUserColumn('linuxdo_uid', 'linuxdo_uid TEXT')
 
     const duplicateEmail = database.exec(`
       SELECT 1

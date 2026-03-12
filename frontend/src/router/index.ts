@@ -31,6 +31,7 @@ import UserInfoView from '../views/UserInfoView.vue'
 import PointsExchangeView from '../views/PointsExchangeView.vue'
 import RoleManagementView from '../views/RoleManagementView.vue'
 import MenuManagementView from '../views/MenuManagementView.vue'
+import LinuxDoLoginCallback from '../views/LinuxDoLoginCallback.vue'
 import { authService } from '@/services/api'
 import FeatureDisabledView from '../views/FeatureDisabledView.vue'
 import { useAppConfigStore } from '@/stores/appConfig'
@@ -81,6 +82,11 @@ const router = createRouter({
       path: '/register',
       name: 'register',
       component: RegisterView,
+    },
+    {
+      path: '/login/linuxdo/callback',
+      name: 'linux-do-login-callback',
+      component: LinuxDoLoginCallback,
     },
     {
       path: '/redeem/common',
