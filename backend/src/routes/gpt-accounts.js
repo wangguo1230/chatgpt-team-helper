@@ -4,7 +4,8 @@ import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { requireMenu } from '../middleware/rbac.js'
-import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite, refreshAccessTokenWithRefreshToken, persistAccountTokens } from '../services/account-sync.js'
+import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite, refreshAccessTokenWithRefreshToken, persistAccountTokens, deleteUnusedCodesByAccountId } from '../services/account-sync.js'
+import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
 
 const router = express.Router()
 const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -66,6 +67,11 @@ const normalizeExpireAt = (value) => {
     if (!Number.isNaN(date.getTime())) {
       return formatExpireAt(date)
     }
+  }
+
+  const parsedMs = Date.parse(raw)
+  if (!Number.isNaN(parsedMs)) {
+    return formatExpireAt(new Date(parsedMs))
   }
 
   return null
@@ -223,11 +229,13 @@ const checkSingleAccountStatus = async (db, account, nowMs) => {
   }
 
   if (account.isBanned) {
+    await deleteUnusedCodesByAccountId(db, account.id)
     return { ...base, status: 'banned', reason: null }
   }
 
   const expireAtMs = parseExpireAtToMs(account.expireAt)
   if (expireAtMs != null && expireAtMs < nowMs) {
+    await deleteUnusedCodesByAccountId(db, account.id)
     return { ...base, status: 'expired', reason: 'expireAt 已过期' }
   }
 
@@ -299,6 +307,9 @@ router.post('/ban', apiKeyAuth, async (req, res) => {
         `,
         emails
       )
+      for (const item of matched) {
+        await deleteUnusedCodesByAccountId(db, item.id)
+      }
       saveDatabase()
     }
 
@@ -319,13 +330,19 @@ router.use(authenticateToken, requireMenu('accounts'))
 // 校验 access token，并返回可用的 Team 账号列表（用于新建账号时选择 chatgptAccountId）
 router.post('/check-token', async (req, res) => {
   try {
-    const { token, proxy } = req.body || {}
-    const normalizedToken = String(token ?? '').trim()
+    const body = req.body || {}
+    const payload = extractOpenAiAccountPayload(body)
+    if (payload.parseErrors.length > 0) {
+      return res.status(400).json({ error: payload.parseErrors[0] })
+    }
+
+    const normalizedToken = String(payload.token || '').trim()
+    const proxy = body?.proxy ?? null
     if (!normalizedToken) {
       return res.status(400).json({ error: 'token is required' })
     }
 
-    const accounts = await fetchOpenAiAccountInfo(normalizedToken, proxy ?? null)
+    const accounts = await fetchOpenAiAccountInfo(normalizedToken, proxy)
     return res.json({ accounts })
   } catch (error) {
     console.error('Check GPT token error:', error)
@@ -603,7 +620,23 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const body = req.body || {}
-    const { email, token, refreshToken, userCount, chatgptAccountId, oaiDeviceId, expireAt } = body
+    const { userCount } = body
+
+    const extracted = extractOpenAiAccountPayload(body)
+    if (extracted.parseErrors.length > 0) {
+      return res.status(400).json({ error: extracted.parseErrors[0] })
+    }
+
+    const email = String(extracted.email || body.email || '').trim()
+    const token = String(extracted.token || '').trim()
+    const refreshToken = String(extracted.refreshToken || '').trim()
+    const normalizedChatgptAccountId = String(extracted.chatgptAccountId || '').trim()
+    const normalizedOaiDeviceId = String(extracted.oaiDeviceId || body.oaiDeviceId || '').trim()
+    const hasExpireAt = extracted.hasExpireAt || Object.prototype.hasOwnProperty.call(body, 'expireAt')
+    const expireAtInput = hasExpireAt
+      ? (extracted.hasExpireAt ? extracted.expireAtInput : body.expireAt)
+      : null
+    const normalizedExpireAt = hasExpireAt ? normalizeExpireAt(expireAtInput) : null
 
     // isDemoted/is_demoted: deprecated (ignored).
 
@@ -615,15 +648,11 @@ router.post('/', async (req, res) => {
     }
     const isBannedValue = normalizedIsBanned ? 1 : 0
 
-    const normalizedChatgptAccountId = String(chatgptAccountId ?? '').trim()
-    const normalizedOaiDeviceId = String(oaiDeviceId ?? '').trim()
-    const normalizedExpireAt = normalizeExpireAt(expireAt)
-
     if (!email || !token || !normalizedChatgptAccountId) {
       return res.status(400).json({ error: 'Email, token and ChatGPT ID are required' })
     }
 
-    if (expireAt != null && String(expireAt).trim() && !normalizedExpireAt) {
+    if (hasExpireAt && expireAtInput != null && String(expireAtInput).trim() && !normalizedExpireAt) {
       return res.status(400).json({
         error: 'Invalid expireAt format',
         message: 'expireAt 格式错误，请使用 YYYY/MM/DD HH:mm'
@@ -668,68 +697,11 @@ router.post('/', async (req, res) => {
 		      updatedAt: row[12]
 		    }
 
-    // 生成随机兑换码的辅助函数
-    function generateRedemptionCode(length = 12) {
-      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // 排除容易混淆的字符
-      let code = ''
-      for (let i = 0; i < length; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length))
-        // 每4位添加一个分隔符
-        if ((i + 1) % 4 === 0 && i < length - 1) {
-          code += '-'
-        }
-      }
-      return code
-    }
-
-    // 自动生成兑换码并绑定到该账号
-    // Team 账号默认总容量 5，新建账号默认人数按 1 计算，所以默认生成 4 个兑换码
-    const totalCapacity = 5
-    const currentUserCountForCodes = Math.max(1, Number(finalUserCount) || 1)
-    const codesToGenerate = Math.max(0, totalCapacity - currentUserCountForCodes)
-
-    const generatedCodes = []
-    for (let i = 0; i < codesToGenerate; i++) {
-      let code = generateRedemptionCode()
-      let attempts = 0
-      let success = false
-
-      // 尝试生成唯一的兑换码（最多重试5次）
-      while (attempts < 5 && !success) {
-        try {
-          db.run(
-            `INSERT INTO redemption_codes (code, account_email, created_at, updated_at) VALUES (?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-            [code, normalizedEmail]
-          )
-          generatedCodes.push(code)
-          success = true
-        } catch (err) {
-          if (err.message.includes('UNIQUE')) {
-            // 如果重复，重新生成
-            code = generateRedemptionCode()
-            attempts++
-          } else {
-            throw err
-          }
-        }
-      }
-    }
-
     saveDatabase()
-
-    // 获取生成的兑换码信息
-    const codesResult = db.exec(`
-      SELECT code FROM redemption_codes
-      WHERE account_email = ?
-      ORDER BY created_at DESC
-    `, [normalizedEmail])
-
-    const codes = codesResult[0]?.values.map(row => row[0]) || []
 
     res.status(201).json({
       account,
-      generatedCodes: codes,
-      message: `账号创建成功，已自动生成${codes.length}个兑换码`
+      message: '账号创建成功'
     })
   } catch (error) {
     console.error('Create GPT account error:', error)
@@ -741,12 +713,23 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const body = req.body || {}
-    const { email, token, refreshToken, userCount, chatgptAccountId, oaiDeviceId, expireAt } = body
+    const { userCount } = body
 
-    const normalizedChatgptAccountId = String(chatgptAccountId ?? '').trim()
-    const normalizedOaiDeviceId = String(oaiDeviceId ?? '').trim()
-    const hasExpireAt = Object.prototype.hasOwnProperty.call(body, 'expireAt')
-    const normalizedExpireAt = hasExpireAt ? normalizeExpireAt(expireAt) : null
+    const extracted = extractOpenAiAccountPayload(body)
+    if (extracted.parseErrors.length > 0) {
+      return res.status(400).json({ error: extracted.parseErrors[0] })
+    }
+
+    const email = String(extracted.email || body.email || '').trim()
+    const token = String(extracted.token || '').trim()
+    const refreshToken = String(extracted.refreshToken || '').trim()
+    const normalizedChatgptAccountId = String(extracted.chatgptAccountId || '').trim()
+    const normalizedOaiDeviceId = String(extracted.oaiDeviceId || body.oaiDeviceId || '').trim()
+    const hasExpireAt = extracted.hasExpireAt || Object.prototype.hasOwnProperty.call(body, 'expireAt')
+    const expireAtInput = hasExpireAt
+      ? (extracted.hasExpireAt ? extracted.expireAtInput : body.expireAt)
+      : null
+    const normalizedExpireAt = hasExpireAt ? normalizeExpireAt(expireAtInput) : null
 
     // isDemoted/is_demoted: deprecated (ignored).
 
@@ -764,7 +747,7 @@ router.put('/:id', async (req, res) => {
       return res.status(400).json({ error: 'Email, token and ChatGPT ID are required' })
     }
 
-    if (hasExpireAt && expireAt != null && String(expireAt).trim() && !normalizedExpireAt) {
+    if (hasExpireAt && expireAtInput != null && String(expireAtInput).trim() && !normalizedExpireAt) {
       return res.status(400).json({
         error: 'Invalid expireAt format',
         message: 'expireAt 格式错误，请使用 YYYY/MM/DD HH:mm'
@@ -818,6 +801,12 @@ router.put('/:id', async (req, res) => {
         [email, existingEmail]
       )
     }
+
+    const isNowExpired = hasExpireAt && normalizedExpireAt && parseExpireAtToMs(normalizedExpireAt) != null && parseExpireAtToMs(normalizedExpireAt) < Date.now()
+    if (shouldApplyBanSideEffects || isNowExpired) {
+      await deleteUnusedCodesByAccountId(db, req.params.id)
+    }
+
     saveDatabase()
 
 		    // Get the updated account

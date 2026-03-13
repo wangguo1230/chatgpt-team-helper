@@ -317,7 +317,7 @@ const getOpenAccountsVisibleCreatedWithinDays = () => {
 }
 
 const OPEN_ACCOUNTS_REDEEM_BLOCK_START_HOUR = 0
-const OPEN_ACCOUNTS_REDEEM_BLOCK_END_HOUR = 8
+const OPEN_ACCOUNTS_REDEEM_BLOCK_END_HOUR = 0
 const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY])
@@ -336,7 +336,7 @@ const isOpenAccountsRedeemBlockedNow = (date = new Date()) => {
   return hour >= OPEN_ACCOUNTS_REDEEM_BLOCK_START_HOUR && hour < OPEN_ACCOUNTS_REDEEM_BLOCK_END_HOUR
 }
 
-const buildOpenAccountsRedeemBlockedMessage = () => '开放账号每日 00:00-08:00 暂停兑换，请在 08:00 后再试'
+const buildOpenAccountsRedeemBlockedMessage = () => '当前时段暂不可兑换，请稍后再试'
 
 // 查询今日已占用名额（包含已上车 + 未过期的未完成订单 + 已支付未上车）
 const getTodayBoardCount = (db) => {
@@ -668,11 +668,26 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         if (!orderEmail) {
           return { type: 'error', status: 400, error: '请先配置邮箱再上车' }
         }
-        if (currentId && currentId === accountId) {
-          const account = await withShortRetry(
-            { enabled: shortRetryContext, label: 'syncCardCounts', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
-            () => syncCardCounts(accountId)
-          )
+
+        const account = await withShortRetry(
+          { enabled: shortRetryContext, label: 'syncCardCounts', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
+          () => syncCardCounts(accountId)
+        )
+
+        const members = await withShortRetry(
+          { enabled: shortRetryContext, label: 'fetchAccountUsersList', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
+          () => fetchAccountUsersList(accountId, { userListParams: { offset: 0, limit: 25, query: orderEmail } })
+        )
+        const isMember = (members.items || []).some(item => normalizeEmail(item.email) === orderEmail)
+
+        const invites = await withShortRetry(
+          { enabled: shortRetryContext, label: 'fetchAccountInvites', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
+          () => fetchAccountInvites(accountId, { inviteListParams: { offset: 0, limit: 25, query: orderEmail } })
+        )
+        const isInvited = (invites.items || []).some(item => normalizeEmail(item.email_address) === orderEmail)
+        const isCurrentAccountBound = Boolean(currentId && currentId === accountId)
+
+        if (isCurrentAccountBound && (isMember || isInvited)) {
           if (verifiedCreditOrderNo) {
             const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
               orderNo: verifiedCreditOrderNo,
@@ -690,6 +705,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
               throw new AccountSyncError(codeMessage, statusCode)
             }
           }
+
           const body = {
             message: '已在该账号上车',
             currentOpenAccountId: accountId,
@@ -718,22 +734,14 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
           return { type: 'success', body }
         }
 
-        const account = await withShortRetry(
-          { enabled: shortRetryContext, label: 'syncCardCounts', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
-          () => syncCardCounts(accountId)
-        )
-
-        const members = await withShortRetry(
-          { enabled: shortRetryContext, label: 'fetchAccountUsersList', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
-          () => fetchAccountUsersList(accountId, { userListParams: { offset: 0, limit: 25, query: orderEmail } })
-        )
-        const isMember = (members.items || []).some(item => normalizeEmail(item.email) === orderEmail)
-
-        const invites = await withShortRetry(
-          { enabled: shortRetryContext, label: 'fetchAccountInvites', uid, accountId, creditOrderNo: verifiedCreditOrderNo },
-          () => fetchAccountInvites(accountId, { inviteListParams: { offset: 0, limit: 25, query: orderEmail } })
-        )
-        const isInvited = (invites.items || []).some(item => normalizeEmail(item.email_address) === orderEmail)
+        if (isCurrentAccountBound && !isMember && !isInvited && onboardedEmailForExitCheck && onboardedEmailForExitCheck !== orderEmail) {
+          console.info('[OpenAccounts] onboard email changed, continue board flow', {
+            uid,
+            accountId,
+            previousEmail: onboardedEmailForExitCheck,
+            currentEmail: orderEmail
+          })
+        }
 
         // 上车必须先消耗 Credit：首次点击上车先创建/复用 Credit 订单，授权成功后再携带 creditOrderNo 继续上车。
         if (!creditOrderNo) {
@@ -972,6 +980,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
       }
 
       const notifyUrl = `${getPublicBaseUrl(req)}/credit/notify`
+      const returnUrl = `${getPublicBaseUrl(req)}/redeem/open-accounts`
 
       if (!creditPid || !creditKey || !creditBaseUrl) {
         return res.status(500).json({ error: '未配置 Linux DO Credit 凭据' })
@@ -1050,6 +1059,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         name: orderTitle,
         money: orderAmount,
         notify_url: notifyUrl,
+        return_url: returnUrl,
         device: uid
       }
       const sign = buildCreditSign(payParams, creditKey)
@@ -1063,6 +1073,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
             title: orderTitle,
             money: orderAmount,
             notifyUrl,
+            returnUrl,
             device: uid,
             timeoutMs: 4500
           })

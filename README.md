@@ -20,7 +20,7 @@
 - 开放API 提供 Token 自动刷新与状态同步
 - 账号用户数、邀请数实时同步（通过 OpenAI API）
 - 账号到期管理与开放展示控制
-- 创建账号时自动生成兑换码
+- 支持手动批量创建兑换码并绑定到指定账号
 
 ### 多渠道兑换
 - **通用兑换**：邮箱 + 兑换码直接兑换
@@ -468,6 +468,9 @@ PURCHASE_NO_WARRANTY_SERVICE_DAYS=30
 
 # 订单过期时间（分钟）
 PURCHASE_ORDER_EXPIRE_MINUTES=15
+
+# 批量创建兑换码单次最大数量（默认 5，可在系统设置覆盖）
+REDEMPTION_BATCH_CREATE_MAX_COUNT=5
 ```
 
 ### Cloudflare Turnstile 人机验证

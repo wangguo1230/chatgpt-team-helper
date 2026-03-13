@@ -187,7 +187,7 @@ router.get('/me', authenticateLinuxDoSession, async (req, res) => {
 
     const db = await getDatabase()
     const result = db.exec(
-      'SELECT uid, username, email, current_open_account_id FROM linuxdo_users WHERE uid = ? LIMIT 1',
+      'SELECT uid, username, email, current_open_account_id, current_open_account_email FROM linuxdo_users WHERE uid = ? LIMIT 1',
       [uid]
     )
 
@@ -201,7 +201,7 @@ router.get('/me', authenticateLinuxDoSession, async (req, res) => {
         [uid, usernameToSave, nameFromToken || null, trustLevelFromToken]
       )
       saveDatabase()
-      return res.json({ uid, username: usernameToSave, email: '', currentOpenAccountId: null })
+      return res.json({ uid, username: usernameToSave, email: '', currentOpenAccountId: null, currentOpenAccountEmail: '' })
     }
 
     const row = result[0].values[0]
@@ -225,7 +225,8 @@ router.get('/me', authenticateLinuxDoSession, async (req, res) => {
       uid: row[0],
       username,
       email: row[2] || '',
-      currentOpenAccountId: row[3] ?? null
+      currentOpenAccountId: row[3] ?? null,
+      currentOpenAccountEmail: row[4] || ''
     })
   } catch (error) {
     console.error('读取 Linux DO 用户信息失败:', error)
@@ -309,7 +310,8 @@ router.put('/me/email', authenticateLinuxDoSession, async (req, res) => {
 		            uid,
 		            username: usernameFromToken || uid,
 		            email: emailToSave || '',
-		            currentOpenAccountId: nextAccountId ?? null
+		            currentOpenAccountId: nextAccountId ?? null,
+		            currentOpenAccountEmail: nextOpenAccountEmail || ''
 		          })
 	        })
 	        return

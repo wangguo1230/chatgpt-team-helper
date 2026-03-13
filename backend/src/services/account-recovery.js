@@ -15,9 +15,9 @@ const normalizeOrderType = (value) => {
 
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
 
-const DEFAULT_WARRANTY_SERVICE_DAYS = Math.max(1, toInt(process.env.PURCHASE_SERVICE_DAYS, 30))
+const DEFAULT_WARRANTY_SERVICE_DAYS = Math.max(0, toInt(process.env.PURCHASE_SERVICE_DAYS, 30))
 const DEFAULT_NO_WARRANTY_SERVICE_DAYS = Math.max(
-  1,
+  0,
   toInt(process.env.PURCHASE_NO_WARRANTY_SERVICE_DAYS, DEFAULT_WARRANTY_SERVICE_DAYS)
 )
 
@@ -67,8 +67,23 @@ export function resolveOrderDeadlineMs(db, { originalCodeId, originalCode, redee
 
   const codeId = Number(originalCodeId || 0)
   const sanitizedCode = String(originalCode || '').trim().toUpperCase()
+  
+  // 1. 获取基础默认值
   const defaultServiceDays = resolveDefaultServiceDays(orderType)
+  
+  // 2. 尝试从 redemption_codes 表获取预设的 service_days
+  let rcServiceDays = null
+  if (codeId > 0) {
+    const rcResult = db.exec('SELECT service_days FROM redemption_codes WHERE id = ?', [codeId])
+    const val = rcResult?.[0]?.values?.[0]?.[0]
+    if (val != null) rcServiceDays = toInt(val, null)
+  } else if (sanitizedCode) {
+    const rcResult = db.exec('SELECT service_days FROM redemption_codes WHERE code = ?', [sanitizedCode])
+    const val = rcResult?.[0]?.values?.[0]?.[0]
+    if (val != null) rcServiceDays = toInt(val, null)
+  }
 
+  // 3. 尝试从 purchase_orders 订单表获取（权重更高，代表实际交易）
   let orderMetaResult
   if (Number.isFinite(codeId) && codeId > 0 && sanitizedCode) {
     orderMetaResult = db.exec(
@@ -105,12 +120,15 @@ export function resolveOrderDeadlineMs(db, { originalCodeId, originalCode, redee
       `,
       [sanitizedCode]
     )
-  } else {
-    return NaN
   }
 
   const orderMetaRow = orderMetaResult?.[0]?.values?.[0] || null
-  const resolvedServiceDays = orderMetaRow ? Math.max(1, toInt(orderMetaRow[0], defaultServiceDays)) : defaultServiceDays
+
+  // 优先级：订单表预设 > 兑换码表预设 > 全局配置文件默认值
+  const resolvedServiceDays = orderMetaRow
+    ? Math.max(0, toInt(orderMetaRow[0], rcServiceDays ?? defaultServiceDays))
+    : (rcServiceDays ?? defaultServiceDays)
+
   const orderStartAt = orderMetaRow?.[1] || orderMetaRow?.[2] || orderMetaRow?.[3] || redeemedAt
   const orderDeadlineDate = addDays(orderStartAt, resolvedServiceDays)
   return orderDeadlineDate instanceof Date ? orderDeadlineDate.getTime() : NaN

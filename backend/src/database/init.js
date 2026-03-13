@@ -2146,6 +2146,12 @@ export async function initDatabase() {
               saveDatabase()
             }
 
+            if (!redemptionColumns.includes('service_days')) {
+              database.run(`ALTER TABLE redemption_codes ADD COLUMN service_days INTEGER`)
+              console.log('已添加 service_days 列到 redemption_codes 表')
+              saveDatabase()
+            }
+
             database.run(
               `UPDATE redemption_codes SET channel = ? WHERE channel IS NULL OR channel = ''`,
               [DEFAULT_CHANNEL],
@@ -2238,6 +2244,7 @@ export async function initDatabase() {
       channel TEXT DEFAULT '${DEFAULT_CHANNEL}',
       channel_name TEXT DEFAULT '${DEFAULT_CHANNEL_NAME}',
       order_type TEXT DEFAULT 'warranty',
+      service_days INTEGER,
       created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
       updated_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
       reserved_for_uid TEXT,

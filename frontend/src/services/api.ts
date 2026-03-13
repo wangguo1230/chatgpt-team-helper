@@ -518,12 +518,14 @@ export interface RedemptionCode {
   isRedeemed: boolean
   redeemedAt?: string
   redeemedBy?: string
+  redeemedEmail?: string | null
   accountEmail?: string
   // Whether the bound GPT account is marked as banned (server may omit in older versions).
   accountIsBanned?: boolean
   channel: RedemptionChannel
   channelName?: string
   orderType?: PurchaseOrderType | null
+  serviceDays?: number | null
   createdAt: string
   updatedAt: string
   reservedForUid?: string | null
@@ -545,6 +547,7 @@ export interface AppRuntimeConfig {
   locale: string
   turnstileSiteKey?: string | null
   turnstileEnabled?: boolean
+  redemptionBatchCreateMaxCount?: number
   channels?: Channel[]
   features?: {
     xhs?: boolean
@@ -971,6 +974,22 @@ export interface AdminPointsWithdrawSettingsResponse {
   stepPoints: number
 }
 
+export interface AdminRedemptionCodeSettingsResponse {
+  settings: {
+    batchCreateMaxCount: number
+  }
+  effective: {
+    batchCreateMaxCount: number
+    source: 'db' | 'env' | 'default'
+  }
+  stored: {
+    batchCreateMaxCount: number | null
+  }
+  env: {
+    batchCreateMaxCount: number
+  }
+}
+
 export interface AdminSmtpSettingsResponse {
   smtp: {
     host: string
@@ -1175,6 +1194,20 @@ export const adminService = {
 
   async getPointsWithdrawSettings(): Promise<AdminPointsWithdrawSettingsResponse> {
     const response = await api.get('/admin/points-withdraw-settings')
+    return response.data
+  },
+
+  async getRedemptionCodeSettings(): Promise<AdminRedemptionCodeSettingsResponse> {
+    const response = await api.get('/admin/redemption-code-settings')
+    return response.data
+  },
+
+  async updateRedemptionCodeSettings(payload: { batchCreateMaxCount: number }): Promise<AdminRedemptionCodeSettingsResponse> {
+    const response = await api.put('/admin/redemption-code-settings', {
+      settings: {
+        batchCreateMaxCount: payload.batchCreateMaxCount
+      }
+    })
     return response.data
   },
 
@@ -1816,6 +1849,7 @@ export interface LinuxDoMe {
   username: string
   email?: string
   currentOpenAccountId?: number | null
+  currentOpenAccountEmail?: string
 }
 
 export const linuxDoUserService = {
@@ -2021,6 +2055,7 @@ export const redemptionCodeService = {
     pageSize?: number
     search?: string
     status?: 'all' | 'redeemed' | 'unused'
+    redeemedEmail?: string
   }): Promise<{
     codes: RedemptionCode[]
     pagination: { page: number; pageSize: number; total: number }
@@ -2034,8 +2069,14 @@ export const redemptionCodeService = {
     return response.data
   },
 
-  async batchCreate(count: number, accountEmail: string, channel?: RedemptionChannel): Promise<BatchCreateResponse> {
-    const response = await api.post('/redemption-codes/batch', { count, accountEmail, ...(channel ? { channel } : {}) })
+  async batchCreate(count: number, accountEmail: string, options?: { channel?: RedemptionChannel; orderType?: PurchaseOrderType; serviceDays?: number }): Promise<BatchCreateResponse> {
+    const response = await api.post('/redemption-codes/batch', {
+      count,
+      accountEmail,
+      channel: options?.channel,
+      orderType: options?.orderType,
+      serviceDays: options?.serviceDays
+    })
     return response.data
   },
 

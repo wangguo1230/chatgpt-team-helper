@@ -22,6 +22,12 @@ import { getFeatureFlags, invalidateFeatureFlagsCache } from '../utils/feature-f
 import { CHANNEL_KEY_REGEX, getChannelByKey, getChannels, invalidateChannelsCache, normalizeChannelKey } from '../utils/channels.js'
 import { getAccountRecoverySettings, invalidateAccountRecoverySettingsCache } from '../utils/account-recovery-settings.js'
 import {
+  getRedemptionCodeSettings,
+  REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY,
+  REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN,
+  REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX
+} from '../utils/redemption-settings.js'
+import {
   PRODUCT_KEY_REGEX,
   getPurchaseProductByKey,
   listPurchaseProducts,
@@ -274,6 +280,63 @@ router.put('/email-domain-whitelist', async (req, res) => {
   } catch (error) {
     console.error('Update email-domain-whitelist error:', error)
     res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/redemption-code-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = getRedemptionCodeSettings(db)
+    return res.json({
+      settings: {
+        batchCreateMaxCount: settings.batchCreateMaxCount
+      },
+      effective: {
+        batchCreateMaxCount: settings.batchCreateMaxCount,
+        source: settings.source
+      },
+      stored: settings.stored,
+      env: settings.env
+    })
+  } catch (error) {
+    console.error('Get redemption-code-settings error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/redemption-code-settings', async (req, res) => {
+  try {
+    const payload = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : (req.body || {})
+    if (!Object.prototype.hasOwnProperty.call(payload, 'batchCreateMaxCount')) {
+      return res.status(400).json({ error: 'No settings provided' })
+    }
+
+    const parsed = Number.parseInt(String(payload.batchCreateMaxCount ?? ''), 10)
+    if (!Number.isFinite(parsed) || parsed < REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN || parsed > REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX) {
+      return res.status(400).json({
+        error: `batchCreateMaxCount 必须在 ${REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN}-${REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX} 之间`
+      })
+    }
+
+    const db = await getDatabase()
+    upsertSystemConfigValue(db, REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY, String(parsed))
+    saveDatabase()
+
+    const settings = getRedemptionCodeSettings(db)
+    return res.json({
+      settings: {
+        batchCreateMaxCount: settings.batchCreateMaxCount
+      },
+      effective: {
+        batchCreateMaxCount: settings.batchCreateMaxCount,
+        source: settings.source
+      },
+      stored: settings.stored,
+      env: settings.env
+    })
+  } catch (error) {
+    console.error('Update redemption-code-settings error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
   }
 })
 

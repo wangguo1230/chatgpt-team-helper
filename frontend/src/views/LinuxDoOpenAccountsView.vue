@@ -47,7 +47,7 @@
               </div>
               <h1 class="text-4xl sm:text-5xl font-extrabold tracking-tight text-[#1d1d1f] dark:text-white font-display">
                 <span class="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 dark:from-blue-400 dark:via-purple-400 dark:to-pink-400">
-                  开放账号
+                  栗子LDC
                 </span>
               </h1>
               <p class="text-lg text-[#86868b] max-w-lg leading-relaxed">
@@ -81,9 +81,6 @@
                 >
                   当日购买次数 {{ rules.userDailyLimitRemaining ?? 0 }}/{{ rules.userDailyLimit }}
                 </span>
-	                <span class="px-2 py-1 rounded-full bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300 border border-amber-100 dark:border-amber-800">
-	                  每日 {{ redeemBlockedHoursLabel }} 暂停兑换
-	                </span>
 		                <RouterLink
 		                  to="/redeem/account-recovery"
 		                  class="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-purple-50 dark:bg-purple-900/20 text-purple-700 dark:text-purple-300 border border-purple-100 dark:border-purple-800 hover:bg-purple-100/70 dark:hover:bg-purple-900/30 transition-colors cursor-pointer"
@@ -173,8 +170,10 @@
                 :interactive="true"
                 :class="[
                   'group relative overflow-hidden transition-all duration-500 flex flex-col h-full',
-                  currentOpenAccountId === item.id
+                  isCardBoarded(item.id)
                     ? 'border-2 border-blue-500/80 dark:border-blue-400/80 shadow-[0_0_30px_rgba(59,130,246,0.2)] dark:shadow-[0_0_30px_rgba(96,165,250,0.15)] bg-blue-50/40 dark:bg-blue-500/5 ring-1 ring-blue-500/20'
+                    : isCardReboard(item.id)
+                      ? 'border border-amber-300/80 dark:border-amber-500/40 shadow-[0_0_24px_rgba(245,158,11,0.15)] dark:shadow-[0_0_24px_rgba(245,158,11,0.1)] bg-amber-50/40 dark:bg-amber-500/5 ring-1 ring-amber-300/30 dark:ring-amber-500/30'
                     : 'border border-white/60 dark:border-white/10 shadow-sm hover:shadow-xl'
                 ]"
                 :style="{ animationDelay: `${index * 50}ms` }"
@@ -211,11 +210,18 @@
                               
                               <!-- Status Badge -->
                               <div
-                                v-if="currentOpenAccountId === item.id"
+                                v-if="isCardBoarded(item.id)"
                                 class="shrink-0 px-2 py-0.5 rounded-full bg-blue-500 text-white text-[10px] font-bold uppercase tracking-wider shadow-lg shadow-blue-500/20 flex items-center gap-1"
                               >
                                 <div class="w-1 h-1 rounded-full bg-white animate-pulse"></div>
                                 已上车
+                              </div>
+                              <div
+                                v-else-if="isCardReboard(item.id)"
+                                class="shrink-0 px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-[10px] font-bold uppercase tracking-wider flex items-center gap-1"
+                              >
+                                <div class="w-1 h-1 rounded-full bg-amber-500"></div>
+                                可重新上车
                               </div>
                               <div
      v-else
@@ -262,24 +268,18 @@
                    <div class="flex-1"></div>
 
 	                   <!-- Action Button -->
-	                   <AppleButton
-                      v-if="currentOpenAccountId === item.id"
-                      variant="secondary"
-                      class="w-full justify-center h-9 text-sm"
-                      :disabled="true"
-                    >
-                      已上车
-                    </AppleButton>
                     <AppleButton
-                      v-else
-                      variant="premium"
+                      :variant="isCardBoarded(item.id) ? 'secondary' : 'premium'"
                       class="w-full justify-center h-9 text-sm"
-                      :disabled="!sessionToken || selectingAccountId !== null"
+                      :disabled="!sessionToken || selectingAccountId !== null || isCardBoarded(item.id)"
                       :loading="selectingAccountId === item.id"
                       @click.stop="board(item.id)"
                     >
                       <span v-if="selectingAccountId === item.id">上车中…</span>
-                      <span v-else>{{ !userEmail ? '先配置邮箱' : '立即上车' }}</span>
+                      <span v-else-if="!userEmail">先配置邮箱</span>
+                      <span v-else-if="isCardReboard(item.id)">重新上车</span>
+                      <span v-else-if="isCardBoarded(item.id)">已上车</span>
+                      <span v-else>立即上车</span>
                     </AppleButton>
 
                     <!-- Decorative Elements (Removed for performance) -->
@@ -298,7 +298,6 @@
 	        :avatar-url="avatarUrl"
 	        :display-name="linuxDoDisplayName"
 	        :trust-level-label="trustLevelLabel"
-	        :github-repo-url="githubRepoUrl"
 	        @reauthorize="handleReauthorize"
 	      />
 
@@ -451,8 +450,6 @@
 	import { useToast } from '@/components/ui/toast'
   import { useAppConfigStore } from '@/stores/appConfig'
 
-	const githubRepoUrl = 'https://github.com/Kylsky/chatgpt-team-helper'
-
 	const accounts = ref<OpenAccountItem[]>([])
 	const loading = ref(false)
 	const loadError = ref('')
@@ -461,6 +458,7 @@
   const serverMaintenanceMessage = ref('')
 	const userEmail = ref('')
 	const currentOpenAccountId = ref<number | null>(null)
+const currentOpenAccountEmail = ref('')
 const showEmailDialog = ref(false)
 const showEmailSaveConfirm = ref(false)
 const showNoWarrantySwitchDialog = ref(false)
@@ -483,33 +481,27 @@ const creditCostRange = computed(() => {
   return `${fmt(base * 0.2)} ~ ${fmt(base)}`
 })
 
-const redeemBlockedHoursLabel = computed(() => {
-  const start = rules.value?.redeemBlockedHours?.start ?? 0
-  const end = rules.value?.redeemBlockedHours?.end ?? 8
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `${pad(start)}:00-${pad(end)}:00`
+const normalizeEmailValue = (value: string | null | undefined) => String(value || '').trim().toLowerCase()
+
+const needsReboardCurrentAccount = computed(() => {
+  if (!currentOpenAccountId.value) return false
+  const onboardedEmail = normalizeEmailValue(currentOpenAccountEmail.value)
+  const currentEmail = normalizeEmailValue(userEmail.value)
+  if (!onboardedEmail || !currentEmail) return false
+  return onboardedEmail !== currentEmail
 })
 
-const redeemBlockedMessage = computed(() => {
-  if (rules.value?.redeemBlockedMessage) return rules.value.redeemBlockedMessage
-  const end = rules.value?.redeemBlockedHours?.end ?? 8
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `开放账号每日 ${redeemBlockedHoursLabel.value} 暂停兑换，请在 ${pad(end)}:00 后再试`
-})
+const isCardBoarded = (accountId: number) => {
+  return currentOpenAccountId.value === accountId && !needsReboardCurrentAccount.value
+}
 
-const redeemBlockedNow = computed(() => {
-  if (typeof rules.value?.redeemBlockedNow === 'boolean') {
-    return rules.value.redeemBlockedNow
-  }
-  const start = rules.value?.redeemBlockedHours?.start ?? 0
-  const end = rules.value?.redeemBlockedHours?.end ?? 8
-  const hour = new Date().getHours()
-  return hour >= start && hour < end
-})
+const isCardReboard = (accountId: number) => {
+  return currentOpenAccountId.value === accountId && needsReboardCurrentAccount.value
+}
 
 const sortedAccounts = computed(() => {
   const list = accounts.value || []
-  const currentId = currentOpenAccountId.value
+  const currentId = needsReboardCurrentAccount.value ? null : currentOpenAccountId.value
   if (!currentId) return list
   const current = list.find(item => item.id === currentId)
   if (!current) return list
@@ -578,6 +570,7 @@ const loadMe = async () => {
     const me = await linuxDoUserService.getMe(sessionToken.value)
     userEmail.value = me.email || ''
     currentOpenAccountId.value = me.currentOpenAccountId ?? null
+    currentOpenAccountEmail.value = me.currentOpenAccountEmail || ''
     emailDraft.value = userEmail.value
   } catch (error: any) {
     console.warn('读取 Linux DO 用户邮箱失败:', error?.response?.data?.error || error?.message || error)
@@ -654,6 +647,7 @@ const doSaveEmail = async () => {
     const me = await linuxDoUserService.updateEmail(sessionToken.value, emailDraft.value)
     userEmail.value = me.email || ''
     currentOpenAccountId.value = me.currentOpenAccountId ?? null
+    currentOpenAccountEmail.value = me.currentOpenAccountEmail || ''
     showEmailDialog.value = false
     showEmailSaveConfirm.value = false
     showSuccessToast('邮箱已更新')
@@ -778,9 +772,10 @@ const openCreditPayPage = (creditOrder?: { payUrl?: string | null; payRequest?: 
 	        showErrorToast('Credit 订单状态异常，请刷新后重试')
 	        stopCreditPolling()
 	        return
-	      }
+      }
 
       currentOpenAccountId.value = result.currentOpenAccountId
+      currentOpenAccountEmail.value = userEmail.value || ''
       await loadOpenAccounts()
       await loadMe()
       showSuccessToast(result.message || '上车成功')
@@ -823,10 +818,6 @@ const startCreditPolling = (orderNo: string, accountId: number) => {
 
 const doBoard = async (accountId: number) => {
   if (!sessionToken.value) return
-  if (redeemBlockedNow.value) {
-    showErrorToast(redeemBlockedMessage.value)
-    return
-  }
   if (!userEmail.value) {
     showErrorToast('请先配置接收邮箱')
     openEmailDialog()
@@ -842,9 +833,10 @@ const doBoard = async (accountId: number) => {
 	      openCreditPayPage(result.creditOrder)
 	      startCreditPolling(result.creditOrder.orderNo, accountId)
 	      return
-	    }
+    }
 
     currentOpenAccountId.value = result.currentOpenAccountId
+    currentOpenAccountEmail.value = userEmail.value || ''
     await loadOpenAccounts()
     await loadMe()
     showSuccessToast(result.message || '上车成功')

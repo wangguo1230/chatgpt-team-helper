@@ -51,12 +51,19 @@ API Key 的读取优先级：
 | 字段 | 必填 | 类型 | 说明 |
 | --- | --- | --- | --- |
 | `email` | 是 | string | 账号邮箱（会被转小写并 trim） |
-| `token` | 是 | string | access token |
-| `refreshToken` | 否 | string | refresh token |
+| `token` | 是 | string | access token；也支持传入 JSON 字符串（自动提取 `access_token`） |
+| `refreshToken` | 否 | string | refresh token；也支持传入 JSON 字符串（自动提取 `refresh_token`） |
 | `chatgptAccountId` | 否 | string | ChatGPT account id（用于优先匹配已有账号） |
 | `oaiDeviceId` | 否 | string | `oai-did` |
 | `expireAt` | 否 | string/number | 过期时间：支持 `YYYY/MM/DD HH:mm`、`YYYY-MM-DD HH:mm`、毫秒时间戳 |
 | `isDemoted`/`is_demoted` | 否 | boolean/number | **Deprecated**：已弃用（请求会被忽略；响应恒为 `false`，仅保留兼容） |
+
+兼容别名（可直接传 OpenAI OAuth/客户端返回 JSON）：
+
+- `access_token`、`refresh_token`
+- `account_id` / `chatgpt_account_id`
+- `oai_device_id`
+- `expired` / `expires_at`
 
 **行为说明**
 
@@ -65,6 +72,7 @@ API Key 的读取优先级：
 - `isDemoted`/`is_demoted`：已弃用，后端会忽略该字段。
 - 新建账号时会自动生成若干兑换码（`generatedCodes` 字段返回）。
 - 会触发一次账号同步（`syncResult`/`removedUsers` 字段返回）。
+- `token`/`refreshToken` 支持直接粘贴 JSON；如果请求体直接包含 `access_token` 等字段，也可直接创建/更新。
 
 **响应**
 
@@ -79,14 +87,30 @@ API Key 的读取优先级：
 curl -X POST "https://<host>/api/auto-boarding" \
   -H "Content-Type: application/json" \
   -H "x-api-key: <your_api_key>" \
-	  -d '{
-	    "email": "user@example.com",
-	    "token": "eyJhbGciOi...",
-	    "refreshToken": "eyJhbGciOi...",
-	    "chatgptAccountId": "acct_...",
-	    "oaiDeviceId": "oai-did-...",
-	    "expireAt": "2026/01/27 12:00"
-	  }'
+  -d '{
+    "email": "user@example.com",
+    "token": "eyJhbGciOi...",
+    "refreshToken": "rt_xxx",
+    "chatgptAccountId": "acct_...",
+    "oaiDeviceId": "oai-did-...",
+    "expireAt": "2026/01/27 12:00"
+  }'
+```
+
+也支持直接提交整包 JSON（后端自动提取）：
+
+```bash
+curl -X POST "https://<host>/api/auto-boarding" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <your_api_key>" \
+  -d '{
+    "access_token": "eyJhbGciOi...",
+    "refresh_token": "rt_xxx",
+    "account_id": "fa337943-cf04-4eab-ad34-a9669f36a0b4",
+    "email": "user@example.com",
+    "expired": "2026-03-23T11:27:45+08:00",
+    "oai_device_id": "oai-did-..."
+  }'
 ```
 
 ### 4.2 GET `/api/auto-boarding/stats`

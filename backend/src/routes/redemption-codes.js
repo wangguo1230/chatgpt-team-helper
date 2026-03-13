@@ -31,6 +31,7 @@ import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 import { getChannels, normalizeChannelKey } from '../utils/channels.js'
 import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 import { getAccountRecoverySettings } from '../utils/account-recovery-settings.js'
+import { getRedemptionCodeSettings } from '../utils/redemption-settings.js'
 
 const router = express.Router()
 
@@ -198,12 +199,15 @@ const mapCodeRow = (row, channelsByKey) => {
   const channelValue = normalizeChannel(row[6], 'common')
   const storedChannelName = row[7] == null ? '' : String(row[7]).trim()
   const channelName = storedChannelName || resolveChannelNameFromRegistry(channelsByKey, channelValue) || channelValue
+  const redeemedBy = row[4]
+  const redeemedEmail = extractEmailFromRedeemedBy(redeemedBy) || null
   return {
     id: row[0],
     code: row[1],
     isRedeemed: row[2] === 1,
     redeemedAt: row[3],
-    redeemedBy: row[4],
+    redeemedBy,
+    redeemedEmail,
     accountEmail: row[5],
     channel: channelValue,
     channelName,
@@ -216,8 +220,9 @@ const mapCodeRow = (row, channelsByKey) => {
     reservedForOrderNo: row.length > 14 ? row[14] || null : null,
     reservedForOrderEmail: row.length > 15 ? row[15] || null : null,
     orderType: row.length > 16 ? row[16] || null : null,
+    serviceDays: row.length > 17 ? row[17] || null : null,
     // Optional: may be present when list API joins gpt_accounts.
-    accountIsBanned: row.length > 17 ? toInt(row[17], 0) === 1 : undefined
+    accountIsBanned: row.length > 18 ? toInt(row[18], 0) === 1 : undefined
   }
 }
 
@@ -374,7 +379,7 @@ export async function redeemCodeInternal({
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
              account_email, channel, channel_name, created_at, updated_at,
              reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-             reserved_for_order_no, reserved_for_order_email, order_type
+             reserved_for_order_no, reserved_for_order_email, order_type, service_days
       FROM redemption_codes
       WHERE code = ?
     `, [sanitizedCode])
@@ -744,14 +749,16 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
       req.query.page != null ||
       req.query.pageSize != null ||
       req.query.search != null ||
-      req.query.status != null
+      req.query.status != null ||
+      req.query.redeemedEmail != null ||
+      req.query.redeemed_email != null
 
     if (!paginated) {
       const result = db.exec(`
         SELECT rc.id, rc.code, rc.is_redeemed, rc.redeemed_at, rc.redeemed_by,
                rc.account_email, rc.channel, rc.channel_name, rc.created_at, rc.updated_at,
                rc.reserved_for_uid, rc.reserved_for_username, rc.reserved_for_entry_id, rc.reserved_at,
-               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type,
+               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type, rc.service_days,
                CASE
                  WHEN ga.id IS NULL THEN 0
                  ELSE COALESCE(ga.is_banned, 0)
@@ -774,6 +781,7 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
     const rawPage = Math.max(1, toInt(req.query.page, 1))
     const search = String(req.query.search || '').trim().toLowerCase()
     const status = String(req.query.status || 'all').trim().toLowerCase()
+    const redeemedEmail = String(req.query.redeemedEmail ?? req.query.redeemed_email ?? '').trim().toLowerCase()
 
     const conditions = []
     const params = []
@@ -801,6 +809,12 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
       params.push(keyword, keyword, keyword, keyword, keyword, keyword)
     }
 
+    if (redeemedEmail) {
+      const keyword = `%${redeemedEmail}%`
+      conditions.push('LOWER(COALESCE(rc.redeemed_by, \'\')) LIKE ?')
+      params.push(keyword)
+    }
+
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
 
     const countResult = db.exec(
@@ -821,7 +835,7 @@ router.get('/', authenticateToken, requireMenu('redemption_codes'), async (req, 
         SELECT rc.id, rc.code, rc.is_redeemed, rc.redeemed_at, rc.redeemed_by,
                rc.account_email, rc.channel, rc.channel_name, rc.created_at, rc.updated_at,
                rc.reserved_for_uid, rc.reserved_for_username, rc.reserved_for_entry_id, rc.reserved_at,
-               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type,
+               rc.reserved_for_order_no, rc.reserved_for_order_email, rc.order_type, rc.service_days,
                CASE
                  WHEN ga.id IS NULL THEN 0
                  ELSE COALESCE(ga.is_banned, 0)
@@ -939,10 +953,14 @@ router.post('/:id/reinvite', authenticateToken, requireMenu('redemption_codes'),
 // 批量创建兑换码
 router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async (req, res) => {
   try {
-    const { count, accountEmail, channel } = req.body
+    const { count, accountEmail, channel, orderType, serviceDays } = req.body
+    const requestedCount = Number.parseInt(String(count ?? ''), 10)
+    const db = await getDatabase()
+    const redemptionSettings = getRedemptionCodeSettings(db)
+    const batchCreateMaxCount = redemptionSettings.batchCreateMaxCount
 
-    if (!count || count < 1 || count > 1000) {
-      return res.status(400).json({ error: '数量必须在 1-1000 之间' })
+    if (!Number.isFinite(requestedCount) || requestedCount < 1 || requestedCount > batchCreateMaxCount) {
+      return res.status(400).json({ error: `数量必须在 1-${batchCreateMaxCount} 之间` })
     }
 
     // 必须指定账号
@@ -950,12 +968,26 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       return res.status(400).json({ error: '必须指定所属账号邮箱' })
     }
 
-    const db = await getDatabase()
+    const rawOrderType = orderType == null ? '' : String(orderType).trim().toLowerCase()
+    const resolvedOrderType = rawOrderType ? normalizeOrderType(rawOrderType) : ORDER_TYPE_WARRANTY
+    if (rawOrderType && resolvedOrderType !== rawOrderType) {
+      return res.status(400).json({ error: 'orderType 不合法（仅支持 warranty/no_warranty/anti_ban）' })
+    }
+
+    let resolvedServiceDays = null
+    if (resolvedOrderType !== ORDER_TYPE_NO_WARRANTY && serviceDays !== undefined && serviceDays !== null && String(serviceDays).trim() !== '') {
+      const parsedServiceDays = Number.parseInt(String(serviceDays), 10)
+      if (!Number.isFinite(parsedServiceDays) || parsedServiceDays < 1 || parsedServiceDays > 3650) {
+        return res.status(400).json({ error: 'serviceDays 不合法（必须为 1-3650 的整数）' })
+      }
+      resolvedServiceDays = parsedServiceDays
+    }
+
     const { byKey: channelsByKey } = await getChannels(db)
 
     // 检查账号是否存在并获取当前人数
     const accountResult = db.exec(`
-      SELECT id, email, user_count FROM gpt_accounts WHERE email = ?
+      SELECT id, email, user_count, expire_at FROM gpt_accounts WHERE email = ?
     `, [accountEmail])
 
     if (accountResult.length === 0 || accountResult[0].values.length === 0) {
@@ -964,6 +996,14 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
 
     const accountRow = accountResult[0].values[0]
     const currentUserCount = accountRow[2] || 0
+    const expireAt = accountRow[3]
+
+    if (expireAt) {
+      const expireMs = parseExpireAtToMs(expireAt)
+      if (expireMs != null && expireMs < Date.now()) {
+        return res.status(400).json({ error: '该账号已过期，无法创建兑换码' })
+      }
+    }
 
     // 如果账号已满员（5人），不能创建兑换码
     if (currentUserCount >= 5) {
@@ -996,11 +1036,11 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       })
     }
 
-    const actualCount = Math.min(count, availableSlots)
+    const actualCount = Math.min(requestedCount, availableSlots)
 
     // 如果请求数量超过可用名额，给出详细提示
-    if (count > availableSlots) {
-      console.log(`请求生成${count}个兑换码，但账号只有${availableSlots}个可用名额（当前${currentUserCount}人，已有${unusedCodesCount}个未使用兑换码），将只生成${actualCount}个`)
+    if (requestedCount > availableSlots) {
+      console.log(`请求生成${requestedCount}个兑换码，但账号只有${availableSlots}个可用名额（当前${currentUserCount}人，已有${unusedCodesCount}个未使用兑换码），将只生成${actualCount}个`)
     }
 
     const normalizedChannel = normalizeChannel(channel, 'common')
@@ -1022,8 +1062,8 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       while (attempts < 4 && !success) {
         try {
           db.run(
-            `INSERT INTO redemption_codes (code, account_email, channel, channel_name, created_at, updated_at) VALUES (?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-            [code, accountEmail, normalizedChannel, resolvedChannelName]
+            `INSERT INTO redemption_codes (code, account_email, channel, channel_name, order_type, service_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
+            [code, accountEmail, normalizedChannel, resolvedChannelName, resolvedOrderType, resolvedServiceDays]
           )
           createdCodes.push(code)
           success = true
@@ -1050,7 +1090,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
              account_email, channel, channel_name, created_at, updated_at,
              reserved_for_uid, reserved_for_username, reserved_for_entry_id, reserved_at,
-             reserved_for_order_no, reserved_for_order_email, order_type
+             reserved_for_order_no, reserved_for_order_email, order_type, service_days
       FROM redemption_codes
       WHERE code IN (${createdCodes.map(() => '?').join(',')})
       ORDER BY created_at DESC
@@ -1066,7 +1106,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       unusedCodesCount: unusedCodesCount + createdCodes.length,
       allCodesCount: unusedCodesCount + createdCodes.length, // 兼容旧前端字段
       availableSlots: availableSlots - createdCodes.length,
-      info: count > availableSlots ? `由于账号可用名额限制（当前${currentUserCount}人 + ${unusedCodesCount}个未使用兑换码），只生成了${actualCount}个兑换码` : undefined
+      info: requestedCount > availableSlots ? `由于账号可用名额限制（当前${currentUserCount}人 + ${unusedCodesCount}个未使用兑换码），只生成了${actualCount}个兑换码` : undefined
     })
   } catch (error) {
     console.error('批量创建兑换码错误:', error)
@@ -2541,6 +2581,7 @@ router.get('/artisan-flow/today', apiKeyAuth, async (req, res) => {
           isRedeemed: row[2] === 1,
           redeemedAt: row[3],
           redeemedBy: row[4],
+          redeemedEmail: extractEmailFromRedeemedBy(row[4]) || null,
           accountEmail: row[5],
           channel: row[6],
           channelName: row[7],

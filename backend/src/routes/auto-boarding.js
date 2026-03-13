@@ -2,6 +2,7 @@ import express from 'express'
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { syncAccountUserCount } from '../services/account-sync.js'
+import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
 
 const router = express.Router()
 
@@ -59,6 +60,11 @@ const normalizeExpireAt = (value) => {
     }
   }
 
+  const parsedMs = Date.parse(raw)
+  if (!Number.isNaN(parsedMs)) {
+    return formatExpireAt(new Date(parsedMs))
+  }
+
   return null
 }
 
@@ -86,20 +92,6 @@ const deriveExpireAtFromToken = (token) => {
   const date = new Date(exp * 1000)
   if (Number.isNaN(date.getTime())) return null
   return formatExpireAt(date)
-}
-
-// 生成随机兑换码的辅助函数
-function generateRedemptionCode(length = 12) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // 排除容易混淆的字符
-  let code = ''
-  for (let i = 0; i < length; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length))
-    // 每4位添加一个分隔符
-    if ((i + 1) % 4 === 0 && i < length - 1) {
-      code += '-'
-    }
-  }
-  return code
 }
 
 async function syncAccountAndCleanup(account) {
@@ -143,15 +135,29 @@ async function syncAccountAndCleanup(account) {
 // 自动上车接口
 router.post('/', apiKeyAuth, async (req, res) => {
   try {
-    const { email, token, refreshToken, chatgptAccountId, oaiDeviceId } = req.body
     const body = req.body || {}
-    const hasExpireAt = Object.prototype.hasOwnProperty.call(req.body || {}, 'expireAt')
-    const expireAtInput = req.body?.expireAt
+    const extracted = extractOpenAiAccountPayload(body)
+    if (extracted.parseErrors.length > 0) {
+      return res.status(400).json({
+        error: extracted.parseErrors[0],
+        message: extracted.parseErrors[0]
+      })
+    }
+
+    const email = String(extracted.email || body.email || '').trim()
+    const token = String(extracted.token || '').trim()
+    const refreshToken = String(extracted.refreshToken || '').trim()
+    const chatgptAccountId = String(extracted.chatgptAccountId || '').trim()
+    const oaiDeviceId = String(extracted.oaiDeviceId || body.oaiDeviceId || '').trim()
+    const hasExpireAt = extracted.hasExpireAt || Object.prototype.hasOwnProperty.call(body, 'expireAt')
+    const expireAtInput = hasExpireAt
+      ? (extracted.hasExpireAt ? extracted.expireAtInput : body.expireAt)
+      : null
     const normalizedExpireAt = hasExpireAt ? normalizeExpireAt(expireAtInput) : null
-	    const shouldUpdateExpireAt = hasExpireAt || Boolean(deriveExpireAtFromToken(token))
-	    const derivedExpireAt = shouldUpdateExpireAt && !hasExpireAt ? deriveExpireAtFromToken(token) : null
-	    const expireAt = hasExpireAt ? normalizedExpireAt : (derivedExpireAt || null)
-	    // isDemoted/is_demoted: deprecated (ignored). Keep request compatibility.
+    const shouldUpdateExpireAt = hasExpireAt || Boolean(deriveExpireAtFromToken(token))
+    const derivedExpireAt = shouldUpdateExpireAt && !hasExpireAt ? deriveExpireAtFromToken(token) : null
+    const expireAt = hasExpireAt ? normalizedExpireAt : (derivedExpireAt || null)
+    // isDemoted/is_demoted: deprecated (ignored). Keep request compatibility.
 
     if (hasExpireAt && expireAtInput != null && String(expireAtInput).trim() && !normalizedExpireAt) {
       return res.status(400).json({
@@ -283,41 +289,6 @@ router.post('/', apiKeyAuth, async (req, res) => {
 	        updatedAt: row[9]
 	      }
 
-      // 自动生成兑换码，数量为可用名额
-      // 可用名额 = 总容量(5) - 当前人数(1) - 所有兑换码数(0) = 4
-      const totalCapacity = 5
-      const currentUserCount = 1  // 刚创建的账号默认人数为1
-      const allCodesCount = 0  // 新账号还没有任何兑换码
-      const availableSlots = totalCapacity - currentUserCount - allCodesCount
-      const codesToGenerate = Math.min(4, availableSlots)  // 生成4个兑换码（正好填满可用名额）
-
-      const generatedCodes = []
-      for (let i = 0; i < codesToGenerate; i++) {
-        let code = generateRedemptionCode()
-        let attempts = 0
-        let success = false
-
-        // 尝试生成唯一的兑换码（最多重试4次）
-        while (attempts < 4 && !success) {
-          try {
-	            db.run(
-	              `INSERT INTO redemption_codes (code, account_email, created_at, updated_at) VALUES (?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-	              [code, normalizedEmail]
-	            )
-	            generatedCodes.push(code)
-	            success = true
-	          } catch (err) {
-            if (err.message.includes('UNIQUE')) {
-              // 如果重复，重新生成
-              code = generateRedemptionCode()
-              attempts++
-            } else {
-              throw err
-            }
-          }
-        }
-      }
-
       saveDatabase()
 
       const { account: responseAccount, syncResult, removedUsers } = await syncAccountAndCleanup(account)
@@ -327,8 +298,8 @@ router.post('/', apiKeyAuth, async (req, res) => {
         message: '自动上车成功！账号已添加到系统',
         action: 'created',
         account: responseAccount,
-        generatedCodes,
-        codesMessage: `已自动生成${generatedCodes.length}个兑换码`,
+        generatedCodes: [],
+        codesMessage: '已关闭自动生成兑换码',
         syncResult,
         removedUsers
       })

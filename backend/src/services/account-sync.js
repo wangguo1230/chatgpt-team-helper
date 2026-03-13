@@ -374,7 +374,7 @@ const parseJsonOrThrow = (text, { logContext, message }) => {
 /**
  * 删除指定账号关联的所有未使用兑换码
  */
-async function deleteUnusedCodesByAccountId(db, accountId) {
+export async function deleteUnusedCodesByAccountId(db, accountId) {
   try {
     const account = await fetchAccountById(db, accountId)
     if (account?.email) {

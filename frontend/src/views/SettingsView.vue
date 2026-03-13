@@ -153,6 +153,12 @@ const emailDomainWhitelistError = ref('')
 const emailDomainWhitelistSuccess = ref('')
 const emailDomainWhitelistLoading = ref(false)
 
+// 兑换码设置（仅超级管理员）
+const redemptionBatchCreateMaxCount = ref('5')
+const redemptionCodeSettingsError = ref('')
+const redemptionCodeSettingsSuccess = ref('')
+const redemptionCodeSettingsLoading = ref(false)
+
 // 积分提现设置（仅超级管理员）
 const pointsWithdrawRatePoints = ref('1')
 const pointsWithdrawRateCashYuan = ref('1.00')
@@ -252,6 +258,7 @@ onMounted(async () => {
     loadPurchaseProducts(),
     loadPurchaseAvailability(),
     loadEmailDomainWhitelist(),
+    loadRedemptionCodeSettings(),
     loadPointsWithdrawSettings(),
     loadSmtpSettings(),
     loadLinuxDoOAuthSettings(),
@@ -680,6 +687,41 @@ const saveEmailDomainWhitelist = async () => {
     emailDomainWhitelistError.value = err.response?.data?.error || '保存失败'
   } finally {
     emailDomainWhitelistLoading.value = false
+  }
+}
+
+const loadRedemptionCodeSettings = async () => {
+  redemptionCodeSettingsError.value = ''
+  redemptionCodeSettingsSuccess.value = ''
+  try {
+    const response = await adminService.getRedemptionCodeSettings()
+    redemptionBatchCreateMaxCount.value = String(response.settings?.batchCreateMaxCount ?? response.effective?.batchCreateMaxCount ?? 5)
+  } catch (err: any) {
+    redemptionCodeSettingsError.value = err.response?.data?.error || '加载兑换码设置失败'
+  }
+}
+
+const saveRedemptionCodeSettings = async () => {
+  redemptionCodeSettingsError.value = ''
+  redemptionCodeSettingsSuccess.value = ''
+  redemptionCodeSettingsLoading.value = true
+  try {
+    const parsed = Number.parseInt(redemptionBatchCreateMaxCount.value, 10)
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 1000) {
+      redemptionCodeSettingsError.value = '单次创建上限必须在 1-1000 之间'
+      return
+    }
+
+    const response = await adminService.updateRedemptionCodeSettings({
+      batchCreateMaxCount: parsed
+    })
+    redemptionBatchCreateMaxCount.value = String(response.settings?.batchCreateMaxCount ?? parsed)
+    redemptionCodeSettingsSuccess.value = '已保存'
+    setTimeout(() => (redemptionCodeSettingsSuccess.value = ''), 3000)
+  } catch (err: any) {
+    redemptionCodeSettingsError.value = err.response?.data?.error || '保存失败'
+  } finally {
+    redemptionCodeSettingsLoading.value = false
   }
 }
 
@@ -1415,6 +1457,58 @@ const savePointsWithdrawSettings = async () => {
           >
             {{ emailDomainWhitelistLoading ? '保存中...' : '保存白名单' }}
           </Button>
+        </CardContent>
+      </Card>
+
+      <!-- 兑换码创建上限 -->
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
+        <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
+          <CardTitle class="text-xl font-bold text-gray-900">兑换码创建上限</CardTitle>
+          <CardDescription class="text-gray-500">
+            控制“批量生成兑换码”单次可提交的最大数量。默认 5，可在系统设置覆盖；未配置时使用环境变量。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="p-6 sm:p-8 space-y-5 flex-1">
+          <div class="space-y-2">
+            <Label for="redemptionBatchCreateMaxCount" class="text-xs font-semibold text-gray-500 uppercase tracking-wider">单次创建最大数量</Label>
+            <Input
+              id="redemptionBatchCreateMaxCount"
+              v-model="redemptionBatchCreateMaxCount"
+              type="number"
+              min="1"
+              max="1000"
+              placeholder="5"
+              class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+            />
+            <p class="text-xs text-gray-400">建议值：5（满足常见 Team 名额分配场景）。</p>
+          </div>
+
+          <div v-if="redemptionCodeSettingsError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
+            {{ redemptionCodeSettingsError }}
+          </div>
+
+          <div v-if="redemptionCodeSettingsSuccess" class="rounded-xl bg-green-50 p-4 text-green-600 border border-green-100 text-sm font-medium">
+            {{ redemptionCodeSettingsSuccess }}
+          </div>
+
+          <div class="flex flex-col sm:flex-row gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 px-4 border-gray-200 rounded-xl"
+              @click="loadRedemptionCodeSettings"
+            >
+              刷新
+            </Button>
+            <Button
+              type="button"
+              :disabled="redemptionCodeSettingsLoading"
+              class="w-full h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5"
+              @click="saveRedemptionCodeSettings"
+            >
+              {{ redemptionCodeSettingsLoading ? '保存中...' : '保存兑换码设置' }}
+            </Button>
+          </div>
         </CardContent>
       </Card>
 

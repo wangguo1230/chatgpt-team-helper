@@ -35,7 +35,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `views/LinuxDoOpenAccountsView.vue` | 开放账号卡片页 + 上车交互 |
+| `views/LinuxDoOpenAccountsView.vue` | 开放账号卡片页（前台标题：栗子LDC）+ 上车交互 |
 | `composables/useLinuxDoAuthSession.ts` | LinuxDo OAuth 状态管理 |
 | `views/PointsExchangeView.vue` | 站内积分兑换 / 提现（独立于 LDC） |
 | `views/CreditOrdersView.vue` | 管理后台 Credit 订单列表 |
@@ -115,7 +115,7 @@ sequenceDiagram
    | ≥ 25 天 | 原价 |
 
 4. **首次点击"上车"（创建订单）**
-   - 校验：维护模式 / 屏蔽时段 (00:00-08:00) / 全局日限额 / 用户日限额 / 账号满员(5人) / 邮箱配置
+   - 校验：维护模式 / 全局日限额 / 用户日限额 / 账号满员(5人) / 邮箱配置
    - 预留一个 `linux-do` 渠道兑换码 → `reserved_for_order_no`
    - 创建 `credit_orders` 记录（场景=`open_accounts_board`）
    - 返回 `requiresCredit=true` + 签名参数，前端 form POST 到 `credit.linux.do/pay/submit.php`
@@ -135,10 +135,11 @@ sequenceDiagram
 
 | 机制 | 配置 | 默认值 |
 |------|------|--------|
-| 全局每日上车上限 | `OPEN_ACCOUNTS_DAILY_BOARD_LIMIT` | 10 |
-| 用户每日上车限制 | `OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT` | 1 |
+| 全局每日上车上限 | `OPEN_ACCOUNTS_DAILY_BOARD_LIMIT` | 0（不限制） |
+| 用户每日上车限制 | `OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT` | 0（不限制） |
+| 用户日限开关 | `OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT_ENABLED` | false（关闭） |
 | 订单过期时间 | `CREDIT_ORDER_EXPIRE_MINUTES` | 15 分钟 |
-| 兑换屏蔽时段 | 凌晨 0:00 ~ 8:00 | 固定 |
+| 兑换屏蔽时段 | 无默认固定时段拦截 | - |
 | 维护模式 | `OPEN_ACCOUNTS_ENABLED` | true |
 | 并发锁 | `withLocks([uid, accountId])` | - |
 | 短重试 | 429/403/5xx 错误自动重试 | 3 次 |
@@ -212,9 +213,9 @@ LINUXDO_CREDIT_BASE_URL=https://credit.linux.do/epay
 # 积分商品配置
 OPEN_ACCOUNTS_CREDIT_COST=30                    # 上车所需 LDC
 OPEN_ACCOUNTS_CREDIT_TITLE=开放账号上车          # 订单标题
-OPEN_ACCOUNTS_DAILY_BOARD_LIMIT=10              # 全局日限
-OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT_ENABLED=true
-OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT=1
+OPEN_ACCOUNTS_DAILY_BOARD_LIMIT=0               # 全局日限（0=不限制）
+OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT_ENABLED=false
+OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT=0          # 用户日限（仅开关开启时生效）
 CREDIT_ORDER_EXPIRE_MINUTES=15                  # 订单超时
 OPEN_ACCOUNTS_ENABLED=true                      # 功能开关
 ```

@@ -39,8 +39,11 @@ const error = ref('')
 const teleportReady = ref(false)
 const showBatchDialog = ref(false)
 const batchCount = ref(10)
+const batchCreateMaxCount = ref(5)
 const selectedAccountEmail = ref('')
 const selectedBatchChannel = ref('common')
+const batchOrderType = ref<PurchaseOrderType>('warranty')
+const batchServiceDays = ref(30)
 const creating = ref(false)
 const selectedCodes = ref<number[]>([])
 const showRedeemDialog = ref(false)
@@ -70,6 +73,7 @@ const orderTypeOptions: { value: PurchaseOrderType; label: string }[] = [
   { value: 'warranty', label: '质保订单' },
   { value: 'no_warranty', label: '无质保订单' },
 ]
+const isBatchNoWarrantyOrder = computed(() => batchOrderType.value === 'no_warranty')
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const updatingChannelId = ref<number | null>(null)
 let popoverTimer: ReturnType<typeof setTimeout> | null = null
@@ -85,7 +89,16 @@ const accountsByEmail = computed(() => {
   return map
 })
 
-const activeAccounts = computed(() => accounts.value.filter(account => account.isOpen && !account.isBanned))
+const activeAccounts = computed(() => accounts.value.filter(account => {
+  if (!account.isOpen || account.isBanned) return false
+  if (account.expireAt) {
+    const expireTime = new Date(account.expireAt).getTime()
+    if (!Number.isNaN(expireTime) && expireTime < Date.now()) {
+      return false
+    }
+  }
+  return true
+}))
 
 const isAccountBanned = (accountEmail?: string | null) => {
   const normalizedEmail = String(accountEmail || '').trim().toLowerCase()
@@ -135,9 +148,19 @@ const extractRedeemerEmail = (redeemedBy?: string | null) => {
   if (match?.[1]) return match[1]
   return EMAIL_REGEX.test(raw) ? raw : ''
 }
-const getRedeemerEmail = (code: RedemptionCode) => extractRedeemerEmail(code.redeemedBy)
+const getRedeemerEmail = (code: RedemptionCode) => String(code.redeemedEmail || '').trim() || extractRedeemerEmail(code.redeemedBy)
 const getRedeemerDisplay = (code: RedemptionCode) => code.redeemedBy || code.reservedForUid || ''
 const hasPendingReservation = (code: RedemptionCode) => Boolean(code.reservedForUid && !code.isRedeemed)
+const normalizeOrderTypeValue = (value?: string | null) => String(value || '').trim().toLowerCase()
+const getOrderTypeLabel = (code: RedemptionCode) => {
+  const orderType = normalizeOrderTypeValue(code.orderType)
+  const serviceDays = Number(code.serviceDays || 0)
+  const hasWarrantyDays = Number.isFinite(serviceDays) && serviceDays > 0
+  if (orderType === 'no_warranty' || orderType === 'no-warranty' || orderType === 'nowarranty') return '无质保'
+  if (orderType === 'anti_ban' || orderType === 'anti-ban') return '防封禁'
+  if (orderType === 'warranty') return hasWarrantyDays ? '质保' : '无质保'
+  return hasWarrantyDays ? '质保' : '无质保'
+}
 
 const hideTextPopover = () => {
   showTextPopover.value = false
@@ -195,6 +218,7 @@ const pageSize = ref(10)
 // 搜索和筛选状态
 const searchQuery = ref('')
 const statusFilter = ref<'全部' | '已使用' | '未使用'>('全部')
+const redeemedEmailFilter = ref('')
 
 // 计算总页数
 const totalPages = computed(() => Math.max(1, Math.ceil(totalCodes.value / pageSize.value)))
@@ -227,6 +251,7 @@ const handleSearch = () => {
 const clearFilters = () => {
   searchQuery.value = ''
   statusFilter.value = '全部'
+  redeemedEmailFilter.value = ''
   currentPage.value = 1
   loadCodes()
 }
@@ -255,6 +280,13 @@ const applySearchFromQuery = () => {
 const loadChannels = async () => {
   try {
     const runtime = await configService.getRuntimeConfig()
+    const runtimeBatchMax = Number(runtime.redemptionBatchCreateMaxCount)
+    if (Number.isFinite(runtimeBatchMax) && runtimeBatchMax >= 1) {
+      batchCreateMaxCount.value = Math.floor(runtimeBatchMax)
+      if (batchCount.value > batchCreateMaxCount.value) {
+        batchCount.value = batchCreateMaxCount.value
+      }
+    }
     const channels = Array.isArray(runtime.channels) ? runtime.channels : []
     if (!channels.length) return
 
@@ -335,6 +367,7 @@ const loadCodes = async () => {
       pageSize: pageSize.value,
       search: searchQuery.value.trim() || undefined,
       status,
+      redeemedEmail: redeemedEmailFilter.value.trim() || undefined,
     })
     codes.value = response.codes || []
     totalCodes.value = Number(response.pagination?.total || 0)
@@ -387,7 +420,7 @@ const truncateText = (text?: string | null, maxLength: number = 20) => {
 }
 
 const openBatchDialog = () => {
-  batchCount.value = 10
+  batchCount.value = Math.min(10, batchCreateMaxCount.value)
   selectedAccountEmail.value = activeAccounts.value.length > 0 ? (activeAccounts.value[0]?.email || '') : ''
   selectedBatchChannel.value = 'common'
   showBatchDialog.value = true
@@ -395,14 +428,21 @@ const openBatchDialog = () => {
 
 const closeBatchDialog = () => {
   showBatchDialog.value = false
-  batchCount.value = 10
+  batchCount.value = Math.min(10, batchCreateMaxCount.value)
   selectedAccountEmail.value = ''
   selectedBatchChannel.value = 'common'
+  batchOrderType.value = 'warranty'
+  batchServiceDays.value = 30
 }
 
 const handleBatchCreate = async () => {
-  if (batchCount.value < 1 || batchCount.value > 1000) {
-    error.value = '数量必须在 1-1000 之间'
+  if (batchCount.value < 1 || batchCount.value > batchCreateMaxCount.value) {
+    error.value = `数量必须在 1-${batchCreateMaxCount.value} 之间`
+    return
+  }
+
+  if (!isBatchNoWarrantyOrder.value && (!Number.isInteger(batchServiceDays.value) || batchServiceDays.value < 1 || batchServiceDays.value > 3650)) {
+    error.value = '质保天数必须为 1-3650 的整数'
     return
   }
 
@@ -415,7 +455,11 @@ const handleBatchCreate = async () => {
   error.value = ''
 
   try {
-    const result = await redemptionCodeService.batchCreate(batchCount.value, selectedAccountEmail.value, selectedBatchChannel.value)
+    const result = await redemptionCodeService.batchCreate(batchCount.value, selectedAccountEmail.value, {
+      channel: selectedBatchChannel.value,
+      orderType: batchOrderType.value,
+      serviceDays: isBatchNoWarrantyOrder.value ? undefined : batchServiceDays.value
+    })
     await loadCodes()
     closeBatchDialog()
 
@@ -667,6 +711,7 @@ const handleRedeemInvite = async () => {
       ...redeemTargetCode.value,
       isRedeemed: true,
       redeemedBy: email,
+      redeemedEmail: email,
       redeemedAt: updatedAt,
       orderType: redeemOrderType.value
     }
@@ -909,6 +954,14 @@ const handleInviteSubmit = async () => {
             class="pl-9 h-11 bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] focus:shadow-[0_4px_12px_rgba(0,0,0,0.06)] rounded-xl transition-all"
           />
         </div>
+        <div class="relative group w-full sm:w-72">
+          <Input
+            v-model="redeemedEmailFilter"
+            @input="handleSearch"
+            placeholder="按已使用邮箱筛选..."
+            class="h-11 bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] focus:shadow-[0_4px_12px_rgba(0,0,0,0.06)] rounded-xl transition-all"
+          />
+        </div>
         <Select v-model="statusFilter">
           <SelectTrigger class="h-11 w-[140px] bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] rounded-xl">
             <SelectValue placeholder="状态筛选" />
@@ -992,7 +1045,8 @@ const handleInviteSubmit = async () => {
                 <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">渠道</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">所属账号</th>
-                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换用户</th>
+                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换用户 / 邮箱 / 质保</th>
+                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider text-nowrap">质保天数</th>
                 <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
                 <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
               </tr>
@@ -1061,12 +1115,12 @@ const handleInviteSubmit = async () => {
                     <template v-if="code.accountEmail">
                       <button
                         type="button"
-                        class="inline-flex items-center gap-1 text-sm text-gray-600 truncate max-w-[180px] hover:text-blue-600 hover:underline transition-colors disabled:opacity-60 disabled:hover:no-underline"
+                        class="inline-flex items-center gap-1 text-sm text-gray-600 max-w-[220px] hover:text-blue-600 hover:underline transition-colors disabled:opacity-60 disabled:hover:no-underline"
                         :title="code.accountEmail"
                         :disabled="syncingAccountEmail === code.accountEmail"
                         @click="handleSyncAccountByEmail(code.accountEmail)"
                       >
-                        <span class="truncate" :class="isCodeAccountBanned(code) ? 'text-red-600' : ''">{{ code.accountEmail }}</span>
+                        <span class="break-all whitespace-normal leading-5" :class="isCodeAccountBanned(code) ? 'text-red-600' : ''">{{ code.accountEmail }}</span>
                         <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingAccountEmail === code.accountEmail }" />
 	                      </button>
 	                    </template>
@@ -1076,12 +1130,21 @@ const handleInviteSubmit = async () => {
                 <td class="px-6 py-5">
                    <div class="flex flex-col items-start gap-1">
                       <span
-                        class="text-sm font-medium text-gray-900 truncate max-w-[150px]"
+                        class="text-sm font-medium text-gray-900 break-all whitespace-normal leading-5 max-w-[220px]"
                         :class="getRedeemerEmail(code) ? 'cursor-pointer hover:text-blue-600' : ''"
                         :title="getRedeemerDisplay(code) || '-'"
                         @click="getRedeemerEmail(code) ? handleCopyRedeemerEmail(code) : null"
                       >
                         {{ getRedeemerDisplay(code) || '-' }}
+                      </span>
+                      <span
+                        v-if="code.isRedeemed"
+                        class="text-xs text-blue-600 break-all whitespace-normal leading-5 max-w-[220px]"
+                        :class="getRedeemerEmail(code) ? 'cursor-pointer hover:underline' : ''"
+                        :title="getRedeemerEmail(code) || '未记录邮箱'"
+                        @click="getRedeemerEmail(code) ? handleCopyRedeemerEmail(code) : null"
+                      >
+                        邮箱：{{ getRedeemerEmail(code) || '未记录' }}
                       </span>
                       <span
                         v-if="hasPendingReservation(code)"
@@ -1093,11 +1156,17 @@ const handleInviteSubmit = async () => {
                         v-else-if="code.isRedeemed"
                         class="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-600"
                       >
-                        {{ code.orderType === 'no_warranty' ? '无质保' : (code.orderType === 'anti_ban' ? '防封禁' : '质保') }}
+                        {{ getOrderTypeLabel(code) }}
                       </span>
                    </div>
                 </td>
-                <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(code.createdAt, dateFormatOptions).split(' ')[0] }}</td>
+                <td class="px-6 py-5 text-center">
+                   <div class="flex flex-col items-center gap-0.5">
+                      <span class="text-sm font-semibold text-gray-900">{{ code.serviceDays || '-' }}</span>
+                      <span v-if="code.serviceDays" class="text-[10px] text-gray-400 font-medium scale-90">DAYS</span>
+                   </div>
+                </td>
+                <td class="px-6 py-5 text-sm text-gray-500 text-nowrap">{{ formatShanghaiDate(code.createdAt, dateFormatOptions).split(' ')[0] }}</td>
 	                <td class="px-6 py-5 text-right">
 	                  <div class="flex items-center justify-end gap-1">
 	                    <!-- Reinvite -->
@@ -1199,7 +1268,7 @@ const handleInviteSubmit = async () => {
 		                        <div class="w-4 h-4 flex-shrink-0 rounded-full bg-white flex items-center justify-center text-[10px] text-gray-500 font-bold shadow-sm">
 		                          {{ code.accountEmail.charAt(0).toUpperCase() }}
 		                        </div>
-		                        <span class="text-xs truncate" :class="isCodeAccountBanned(code) ? 'text-red-600' : 'text-gray-700'">{{ code.accountEmail }}</span>
+		                        <span class="text-xs break-all whitespace-normal leading-5" :class="isCodeAccountBanned(code) ? 'text-red-600' : 'text-gray-700'">{{ code.accountEmail }}</span>
 		                        <RefreshCw class="w-3.5 h-3.5 text-gray-400 ml-auto" :class="{ 'animate-spin': syncingAccountEmail === code.accountEmail }" />
 		                      </button>
                       <div v-else class="w-full h-8 flex items-center px-3 gap-2 bg-gray-50 border border-gray-200 rounded-lg overflow-hidden">
@@ -1222,18 +1291,27 @@ const handleInviteSubmit = async () => {
                       </span>
                    </div>
                    <p
-                      class="text-sm font-medium text-gray-900 mt-1 truncate"
+                      class="text-sm font-medium text-gray-900 mt-1 break-all whitespace-normal leading-5"
                       :class="getRedeemerEmail(code) ? 'cursor-pointer hover:text-blue-600' : ''"
                       :title="getRedeemerDisplay(code) || '-'"
                       @click="getRedeemerEmail(code) ? handleCopyRedeemerEmail(code) : null"
                    >
                       {{ getRedeemerDisplay(code) || '-' }}
                    </p>
+                   <p
+                      v-if="code.isRedeemed"
+                      class="text-xs text-blue-600 mt-1 break-all whitespace-normal leading-5"
+                      :class="getRedeemerEmail(code) ? 'cursor-pointer hover:underline' : ''"
+                      :title="getRedeemerEmail(code) || '未记录邮箱'"
+                      @click="getRedeemerEmail(code) ? handleCopyRedeemerEmail(code) : null"
+                   >
+                      邮箱：{{ getRedeemerEmail(code) || '未记录' }}
+                   </p>
                    <span
                       v-if="code.isRedeemed"
                       class="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-600 mt-2"
                    >
-                      {{ code.orderType === 'no_warranty' ? '无质保' : (code.orderType === 'anti_ban' ? '防封禁' : '质保') }}
+                      {{ getOrderTypeLabel(code) }}
                    </span>
                 </div>
                 
@@ -1508,7 +1586,7 @@ const handleInviteSubmit = async () => {
                 </SelectContent>
               </Select>
               <p class="text-xs text-gray-400">
-                可创建数量 = 6 - 当前人数 - 未使用的兑换码数。
+                可创建数量 = 5 - 当前人数 - 未使用的兑换码数；单次最多 {{ batchCreateMaxCount }} 个。
               </p>
            </div>
 
@@ -1527,12 +1605,43 @@ const handleInviteSubmit = async () => {
            </div>
            
            <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">质保天数</Label>
+              <div class="flex items-center gap-3">
+                 <Input
+                   v-model.number="batchServiceDays"
+                   type="number"
+                   min="1"
+                   max="3650"
+                   step="1"
+                   :disabled="isBatchNoWarrantyOrder"
+                   class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500"
+                 />
+                 <span class="text-sm font-medium text-gray-400 whitespace-nowrap">天</span>
+              </div>
+              <p class="text-xs text-gray-400">{{ isBatchNoWarrantyOrder ? '无质保订单将忽略质保天数。' : '设置该批次兑换码的有效质保时长。' }}</p>
+           </div>
+
+           <div class="space-y-2">
+              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">质保类型</Label>
+              <Select v-model="batchOrderType">
+                <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500">
+                  <SelectValue placeholder="选择质保类型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="option in orderTypeOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+           </div>
+
+           <div class="space-y-2">
               <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">生成数量</Label>
               <Input
                 v-model.number="batchCount"
                 type="number"
                 min="1"
-                max="1000"
+                :max="batchCreateMaxCount"
                 class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500"
               />
            </div>

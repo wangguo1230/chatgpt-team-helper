@@ -1,7 +1,9 @@
 import express from 'express'
+import { getDatabase } from '../database/init.js'
 import { getTurnstileSettings } from '../utils/turnstile-settings.js'
 import { getFeatureFlags } from '../utils/feature-flags.js'
 import { getChannels } from '../utils/channels.js'
+import { getRedemptionCodeSettings } from '../utils/redemption-settings.js'
 
 const router = express.Router()
 
@@ -31,6 +33,8 @@ router.get('/runtime', async (req, res) => {
     const turnstileSiteKey = String(turnstileSettings.siteKey || '').trim()
     const features = await getFeatureFlags()
     const { list: channelList } = await getChannels()
+    const db = await getDatabase()
+    const redemptionSettings = getRedemptionCodeSettings(db)
     const channels = (channelList || [])
       .filter(channel => channel?.isActive)
       .map(channel => ({
@@ -52,6 +56,7 @@ router.get('/runtime', async (req, res) => {
       turnstileSiteKey: turnstileSiteKey || null,
       features,
       channels,
+      redemptionBatchCreateMaxCount: redemptionSettings.batchCreateMaxCount,
       openAccountsEnabled,
       openAccountsMaintenanceMessage: openAccountsEnabled ? null : getOpenAccountsMaintenanceMessage()
     })

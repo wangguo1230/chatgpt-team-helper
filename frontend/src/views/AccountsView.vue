@@ -154,6 +154,124 @@ const resolveRequestError = (err: any, fallback: string) => {
   )
 }
 
+type ParsedAccountTokenInput = {
+  parseError: string
+  accessToken: string
+  refreshToken: string
+  chatgptAccountId: string
+  email: string
+  expireAtRaw: string
+}
+
+const looksLikeJsonObject = (value: string) => {
+  const raw = String(value || '').trim()
+  return raw.startsWith('{') && raw.endsWith('}')
+}
+
+const parseJsonInput = (rawValue: string, fieldLabel: string): { value: Record<string, any> | null; error: string } => {
+  const raw = String(rawValue || '').trim()
+  if (!raw || !looksLikeJsonObject(raw)) {
+    return { value: null, error: '' }
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { value: null, error: `${fieldLabel} JSON 必须是对象` }
+    }
+    return { value: parsed as Record<string, any>, error: '' }
+  } catch {
+    return { value: null, error: `${fieldLabel} JSON 格式错误` }
+  }
+}
+
+const readFirstText = (sources: Array<Record<string, any> | null>, keys: string[]) => {
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue
+    for (const key of keys) {
+      const value = source[key]
+      if (value == null) continue
+      const normalized = String(value).trim()
+      if (normalized) return normalized
+    }
+  }
+  return ''
+}
+
+const decodeJwtPayloadFromToken = (token: string): Record<string, any> | null => {
+  const raw = String(token || '').trim()
+  if (!raw) return null
+  const parts = raw.split('.')
+  if (parts.length < 2) return null
+  const payload = parts[1]
+  if (!payload) return null
+
+  try {
+    const base64 = payload
+      .replace(/-/g, '+')
+      .replace(/_/g, '/')
+      .padEnd(Math.ceil(payload.length / 4) * 4, '=')
+    const decoded = atob(base64)
+    const parsed = JSON.parse(decoded)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed as Record<string, any>
+  } catch {
+    return null
+  }
+}
+
+const deriveChatgptAccountIdFromToken = (token: string) => {
+  const payload = decodeJwtPayloadFromToken(token)
+  if (!payload) return ''
+
+  const authClaim = payload['https://api.openai.com/auth']
+  if (authClaim && typeof authClaim === 'object' && !Array.isArray(authClaim)) {
+    const fromAuth = String((authClaim as Record<string, any>).chatgpt_account_id || '').trim()
+    if (fromAuth) return fromAuth
+  }
+
+  const direct = String(payload.chatgpt_account_id || '').trim()
+  if (direct) return direct
+
+  return String(payload.account_id || '').trim()
+}
+
+const extractAccountTokenInput = (tokenInput: string, refreshInput: string): ParsedAccountTokenInput => {
+  const tokenRaw = String(tokenInput || '').trim()
+  const refreshRaw = String(refreshInput || '').trim()
+
+  const parsedToken = parseJsonInput(tokenRaw, 'Access Token')
+  const parsedRefresh = parseJsonInput(refreshRaw, 'Refresh Token')
+
+  const parseError = [parsedToken.error, parsedRefresh.error].filter(Boolean)[0] || ''
+  const sources = [parsedToken.value, parsedRefresh.value]
+
+  let accessToken = readFirstText(sources, ['access_token', 'accessToken', 'token'])
+  if (!accessToken && tokenRaw && !looksLikeJsonObject(tokenRaw)) {
+    accessToken = tokenRaw
+  }
+
+  let refreshToken = readFirstText(sources, ['refresh_token', 'refreshToken'])
+  if (!refreshToken && refreshRaw && !looksLikeJsonObject(refreshRaw)) {
+    refreshToken = refreshRaw
+  }
+
+  const chatgptAccountIdFromJson = readFirstText(sources, ['chatgptAccountId', 'chatgpt_account_id', 'account_id'])
+  const chatgptAccountId = chatgptAccountIdFromJson || deriveChatgptAccountIdFromToken(accessToken)
+
+  const email = readFirstText(sources, ['email', 'account_email'])
+  const expireAtRaw = readFirstText(sources, ['expireAt', 'expire_at', 'expired', 'expiresAt', 'expires_at'])
+
+  return {
+    parseError,
+    accessToken,
+    refreshToken,
+    chatgptAccountId,
+    email,
+    expireAtRaw
+  }
+}
+
 const logHttpErrorWithBody = (label: string, err: any) => {
   try {
     console.error(label, {
@@ -512,7 +630,26 @@ const openChatgptIdDropdown = async () => {
 }
 
 const handleCheckAccessToken = async () => {
-  const token = String(formData.value.token || '').trim()
+  const extracted = extractAccountTokenInput(
+    String(formData.value.token || ''),
+    String(formData.value.refreshToken || '')
+  )
+  if (extracted.parseError) {
+    showErrorToast(extracted.parseError)
+    return
+  }
+
+  if (!String(formData.value.email || '').trim() && extracted.email) {
+    formData.value.email = extracted.email
+  }
+  if (!String(formData.value.refreshToken || '').trim() && extracted.refreshToken) {
+    formData.value.refreshToken = extracted.refreshToken
+  }
+  if (!String(formData.value.chatgptAccountId || '').trim() && extracted.chatgptAccountId) {
+    formData.value.chatgptAccountId = extracted.chatgptAccountId
+  }
+
+  const token = extracted.accessToken
   if (!token) {
     showErrorToast('请先填写 Access Token')
     return
@@ -967,14 +1104,35 @@ const openEditDialog = (account: GptAccount) => {
 
 const handleSubmit = async () => {
   try {
+    const extracted = extractAccountTokenInput(
+      String(formData.value.token || ''),
+      String(formData.value.refreshToken || '')
+    )
+    if (extracted.parseError) {
+      showErrorToast(extracted.parseError)
+      return
+    }
+
+    const expireAtFromForm = fromDatetimeLocal(formData.value.expireAt?.trim() || '')
+    const normalizedEmail = formData.value.email.trim() || extracted.email
+    const normalizedToken = extracted.accessToken
+    const normalizedRefreshToken = formData.value.refreshToken?.trim() || extracted.refreshToken || ''
+    const normalizedChatgptAccountId = formData.value.chatgptAccountId?.trim() || extracted.chatgptAccountId || ''
+    const normalizedExpireAt = expireAtFromForm || extracted.expireAtRaw || ''
+
+    if (!normalizedToken) {
+      showErrorToast('Access Token 为必填')
+      return
+    }
+
     const payload: CreateGptAccountDto = {
       ...formData.value,
-      email: formData.value.email.trim(),
-      token: formData.value.token.trim(),
-      refreshToken: formData.value.refreshToken?.trim() || '',
-      chatgptAccountId: formData.value.chatgptAccountId?.trim() || '',
+      email: normalizedEmail,
+      token: normalizedToken,
+      refreshToken: normalizedRefreshToken,
+      chatgptAccountId: normalizedChatgptAccountId,
       oaiDeviceId: formData.value.oaiDeviceId?.trim() || '',
-      expireAt: fromDatetimeLocal(formData.value.expireAt?.trim() || ''),
+      expireAt: normalizedExpireAt,
     }
 
     if (!payload.chatgptAccountId) {
@@ -1667,12 +1825,12 @@ const handleInviteSubmit = async () => {
               </div>
 
               <div class="space-y-2">
-                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Access Token</Label>
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Access Token（支持 JSON）</Label>
                 <div class="flex items-center gap-2">
                   <Input
                     v-model="formData.token"
                     required
-                    placeholder="eyJhbGciOi..."
+                    placeholder="可粘贴 access token 或整段 JSON"
                     class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
                   />
                   <Button
@@ -1697,11 +1855,11 @@ const handleInviteSubmit = async () => {
               </div>
 
               <div class="space-y-2">
-                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Refresh Token</Label>
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Refresh Token（支持 JSON）</Label>
                 <div class="flex items-center gap-2">
                   <Input
                     v-model="formData.refreshToken"
-                    placeholder="可选，用于自动刷新"
+                    placeholder="可粘贴 refresh token 或整段 JSON"
                     class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
                   />
                   <Button
