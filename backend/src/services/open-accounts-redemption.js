@@ -224,7 +224,12 @@ export const redeemOpenAccountsOrderCode = async (db, { orderNo, uid, email, acc
     return { ok: true, redemption, code: codeInfo }
   } catch (error) {
     if (error instanceof RedemptionError) {
-      return { ok: false, error: error.message, statusCode: error.statusCode || 400 }
+      return {
+        ok: false,
+        error: error.message,
+        statusCode: error.statusCode || 400,
+        payload: error.payload || null
+      }
     }
     return { ok: false, error: error?.message || 'redeem_failed', statusCode: 500 }
   } finally {

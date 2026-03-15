@@ -5,13 +5,18 @@ import { requireMenu } from '../middleware/rbac.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { verifyLinuxDoSessionToken } from '../middleware/linuxdo-session.js'
 import {
+  fetchAccountInvites,
   fetchAccountUsersList,
   syncAccountInviteCount,
   syncAccountUserCount,
   inviteAccountUser,
   markAccountAsBannedAndCleanup
 } from '../services/account-sync.js'
-import { sendRedemptionFlowSummaryEmail, sendRedemptionOwnerNotificationEmail } from '../services/email-service.js'
+import {
+  sendInviteDomainRiskAlertEmail,
+  sendRedemptionFlowSummaryEmail,
+  sendRedemptionOwnerNotificationEmail
+} from '../services/email-service.js'
 import {
   getXhsConfig,
   getXhsOrderByNumber,
@@ -495,6 +500,160 @@ function generateRedemptionCode(length = 12) {
 }
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
+const extractEmailDomain = (email) => {
+  const normalized = normalizeEmail(email)
+  const atIndex = normalized.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex >= normalized.length - 1) return ''
+  return normalized.slice(atIndex + 1)
+}
+
+const hasInviteInList = (invites, email) => {
+  const normalized = normalizeEmail(email)
+  if (!normalized) return false
+  return (invites?.items || []).some(item => normalizeEmail(item?.email_address) === normalized)
+}
+
+const rollbackRedeemedCodeUsage = async (db, codeId, context = {}) => {
+  if (!db || !Number.isFinite(Number(codeId)) || Number(codeId) <= 0) return false
+  try {
+    db.run(
+      `
+        UPDATE redemption_codes
+        SET is_redeemed = 0,
+            redeemed_at = NULL,
+            redeemed_by = NULL,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [codeId]
+    )
+    const rowsModified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+    if (rowsModified > 0) {
+      await saveDatabase()
+    }
+    return rowsModified > 0
+  } catch (error) {
+    console.warn('[Redemption] 回滚兑换码状态失败', {
+      codeId,
+      accountId: context?.accountId || null,
+      message: error?.message || String(error)
+    })
+    return false
+  }
+}
+
+const syncInviteAndCheckPresence = async ({ accountId, inviteEmail, suppressAlertEmail }) => {
+  const inviteSync = await syncAccountInviteCount(accountId, {
+    inviteListParams: { offset: 0, limit: 1, query: '' },
+    suppressAlertEmail
+  })
+  const inviteQuery = await fetchAccountInvites(accountId, {
+    inviteListParams: { offset: 0, limit: 25, query: normalizeEmail(inviteEmail) },
+    suppressAlertEmail
+  })
+
+  return {
+    account: inviteSync?.account || null,
+    inviteCount: Number.isFinite(Number(inviteSync?.inviteCount)) ? Number(inviteSync.inviteCount) : null,
+    isInvited: hasInviteInList(inviteQuery, inviteEmail)
+  }
+}
+
+const handleInviteDomainRiskBySuffix = async ({
+  db,
+  domain,
+  triggerAccountId,
+  triggerAccountEmail,
+  reason
+}) => {
+  const normalizedDomain = String(domain || '').trim().toLowerCase()
+  if (!db || !normalizedDomain) {
+    return {
+      domain: normalizedDomain,
+      closedAccountCount: 0,
+      deletedUnusedCodeCount: 0,
+      affectedAccounts: []
+    }
+  }
+
+  return withLocks([`invite-domain-risk:${normalizedDomain}`], async () => {
+    const triggeredAt = new Date()
+    const note = `邮箱后缀疑似风控（${normalizedDomain}）：第二人邀请两次后仍未进入邀请列表；触发账号 ${triggerAccountEmail || '-'}；时间 ${triggeredAt.toLocaleString()}`
+
+    const accountsRows = db.exec(
+      `
+        SELECT id, email, COALESCE(is_open, 0) AS is_open
+        FROM gpt_accounts
+        WHERE INSTR(email, '@') > 0
+          AND LOWER(TRIM(SUBSTR(email, INSTR(email, '@') + 1))) = ?
+      `,
+      [normalizedDomain]
+    )?.[0]?.values || []
+
+    const affectedAccounts = accountsRows
+      .map(row => ({
+        id: Number(row[0] || 0),
+        email: String(row[1] || '').trim(),
+        wasOpen: Number(row[2] || 0) === 1
+      }))
+      .filter(item => item.id > 0 && item.email)
+
+    const accountIds = affectedAccounts.map(item => item.id)
+    const closedAccountCount = affectedAccounts.filter(item => item.wasOpen).length
+
+    if (accountIds.length > 0) {
+      const placeholders = accountIds.map(() => '?').join(',')
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 0,
+              risk_note = CASE
+                WHEN COALESCE(TRIM(risk_note), '') = '' THEN ?
+                ELSE risk_note || '\n' || ?
+              END,
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id IN (${placeholders})
+        `,
+        [note, note, ...accountIds]
+      )
+    }
+
+    db.run(
+      `
+        DELETE FROM redemption_codes
+        WHERE is_redeemed = 0
+          AND account_email IS NOT NULL
+          AND INSTR(account_email, '@') > 0
+          AND LOWER(TRIM(SUBSTR(account_email, INSTR(account_email, '@') + 1))) = ?
+      `,
+      [normalizedDomain]
+    )
+    const deletedUnusedCodeCount = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+    await saveDatabase()
+
+    try {
+      await sendInviteDomainRiskAlertEmail({
+        domain: normalizedDomain,
+        triggerAccountId,
+        triggerAccountEmail,
+        closedAccountCount,
+        deletedUnusedCodeCount,
+        reason,
+        affectedAccounts,
+        triggeredAt
+      })
+    } catch (mailError) {
+      console.warn('[InviteDomainRisk] 发送域名风控告警失败', mailError?.message || mailError)
+    }
+
+    return {
+      domain: normalizedDomain,
+      closedAccountCount,
+      deletedUnusedCodeCount,
+      affectedAccounts
+    }
+  })
+}
 
 const buildRecoveryWindowEndsAt = (redeemedAt) => {
   if (!redeemedAt) return null
@@ -853,13 +1012,40 @@ export async function redeemCodeInternal({
   const accountToken = account[2]
   const currentUserCount = account[3] || 0
   const chatgptAccountId = account[4]
+  const currentInviteCountRow = db.exec(
+    'SELECT COALESCE(invite_count, 0) FROM gpt_accounts WHERE id = ? LIMIT 1',
+    [accountId]
+  )
+  const currentInviteCount = Number(currentInviteCountRow?.[0]?.values?.[0]?.[0] || 0)
+  let preflightUserCount = Number(currentUserCount || 0)
+  let preflightInviteCount = Number(currentInviteCount || 0)
 
   if (chatgptAccountId && accountToken) {
     try {
-      await fetchAccountUsersList(accountId, {
+      const preflightUsers = await fetchAccountUsersList(accountId, {
         userListParams: { offset: 0, limit: 1, query: '' },
         suppressAlertEmail
       })
+      if (Number.isFinite(Number(preflightUsers?.total))) {
+        preflightUserCount = Number(preflightUsers.total)
+      }
+
+      if (preflightUserCount === 1) {
+        try {
+          const preflightInviteSync = await syncAccountInviteCount(accountId, {
+            inviteListParams: { offset: 0, limit: 1, query: '' },
+            suppressAlertEmail
+          })
+          if (Number.isFinite(Number(preflightInviteSync?.inviteCount))) {
+            preflightInviteCount = Number(preflightInviteSync.inviteCount)
+          }
+        } catch (inviteSyncError) {
+          console.warn('[Redemption] 兑换前邀请数预同步失败，沿用本地 invite_count', {
+            accountId,
+            message: inviteSyncError?.message || String(inviteSyncError)
+          })
+        }
+      }
     } catch (error) {
       if (shouldMarkAccountUnavailable(error)) {
         const reason = `兑换前账号校验失败：${error?.message || '未知错误'}`
@@ -997,6 +1183,94 @@ export async function redeemCodeInternal({
       console.error(`邀请用户 ${normalizedEmail} 失败:`, error.message)
     }
 
+    const shouldVerifySecondSeatInvite =
+      Number(preflightUserCount || 0) === 1 &&
+      Number(preflightInviteCount || 0) === 0
+
+    if (inviteResult.success && shouldVerifySecondSeatInvite) {
+      try {
+        const firstCheck = await syncInviteAndCheckPresence({
+          accountId,
+          inviteEmail: normalizedEmail,
+          suppressAlertEmail
+        })
+        syncedAccount = firstCheck.account || syncedAccount
+        if (typeof firstCheck.inviteCount === 'number') {
+          syncedInviteCount = firstCheck.inviteCount
+        }
+
+        if (!firstCheck.isInvited) {
+          let retryInviteSucceeded = false
+          try {
+            const retryResp = await inviteAccountUser(accountId, normalizedEmail, { suppressAlertEmail })
+            inviteResult = { success: true, response: retryResp.invite, retried: true }
+            retryInviteSucceeded = true
+          } catch (retryError) {
+            inviteResult = { success: false, error: retryError?.message || '二次邀请失败' }
+            console.warn('[Redemption] 第二次邀请失败', {
+              accountId,
+              accountEmail,
+              email: normalizedEmail,
+              message: retryError?.message || String(retryError)
+            })
+          }
+
+          if (retryInviteSucceeded) {
+            const secondCheck = await syncInviteAndCheckPresence({
+              accountId,
+              inviteEmail: normalizedEmail,
+              suppressAlertEmail
+            })
+            syncedAccount = secondCheck.account || syncedAccount
+            if (typeof secondCheck.inviteCount === 'number') {
+              syncedInviteCount = secondCheck.inviteCount
+            }
+
+            if (!secondCheck.isInvited) {
+              const domain = extractEmailDomain(accountEmail)
+              const reason = domain
+                ? `第二人邀请两次后仍不在邀请列表，账号邮箱后缀 ${domain} 疑似被风控`
+                : '第二人邀请两次后仍不在邀请列表，账号邮箱后缀缺失，无法自动域名处置'
+              await rollbackRedeemedCodeUsage(db, codeId, { accountId })
+              let domainRiskResult = {
+                domain: domain || '',
+                closedAccountCount: 0,
+                deletedUnusedCodeCount: 0
+              }
+              if (domain) {
+                domainRiskResult = await handleInviteDomainRiskBySuffix({
+                  db,
+                  domain,
+                  triggerAccountId: accountId,
+                  triggerAccountEmail: accountEmail,
+                  reason
+                })
+              }
+              throw new RedemptionError(503, '该账号邮箱后缀疑似被风控，已自动下架同后缀开放账号，请联系管理员', {
+                errorCode: REDEEM_ACCOUNT_UNAVAILABLE_ERROR_CODE,
+                accountId,
+                accountEmail,
+                domain: domainRiskResult.domain || null,
+                closedAccountCount: Number(domainRiskResult.closedAccountCount || 0),
+                deletedUnusedCodeCount: Number(domainRiskResult.deletedUnusedCodeCount || 0),
+                reason
+              })
+            }
+          }
+        }
+      } catch (error) {
+        if (error instanceof RedemptionError) {
+          throw error
+        }
+        console.warn('[Redemption] 第二人邀请校验异常，终止本次兑换', {
+          accountId,
+          accountEmail,
+          message: error?.message || String(error)
+        })
+        throw new RedemptionError(503, '邀请校验异常，请稍后重试')
+      }
+    }
+
     if (inviteResult.success) {
       try {
         const userSync = await syncAccountUserCount(accountId, {
@@ -1032,7 +1306,7 @@ export async function redeemCodeInternal({
     ? syncedAccount.userCount
     : typeof syncedUserCount === 'number'
       ? syncedUserCount
-      : currentUserCount
+      : preflightUserCount
   const resolvedInviteCount = typeof syncedAccount?.inviteCount === 'number'
     ? syncedAccount.inviteCount
     : typeof syncedInviteCount === 'number'

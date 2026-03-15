@@ -1059,20 +1059,28 @@ const openCreditPayPage = (creditOrder?: { payUrl?: string | null; payRequest?: 
       showErrorToast(order.actionMessage || order.refundMessage || `Credit 订单状态异常：${order.status}`)
       stopCreditPolling()
     }
-	  } catch (error: any) {
-	    const message = error?.response?.data?.error || error?.message || '查询 Credit 订单失败'
-      if (error?.response?.data?.code === 'OPEN_ACCOUNTS_MAINTENANCE') {
-        serverMaintenance.value = true
-        serverMaintenanceMessage.value = message
-      }
-      if (error?.response?.data?.code === 'NO_WARRANTY_ORDER') {
-        openNoWarrantySwitchDialog(message)
-        stopCreditPolling()
-        return
-      }
-	    showErrorToast(message)
-	    stopCreditPolling()
-	  } finally {
+  } catch (error: any) {
+    const message = error?.response?.data?.error || error?.message || '查询 Credit 订单失败'
+    const code = error?.response?.data?.code
+    const autoRefunded = Boolean(error?.response?.data?.autoRefunded)
+    if (error?.response?.data?.code === 'OPEN_ACCOUNTS_MAINTENANCE') {
+      serverMaintenance.value = true
+      serverMaintenanceMessage.value = message
+    }
+    if (code === 'NO_WARRANTY_ORDER') {
+      openNoWarrantySwitchDialog(message)
+      stopCreditPolling()
+      return
+    }
+    if (code === 'OPEN_ACCOUNTS_INVITE_DOMAIN_RISK' && autoRefunded) {
+      const text = /自动退回|自动退款/.test(message) ? message : `${message}（积分已自动退回）`
+      showErrorToast(text)
+      stopCreditPolling()
+      return
+    }
+    showErrorToast(message)
+    stopCreditPolling()
+  } finally {
 	    creditPollingInFlight.value = false
 	  }
 }
@@ -1112,9 +1120,10 @@ const doBoard = async (accountId: number) => {
     await loadOpenAccounts()
     await loadMe()
     showSuccessToast(result.message || '上车成功')
-	  } catch (error: any) {
+  } catch (error: any) {
       const code = error?.response?.data?.code
       const message = error.response?.data?.error || error?.message || '上车失败，请稍后重试'
+      const autoRefunded = Boolean(error?.response?.data?.autoRefunded)
       if (code === 'OPEN_ACCOUNTS_MAINTENANCE') {
         accounts.value = []
         rules.value = null
@@ -1126,6 +1135,11 @@ const doBoard = async (accountId: number) => {
       if (code === 'NO_WARRANTY_ORDER') {
         loadError.value = ''
         openNoWarrantySwitchDialog(message)
+        return
+      }
+      if (code === 'OPEN_ACCOUNTS_INVITE_DOMAIN_RISK' && autoRefunded) {
+        boardError.value = /自动退回|自动退款/.test(message) ? message : `${message}（积分已自动退回）`
+        showErrorToast(boardError.value)
         return
       }
       boardError.value = message

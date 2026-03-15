@@ -2,12 +2,24 @@ import express from 'express'
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateLinuxDoSession } from '../middleware/linuxdo-session.js'
 import { AccountSyncError, fetchAccountInvites, fetchAccountUsersList, syncAccountInviteCount, syncAccountUserCount } from '../services/account-sync.js'
-import { buildCreditSign, createCreditTransferService, formatCreditMoney, getCreditGatewayConfig } from '../services/credit-gateway.js'
+import {
+  buildCreditSign,
+  createCreditTransferService,
+  formatCreditMoney,
+  getCreditGatewayConfig,
+  queryCreditOrder,
+  refundCreditOrder
+} from '../services/credit-gateway.js'
 import {
   reserveOpenAccountsCode,
   ensureOpenAccountsOrderCode,
-  redeemOpenAccountsOrderCode
+  redeemOpenAccountsOrderCode,
+  releaseOpenAccountsOrderCode
 } from '../services/open-accounts-redemption.js'
+import {
+  sendOpenAccountsDomainRiskAdminEmail,
+  sendOpenAccountsDomainRiskUserEmail
+} from '../services/email-service.js'
 import { withLocks } from '../utils/locks.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
@@ -117,6 +129,179 @@ const shortRetryMaxAttempts = () => Math.min(5, Math.max(1, toInt(process.env.OP
 const shortRetryBaseDelayMs = () => Math.min(5000, Math.max(0, toInt(process.env.OPEN_ACCOUNTS_BOARD_SHORT_RETRY_BASE_DELAY_MS, 800)))
 
 const creditGatewayServerSubmitEnabled = () => isEnabledFlag(process.env.CREDIT_GATEWAY_SERVER_SUBMIT_ENABLED, false)
+const OPEN_ACCOUNTS_INVITE_DOMAIN_RISK_CODE = 'OPEN_ACCOUNTS_INVITE_DOMAIN_RISK'
+const DEFAULT_OPEN_ACCOUNTS_CODE_CHANNELS = ['linux-do']
+const OPEN_ACCOUNTS_ALLOWED_CODE_CHANNELS = new Set(['common', 'linux-do'])
+const getOpenAccountsFallbackMaxAttempts = () => Math.min(6, Math.max(1, toInt(process.env.OPEN_ACCOUNTS_DOMAIN_RISK_FALLBACK_MAX_ATTEMPTS, 3)))
+
+const extractEmailDomain = (email) => {
+  const normalized = normalizeEmail(email)
+  const at = normalized.lastIndexOf('@')
+  if (at <= 0 || at >= normalized.length - 1) return ''
+  return normalized.slice(at + 1)
+}
+
+const normalizeDomainLike = (value) => {
+  const raw = String(value || '').trim().toLowerCase().replace(/^@+/, '')
+  if (!raw) return ''
+  if (raw.includes('@')) return extractEmailDomain(raw)
+  return raw
+}
+
+const getOpenAccountsCodeChannels = () => {
+  const raw = String(process.env.OPEN_ACCOUNTS_CODE_CHANNELS || '').trim()
+  const configured = raw
+    ? raw.split(',').map(item => item.trim().toLowerCase()).filter(Boolean)
+    : []
+  const filtered = configured.filter(item => OPEN_ACCOUNTS_ALLOWED_CODE_CHANNELS.has(item))
+  return filtered.length ? filtered : DEFAULT_OPEN_ACCOUNTS_CODE_CHANNELS
+}
+
+const buildRedeemFailureError = (redeemOutcome) => {
+  const codeMessage = redeemOutcome?.error === 'no_code'
+    ? '当前账号暂无可用兑换码，请稍后再试'
+    : redeemOutcome?.error || '兑换失败'
+  const statusCode = redeemOutcome?.statusCode || (redeemOutcome?.error === 'no_code' ? 409 : 500)
+  const err = new AccountSyncError(codeMessage, statusCode)
+  const payload = redeemOutcome?.payload && typeof redeemOutcome.payload === 'object'
+    ? redeemOutcome.payload
+    : null
+  if (payload) {
+    err.details = payload
+    if (payload?.domain || payload?.closedAccountCount || payload?.deletedUnusedCodeCount) {
+      err.code = OPEN_ACCOUNTS_INVITE_DOMAIN_RISK_CODE
+    }
+  }
+  return err
+}
+
+const resolveRefundFailureMessage = (refundResult) => {
+  if (!refundResult || typeof refundResult !== 'object') return '自动退款失败'
+  if (refundResult.error === 'missing_config') return 'Credit 未配置，请联系管理员'
+  if (refundResult.error === 'missing_trade_no') return '缺少 trade_no，无法自动退款'
+  if (refundResult.error === 'invalid_money') return '订单金额异常，无法自动退款'
+  if (refundResult.error === 'cf_challenge') return 'Credit 通道启用 Cloudflare challenge，服务端无法自动退款'
+  if (typeof refundResult.error === 'string' && refundResult.error.startsWith('http_')) {
+    return `Credit 通道异常（HTTP ${refundResult.error.slice(5)}）`
+  }
+  if (refundResult.msg) return String(refundResult.msg)
+  if (refundResult.message) return String(refundResult.message)
+  return '自动退款失败'
+}
+
+const tryAutoRefundPaidOrder = async (db, orderNo, options = {}) => {
+  const normalizedOrderNo = normalizeOrderNo(orderNo)
+  if (!db || !normalizedOrderNo) {
+    return { attempted: false, refunded: false, reason: 'invalid_order_no' }
+  }
+
+  return withLocks([`credit:${normalizedOrderNo}`], async () => {
+    const row = db.exec(
+      `
+        SELECT scene, status, trade_no, amount, refunded_at
+        FROM credit_orders
+        WHERE order_no = ?
+        LIMIT 1
+      `,
+      [normalizedOrderNo]
+    )?.[0]?.values?.[0]
+
+    if (!row) {
+      return { attempted: false, refunded: false, reason: 'order_not_found' }
+    }
+
+    const scene = String(row[0] || '')
+    const status = String(row[1] || '')
+    const refundedAt = row[4] ? String(row[4]) : ''
+    if (scene !== 'open_accounts_board') {
+      return { attempted: false, refunded: false, reason: 'unsupported_scene' }
+    }
+    if (status === 'refunded' || refundedAt) {
+      return { attempted: true, refunded: true, reason: 'already_refunded' }
+    }
+    if (status !== 'paid') {
+      return { attempted: false, refunded: false, reason: 'status_not_paid' }
+    }
+
+    let tradeNo = String(row[2] || '').trim()
+    const amount = formatCreditMoney(row[3])
+    if (!amount) {
+      const message = '订单金额异常，无法自动退款'
+      db.run(
+        `UPDATE credit_orders SET refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
+        [message, normalizedOrderNo]
+      )
+      saveDatabase()
+      return { attempted: true, refunded: false, reason: 'invalid_money', message }
+    }
+
+    if (!tradeNo) {
+      const query = await queryCreditOrder({ tradeNo: '', outTradeNo: normalizedOrderNo })
+      if (query?.ok) {
+        const data = query.data || {}
+        const queriedTradeNo = String(data.trade_no || data.tradeNo || '').trim()
+        if (queriedTradeNo) {
+          tradeNo = queriedTradeNo
+          db.run(
+            `
+              UPDATE credit_orders
+              SET trade_no = ?,
+                  query_payload = ?,
+                  query_at = DATETIME('now', 'localtime'),
+                  query_status = ?,
+                  updated_at = DATETIME('now', 'localtime')
+              WHERE order_no = ?
+            `,
+            [tradeNo, JSON.stringify(data), Number(data.status || 0), normalizedOrderNo]
+          )
+          saveDatabase()
+        }
+      }
+    }
+
+    if (!tradeNo) {
+      const message = '缺少 trade_no，无法自动退款'
+      db.run(
+        `UPDATE credit_orders SET refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
+        [message, normalizedOrderNo]
+      )
+      saveDatabase()
+      return { attempted: true, refunded: false, reason: 'missing_trade_no', message }
+    }
+
+    const refundResult = await refundCreditOrder({ tradeNo, outTradeNo: normalizedOrderNo, money: amount })
+    if (!refundResult.ok) {
+      const message = resolveRefundFailureMessage(refundResult)
+      db.run(
+        `UPDATE credit_orders SET refund_message = ?, updated_at = DATETIME('now', 'localtime') WHERE order_no = ?`,
+        [message, normalizedOrderNo]
+      )
+      saveDatabase()
+      return { attempted: true, refunded: false, reason: 'refund_failed', message }
+    }
+
+    const successMessage = refundResult?.data?.msg
+      ? String(refundResult.data.msg)
+      : '自动退款成功'
+    const note = String(options?.note || '').trim()
+    const persistedMessage = note ? `${successMessage}（${note}）` : successMessage
+    db.run(
+      `
+        UPDATE credit_orders
+        SET status = 'refunded',
+            refunded_at = DATETIME('now', 'localtime'),
+            refund_message = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_no = ?
+      `,
+      [persistedMessage, normalizedOrderNo]
+    )
+    releaseOpenAccountsOrderCode(db, normalizedOrderNo)
+    saveDatabase()
+
+    return { attempted: true, refunded: true, reason: 'refunded', message: successMessage }
+  })
+}
 
 const isOpenAccountsEnabled = () => isEnabledFlag(process.env.OPEN_ACCOUNTS_ENABLED, true)
 
@@ -297,6 +482,295 @@ const detectEmailInAccountQueues = async (accountId, email) => {
   const isInvited = (invites.items || []).some(item => normalizeEmail(item.email_address) === normalized)
 
   return { isMember, isInvited }
+}
+
+const loadOpenAccountsFallbackCandidates = (db, options = {}) => {
+  if (!db) return []
+  const channels = getOpenAccountsCodeChannels()
+  const channelPlaceholders = channels.map(() => '?').join(',')
+  const excludedAccountIds = Array.from(new Set((options?.excludeAccountIds || [])
+    .map(item => Number(item))
+    .filter(item => Number.isFinite(item) && item > 0)))
+  const excludedDomains = new Set((options?.excludeDomains || [])
+    .map(item => normalizeDomainLike(item))
+    .filter(Boolean))
+  const resolvedCapacityLimit = Number.isFinite(Number(options?.capacityLimit)) && Number(options?.capacityLimit) > 0
+    ? Number(options.capacityLimit)
+    : getOpenAccountsCapacityLimit(db)
+  const fetchLimit = Math.max(1, Number(options?.limit || 3))
+  const params = [...channels, resolvedCapacityLimit]
+
+  const excludeAccountSql = excludedAccountIds.length > 0
+    ? ` AND ga.id NOT IN (${excludedAccountIds.map(() => '?').join(',')})`
+    : ''
+  if (excludedAccountIds.length > 0) {
+    params.push(...excludedAccountIds)
+  }
+  params.push(Math.max(fetchLimit * 2, fetchLimit))
+
+  const result = db.exec(
+    `
+      SELECT ga.id,
+             ga.email,
+             COALESCE(ga.user_count, 0) AS user_count,
+             COALESCE(ga.invite_count, 0) AS invite_count,
+             code_stats.remaining_codes
+      FROM gpt_accounts ga
+      JOIN (
+        SELECT lower(trim(account_email)) AS account_email_lower,
+               COUNT(*) AS remaining_codes
+        FROM redemption_codes
+        WHERE is_redeemed = 0
+          AND account_email IS NOT NULL
+          AND trim(account_email) != ''
+          AND channel IN (${channelPlaceholders})
+          AND (reserved_for_order_no IS NULL OR reserved_for_order_no = '')
+          AND (reserved_for_entry_id IS NULL OR reserved_for_entry_id = 0)
+          AND (reserved_for_uid IS NULL OR reserved_for_uid = '')
+        GROUP BY lower(trim(account_email))
+      ) code_stats ON lower(trim(ga.email)) = code_stats.account_email_lower
+      WHERE ga.is_open = 1
+        AND COALESCE(ga.is_banned, 0) = 0
+        AND COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0) < ?
+        ${excludeAccountSql}
+      ORDER BY
+        CASE WHEN COALESCE(ga.invite_count, 0) > 0 THEN 0 ELSE 1 END ASC,
+        COALESCE(ga.invite_count, 0) DESC,
+        COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0) ASC,
+        code_stats.remaining_codes DESC,
+        ga.created_at ASC
+      LIMIT ?
+    `,
+    params
+  )
+
+  const rows = result[0]?.values || []
+  const mapped = rows.map(row => {
+    const id = Number(row?.[0] || 0)
+    const email = String(row?.[1] || '').trim()
+    return {
+      id,
+      email,
+      domain: extractEmailDomain(email),
+      userCount: Number(row?.[2] || 0),
+      inviteCount: Number(row?.[3] || 0),
+      remainingCodes: Number(row?.[4] || 0)
+    }
+  }).filter(item => item.id > 0 && item.email)
+
+  const deduped = []
+  const seenEmails = new Set()
+  for (const item of mapped) {
+    const emailKey = normalizeEmail(item.email)
+    if (!emailKey || seenEmails.has(emailKey)) continue
+    seenEmails.add(emailKey)
+    if (item.domain && excludedDomains.has(item.domain)) continue
+    deduped.push(item)
+    if (deduped.length >= fetchLimit) break
+  }
+  return deduped
+}
+
+const trySendDomainRiskOutcomeEmails = async (payload = {}) => {
+  const userEmail = normalizeEmail(payload?.userEmail)
+  const action = String(payload?.action || '').trim().toLowerCase()
+  const tasks = []
+  if (userEmail && (action === 'refunded' || action === 'refund_failed')) {
+    tasks.push(sendOpenAccountsDomainRiskUserEmail({
+      to: userEmail,
+      action,
+      orderNo: payload?.orderNo,
+      refundMessage: payload?.refundMessage
+    }))
+  }
+  tasks.push(sendOpenAccountsDomainRiskAdminEmail({
+    action,
+    orderNo: payload?.orderNo,
+    uid: payload?.uid,
+    username: payload?.username,
+    userEmail,
+    triggerDomain: payload?.triggerDomain,
+    triggerAccountId: payload?.triggerAccountId,
+    triggerAccountEmail: payload?.triggerAccountEmail,
+    transferAccountId: payload?.transferAccountId,
+    transferAccountEmail: payload?.transferAccountEmail,
+    closedAccountCount: payload?.closedAccountCount,
+    deletedUnusedCodeCount: payload?.deletedUnusedCodeCount,
+    fallbackAttempted: payload?.fallbackAttempted,
+    refundMessage: payload?.refundMessage,
+    attempts: payload?.attempts
+  }))
+  const results = await Promise.allSettled(tasks)
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      console.warn('[OpenAccounts] domain-risk outcome email failed', {
+        index,
+        message: result.reason?.message || String(result.reason)
+      })
+    }
+  })
+}
+
+const tryAutoTransferPaidOrderOnDomainRisk = async (db, options = {}) => {
+  const orderNo = normalizeOrderNo(options?.orderNo)
+  const uid = normalizeUid(options?.uid)
+  const username = normalizeUsername(options?.username)
+  const orderEmail = normalizeEmail(options?.orderEmail)
+  const triggerAccountId = Number(options?.triggerAccountId || 0)
+  const triggerAccountEmail = String(options?.triggerAccountEmail || '').trim()
+  if (!db || !orderNo || !uid || !orderEmail) {
+    return { transferred: false, attempts: [], reason: 'invalid_arguments' }
+  }
+
+  const attemptLimit = getOpenAccountsFallbackMaxAttempts()
+  const resolvedCapacityLimit = Number.isFinite(Number(options?.capacityLimit)) && Number(options?.capacityLimit) > 0
+    ? Number(options.capacityLimit)
+    : getOpenAccountsCapacityLimit(db)
+  const excludedAccountIds = new Set()
+  if (triggerAccountId > 0) {
+    excludedAccountIds.add(triggerAccountId)
+  }
+  const excludedDomains = new Set()
+  const triggerDomain = normalizeDomainLike(options?.triggerDomain || '')
+  if (triggerDomain) excludedDomains.add(triggerDomain)
+  const triggerAccountDomain = normalizeDomainLike(triggerAccountEmail)
+  if (triggerAccountDomain) excludedDomains.add(triggerAccountDomain)
+
+  const attempts = []
+
+  while (attempts.length < attemptLimit) {
+    const remain = attemptLimit - attempts.length
+    const candidates = loadOpenAccountsFallbackCandidates(db, {
+      capacityLimit: resolvedCapacityLimit,
+      excludeAccountIds: [...excludedAccountIds],
+      excludeDomains: [...excludedDomains],
+      limit: remain
+    })
+    if (!candidates.length) break
+
+    for (const candidate of candidates) {
+      if (attempts.length >= attemptLimit) break
+      excludedAccountIds.add(candidate.id)
+
+      const attempt = {
+        accountId: candidate.id,
+        accountEmail: candidate.email,
+        status: 'failed',
+        reason: '未知错误'
+      }
+      attempts.push(attempt)
+
+      try {
+        if (!ensureOpenAccount(db, candidate.id)) {
+          attempt.status = 'skipped'
+          attempt.reason = '账号已关闭或不可用'
+          continue
+        }
+
+        const synced = await syncCardCounts(candidate.id)
+        const userCount = Number(synced?.userCount ?? candidate.userCount ?? 0)
+        const inviteCount = Number(synced?.inviteCount ?? candidate.inviteCount ?? 0)
+        const queueState = await detectEmailInAccountQueues(candidate.id, orderEmail)
+        const isMember = Boolean(queueState.isMember)
+        const isInvited = Boolean(queueState.isInvited)
+
+        if (!isMember && !isInvited && (userCount + inviteCount) >= resolvedCapacityLimit) {
+          attempt.status = 'skipped'
+          attempt.reason = '账号满员'
+          continue
+        }
+
+        releaseOpenAccountsOrderCode(db, orderNo)
+        const reservedCode = reserveOpenAccountsCode(db, {
+          orderNo,
+          accountEmail: candidate.email,
+          email: orderEmail
+        })
+        if (!reservedCode) {
+          attempt.status = 'failed'
+          attempt.reason = '账号无可用兑换码'
+          continue
+        }
+        ensureOpenAccountsOrderCode(db, { orderNo, accountEmail: candidate.email, email: orderEmail })
+        db.run(
+          `
+            UPDATE credit_orders
+            SET target_account_id = ?,
+                updated_at = DATETIME('now', 'localtime')
+            WHERE order_no = ?
+          `,
+          [candidate.id, orderNo]
+        )
+        saveDatabase()
+
+        const redeemCapacity = isMember || isInvited ? resolvedCapacityLimit + 1 : resolvedCapacityLimit
+        const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
+          orderNo,
+          uid,
+          email: orderEmail,
+          accountEmail: candidate.email,
+          capacityLimit: redeemCapacity
+        })
+
+        if (!redeemOutcome.ok) {
+          const payload = redeemOutcome?.payload && typeof redeemOutcome.payload === 'object'
+            ? redeemOutcome.payload
+            : null
+          const payloadDomain = normalizeDomainLike(payload?.domain || '')
+          if (payloadDomain) excludedDomains.add(payloadDomain)
+          attempt.status = 'failed'
+          attempt.reason = redeemOutcome.error || '兑换失败'
+          continue
+        }
+
+        updateLinuxDoUserCurrentAccount(db, uid, username, candidate.id, orderEmail)
+        const redeemedData = redeemOutcome.redemption?.data || {}
+        const resolvedInviteCount = typeof redeemedData.inviteCount === 'number'
+          ? redeemedData.inviteCount
+          : inviteCount
+        const body = {
+          message: redeemedData.inviteStatus === '邀请已发送'
+            ? '原账号域名疑似风控，已自动切换到可用账号并发送邀请'
+            : '原账号域名疑似风控，已自动切换到可用账号，邀请未发送（需要手动添加）',
+          currentOpenAccountId: candidate.id,
+          account: {
+            id: candidate.id,
+            userCount: redeemedData.userCount ?? userCount,
+            inviteCount: resolvedInviteCount
+          },
+          autoTransferred: true
+        }
+        db.run(
+          `
+            UPDATE credit_orders
+            SET target_account_id = ?,
+                action_status = 'fulfilled',
+                action_message = ?,
+                action_result = ?,
+                updated_at = DATETIME('now', 'localtime')
+            WHERE order_no = ?
+          `,
+          [candidate.id, body.message, JSON.stringify(body), orderNo]
+        )
+        saveDatabase()
+
+        attempt.status = 'success'
+        attempt.reason = '自动转移成功'
+        return {
+          transferred: true,
+          body,
+          transferAccountId: candidate.id,
+          transferAccountEmail: candidate.email,
+          attempts
+        }
+      } catch (attemptError) {
+        attempt.status = 'failed'
+        attempt.reason = attemptError?.message || String(attemptError)
+      }
+    }
+  }
+
+  return { transferred: false, attempts, reason: 'no_fallback_available' }
 }
 
 // 获取每日上车限制配置
@@ -698,14 +1172,10 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
 	              accountEmail,
 	              capacityLimit: openAccountsCapacityLimit + 1
 	            })
-            if (!redeemOutcome.ok) {
-              const codeMessage = redeemOutcome.error === 'no_code'
-                ? '当前账号暂无可用兑换码，请稍后再试'
-                : redeemOutcome.error || '兑换失败'
-              const statusCode = redeemOutcome.statusCode || (redeemOutcome.error === 'no_code' ? 409 : 500)
-              throw new AccountSyncError(codeMessage, statusCode)
-            }
-          }
+	            if (!redeemOutcome.ok) {
+	              throw buildRedeemFailureError(redeemOutcome)
+	            }
+	          }
 
           const body = {
             message: '已在该账号上车',
@@ -898,13 +1368,9 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
           capacityLimit: redeemCapacity
         })
 
-        if (!redeemOutcome.ok) {
-          const codeMessage = redeemOutcome.error === 'no_code'
-            ? '当前账号暂无可用兑换码，请稍后再试'
-            : redeemOutcome.error || '兑换失败'
-          const statusCode = redeemOutcome.statusCode || (redeemOutcome.error === 'no_code' ? 409 : 500)
-          throw new AccountSyncError(codeMessage, statusCode)
-        }
+	        if (!redeemOutcome.ok) {
+	          throw buildRedeemFailureError(redeemOutcome)
+	        }
 
         updateLinuxDoUserCurrentAccount(db, uid, username, accountId, orderEmail)
         saveDatabase()
@@ -943,9 +1409,123 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         return { type: 'success', body }
       } catch (error) {
         if (verifiedCreditOrderNo) {
-          const message = error instanceof AccountSyncError
+          let message = error instanceof AccountSyncError
             ? error.message
             : error?.message || String(error)
+
+          if (error instanceof AccountSyncError && error.code === OPEN_ACCOUNTS_INVITE_DOMAIN_RISK_CODE) {
+            const details = error?.details && typeof error.details === 'object' ? error.details : {}
+            const triggerDomain = normalizeDomainLike(details?.domain || accountEmail || '')
+            const closedAccountCount = Number(details?.closedAccountCount || 0)
+            const deletedUnusedCodeCount = Number(details?.deletedUnusedCodeCount || 0)
+
+            let transferResult = { transferred: false, attempts: [] }
+            try {
+              transferResult = await tryAutoTransferPaidOrderOnDomainRisk(db, {
+                orderNo: verifiedCreditOrderNo,
+                uid,
+                username,
+                orderEmail,
+                triggerAccountId: accountId,
+                triggerAccountEmail: accountEmail,
+                triggerDomain,
+                capacityLimit: openAccountsCapacityLimit
+              })
+            } catch (transferError) {
+              console.warn('[OpenAccounts] auto transfer after domain-risk failed', {
+                orderNo: verifiedCreditOrderNo,
+                message: transferError?.message || String(transferError)
+              })
+            }
+
+            if (transferResult?.transferred && transferResult?.body) {
+              await trySendDomainRiskOutcomeEmails({
+                action: 'transfer',
+                orderNo: verifiedCreditOrderNo,
+                uid,
+                username,
+                userEmail: orderEmail,
+                triggerDomain,
+                triggerAccountId: accountId,
+                triggerAccountEmail: accountEmail,
+                transferAccountId: transferResult.transferAccountId,
+                transferAccountEmail: transferResult.transferAccountEmail,
+                closedAccountCount,
+                deletedUnusedCodeCount,
+                fallbackAttempted: Array.isArray(transferResult.attempts) ? transferResult.attempts.length : 0,
+                attempts: transferResult.attempts || []
+              })
+              return { type: 'success', body: transferResult.body }
+            }
+
+            const fallbackAttempted = Array.isArray(transferResult?.attempts) ? transferResult.attempts.length : 0
+            message = fallbackAttempted > 0
+              ? `${message}；已尝试 ${fallbackAttempted} 个后备账号，均未转移成功`
+              : `${message}；未找到可用后备账号`
+
+            let refundMessage = ''
+            try {
+              const refundResult = await tryAutoRefundPaidOrder(db, verifiedCreditOrderNo, {
+                note: '因账号域名疑似风控且无可用后备账号自动退款'
+              })
+              if (refundResult?.refunded) {
+                message = `${message}；订单积分已自动退回，请重新选择账号上车`
+                refundMessage = refundResult?.message || '自动退款成功'
+                error.message = message
+                error.autoRefunded = true
+              } else if (refundResult?.attempted) {
+                refundMessage = refundResult?.message || ''
+                const detail = refundMessage ? `（${refundMessage}）` : ''
+                message = `${message}；自动退款未完成，请联系管理员手动退款${detail}`
+                error.message = message
+                error.autoRefunded = false
+              } else {
+                refundMessage = refundResult?.reason || '订单状态异常，未执行自动退款'
+                message = `${message}；自动退款未执行（${refundMessage}）`
+                error.message = message
+                error.autoRefunded = false
+              }
+
+              await trySendDomainRiskOutcomeEmails({
+                action: error.autoRefunded ? 'refunded' : 'refund_failed',
+                orderNo: verifiedCreditOrderNo,
+                uid,
+                username,
+                userEmail: orderEmail,
+                triggerDomain,
+                triggerAccountId: accountId,
+                triggerAccountEmail: accountEmail,
+                closedAccountCount,
+                deletedUnusedCodeCount,
+                fallbackAttempted,
+                refundMessage,
+                attempts: transferResult?.attempts || []
+              })
+            } catch (refundError) {
+              message = `${message}；自动退款执行异常，请联系管理员手动退款`
+              error.message = message
+              error.autoRefunded = false
+              console.warn('[OpenAccounts] auto refund after domain-risk failed', {
+                orderNo: verifiedCreditOrderNo,
+                message: refundError?.message || String(refundError)
+              })
+              await trySendDomainRiskOutcomeEmails({
+                action: 'refund_failed',
+                orderNo: verifiedCreditOrderNo,
+                uid,
+                username,
+                userEmail: orderEmail,
+                triggerDomain,
+                triggerAccountId: accountId,
+                triggerAccountEmail: accountEmail,
+                closedAccountCount,
+                deletedUnusedCodeCount,
+                fallbackAttempted,
+                refundMessage: refundError?.message || '自动退款执行异常',
+                attempts: transferResult?.attempts || []
+              })
+            }
+          }
           try {
             db.run(
               `
@@ -1144,17 +1724,23 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
     }
 
     return res.json(decision.body)
-  } catch (error) {
-    console.error('Board error:', error)
-    if (error instanceof AccountSyncError || error.status) {
-      const payload = { error: error.message }
-      if (error.code && String(error.code).startsWith('NO_WARRANTY')) {
-        payload.code = error.code
-      }
-      return res.status(error.status || 500).json(payload)
-    }
-    res.status(500).json({ error: '内部服务器错误' })
-  }
+	  } catch (error) {
+	    console.error('Board error:', error)
+	    if (error instanceof AccountSyncError || error.status) {
+	      const payload = { error: error.message }
+	      if (error.code && (
+	        String(error.code).startsWith('NO_WARRANTY')
+	        || String(error.code).startsWith('OPEN_ACCOUNTS_')
+	      )) {
+	        payload.code = error.code
+	      }
+	      if (typeof error?.autoRefunded === 'boolean') {
+	        payload.autoRefunded = error.autoRefunded
+	      }
+	      return res.status(error.status || 500).json(payload)
+	    }
+	    res.status(500).json({ error: '内部服务器错误' })
+	  }
 })
 
 // 下车（已移除）

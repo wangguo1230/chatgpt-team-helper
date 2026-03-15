@@ -373,6 +373,7 @@ export interface GptAccount {
   isBanned?: boolean
   bannedAt?: string | null
   bannedDays?: number | null
+  riskNote?: string | null
   chatgptAccountId?: string
   oaiDeviceId?: string
   expireAt?: string | null
@@ -2212,7 +2213,12 @@ export const openAccountsService = {
     accountId: number,
     options?: { turnstileToken?: string; creditOrderNo?: string }
   ): Promise<
-    | { message: string; currentOpenAccountId: number; account?: { id: number; userCount?: number; inviteCount?: number } }
+    | {
+        message: string
+        currentOpenAccountId: number
+        account?: { id: number; userCount?: number; inviteCount?: number }
+        autoTransferred?: boolean
+      }
     | {
         requiresCredit: true
         message: string

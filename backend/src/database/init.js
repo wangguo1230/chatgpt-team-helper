@@ -2454,6 +2454,11 @@ export async function initDatabase() {
 	              console.log('已添加 banned_at 列到 gpt_accounts 表')
 	              saveDatabase()
 	            }
+	            if (!columns.includes('risk_note')) {
+	              database.run('ALTER TABLE gpt_accounts ADD COLUMN risk_note TEXT')
+	              console.log('已添加 risk_note 列到 gpt_accounts 表')
+	              saveDatabase()
+	            }
 	            database.run(`
 	              UPDATE gpt_accounts
 	              SET banned_at = COALESCE(banned_at, updated_at)
@@ -2609,6 +2614,7 @@ export async function initDatabase() {
 		      is_banned INTEGER DEFAULT 0,
 		      ban_processed INTEGER DEFAULT 0,
 		      banned_at DATETIME,
+		      risk_note TEXT,
 		      created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
 		      updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
 		    )
@@ -2731,6 +2737,10 @@ export async function initDatabase() {
 	      if (!columns.includes('banned_at')) {
 	        database.run('ALTER TABLE gpt_accounts ADD COLUMN banned_at DATETIME')
 	        console.log('已添加 banned_at 列到 gpt_accounts 表')
+	      }
+	      if (!columns.includes('risk_note')) {
+	        database.run('ALTER TABLE gpt_accounts ADD COLUMN risk_note TEXT')
+	        console.log('已添加 risk_note 列到 gpt_accounts 表')
 	      }
 	      database.run(`
 	        UPDATE gpt_accounts

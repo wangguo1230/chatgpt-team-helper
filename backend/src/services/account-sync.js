@@ -95,8 +95,9 @@ function mapRowToAccount(row) {
     isBanned,
     bannedAt,
     bannedDays: calculateBannedDays(isBanned, bannedAt),
-    createdAt: row[12],
-    updatedAt: row[13]
+    riskNote: row[12] || null,
+    createdAt: row[13],
+    updatedAt: row[14]
   }
 }
 
@@ -106,6 +107,7 @@ async function fetchAccountById(db, accountId) {
 		    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 		           COALESCE(is_banned, 0) AS is_banned,
 		           banned_at,
+		           risk_note,
 		           created_at, updated_at
 		    FROM gpt_accounts
 		    WHERE id = ?
@@ -126,6 +128,7 @@ export async function fetchAllAccounts() {
 		    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 		           COALESCE(is_banned, 0) AS is_banned,
 		           banned_at,
+		           risk_note,
 		           created_at, updated_at
 		    FROM gpt_accounts
 		    ORDER BY created_at DESC

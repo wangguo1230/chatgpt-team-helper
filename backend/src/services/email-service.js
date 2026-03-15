@@ -310,6 +310,270 @@ export async function sendRedemptionFlowSummaryEmail(summary = {}) {
   }
 }
 
+export async function sendInviteDomainRiskAlertEmail(payload = {}) {
+  const domain = String(payload?.domain || '').trim().toLowerCase()
+  if (!domain) {
+    console.warn('[InviteDomainRisk] 缺少域名，跳过发送告警邮件')
+    return false
+  }
+
+  const triggerAccountId = Number(payload?.triggerAccountId || 0)
+  const triggerAccountEmail = String(payload?.triggerAccountEmail || '').trim()
+  const closedAccountCount = Number(payload?.closedAccountCount || 0)
+  const deletedUnusedCodeCount = Number(payload?.deletedUnusedCodeCount || 0)
+  const reason = String(payload?.reason || '').trim()
+  const triggeredAt = payload?.triggeredAt ? new Date(payload.triggeredAt) : new Date()
+  const resolvedTriggeredAt = Number.isNaN(triggeredAt.getTime()) ? new Date() : triggeredAt
+
+  const affectedAccounts = Array.isArray(payload?.affectedAccounts)
+    ? payload.affectedAccounts
+      .map(item => {
+        const id = Number(item?.id || 0)
+        const email = String(item?.email || '').trim()
+        const wasOpen = Boolean(item?.wasOpen)
+        if (!email) return null
+        return { id: Number.isFinite(id) && id > 0 ? id : 0, email, wasOpen }
+      })
+      .filter(Boolean)
+    : []
+
+  const affectedText = affectedAccounts.length > 0
+    ? affectedAccounts
+      .map(item => `- ${item.email}${item.id ? ` (ID=${item.id})` : ''}${item.wasOpen ? ' [已关闭开放]' : ''}`)
+      .join('\n')
+    : '无'
+
+  const affectedHtml = affectedAccounts.length > 0
+    ? `<ul>${affectedAccounts
+      .map(item => `<li>${escapeHtml(item.email)}${item.id ? ` (ID=${item.id})` : ''}${item.wasOpen ? ' [已关闭开放]' : ''}</li>`)
+      .join('')}</ul>`
+    : '<p>无</p>'
+
+  const subject = String(
+    process.env.INVITE_DOMAIN_RISK_ALERT_EMAIL_SUBJECT || `开放账号域名风控告警 @${domain}`
+  ).trim() || `开放账号域名风控告警 @${domain}`
+
+  const text = [
+    '检测到开放账号邀请域名疑似被风控，已执行自动处置。',
+    `触发时间：${resolvedTriggeredAt.toLocaleString()}`,
+    `疑似风控域名：${domain}`,
+    triggerAccountEmail ? `触发账号：${triggerAccountEmail}${triggerAccountId > 0 ? ` (ID=${triggerAccountId})` : ''}` : null,
+    reason ? `触发原因：${reason}` : null,
+    `关闭开放账号数：${closedAccountCount}`,
+    `删除未使用兑换码数：${deletedUnusedCodeCount}`,
+    '',
+    '涉及账号：',
+    affectedText
+  ].filter(Boolean).join('\n')
+
+  const html = [
+    '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica Neue, Arial, PingFang SC, Microsoft YaHei, sans-serif; line-height: 1.6;">',
+    '<h2 style="margin: 0 0 12px;">开放账号域名风控告警</h2>',
+    '<p style="margin: 0 0 8px;">检测到开放账号邀请域名疑似被风控，已执行自动处置。</p>',
+    `<p style="margin: 0 0 6px;">触发时间：<strong>${escapeHtml(resolvedTriggeredAt.toLocaleString())}</strong></p>`,
+    `<p style="margin: 0 0 6px;">疑似风控域名：<strong>${escapeHtml(domain)}</strong></p>`,
+    triggerAccountEmail
+      ? `<p style="margin: 0 0 6px;">触发账号：<strong>${escapeHtml(triggerAccountEmail)}${triggerAccountId > 0 ? ` (ID=${triggerAccountId})` : ''}</strong></p>`
+      : '',
+    reason ? `<p style="margin: 0 0 6px;">触发原因：${escapeHtml(reason)}</p>` : '',
+    `<p style="margin: 0 0 6px;">关闭开放账号数：<strong>${closedAccountCount}</strong></p>`,
+    `<p style="margin: 0 0 6px;">删除未使用兑换码数：<strong>${deletedUnusedCodeCount}</strong></p>`,
+    '<h4 style="margin: 12px 0 6px;">涉及账号</h4>',
+    affectedHtml,
+    '</div>'
+  ].join('\n')
+
+  return sendAdminAlertEmail({ subject, text, html })
+}
+
+const normalizeRiskAttempts = (attempts) => {
+  if (!Array.isArray(attempts)) return []
+  return attempts
+    .map((item, index) => {
+      const accountId = Number(item?.accountId || 0)
+      const accountEmail = String(item?.accountEmail || '').trim()
+      const reason = String(item?.reason || '').trim() || '未知失败'
+      const status = String(item?.status || '').trim()
+      if (!accountEmail && accountId <= 0) return null
+      return {
+        index: index + 1,
+        accountId: accountId > 0 ? accountId : null,
+        accountEmail: accountEmail || '',
+        reason,
+        status
+      }
+    })
+    .filter(Boolean)
+}
+
+export async function sendOpenAccountsDomainRiskUserEmail(payload = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[OpenAccountsRiskUserMail] SMTP 配置不完整，跳过发送用户邮件')
+    return false
+  }
+
+  const to = String(payload?.to || '').trim()
+  if (!to) {
+    console.warn('[OpenAccountsRiskUserMail] 缺少收件邮箱，跳过发送用户邮件')
+    return false
+  }
+
+  const action = String(payload?.action || '').trim().toLowerCase()
+  const isRefunded = action === 'refunded'
+  const isRefundFailed = action === 'refund_failed'
+  if (!isRefunded && !isRefundFailed) {
+    return false
+  }
+
+  const orderNo = String(payload?.orderNo || '').trim()
+  const refundMessage = String(payload?.refundMessage || '').trim()
+
+  const actionText = isRefunded ? '已自动退款' : '退款未完成，请联系管理员处理'
+  const subject = String(
+    payload?.subject
+    || process.env.OPEN_ACCOUNTS_REFUND_USER_SUBJECT
+    || '开放账号订单退款通知'
+  ).trim()
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const transporter = nodemailer.createTransport(smtpConfig)
+
+  const text = [
+    '您的开放账号订单退款处理结果如下：',
+    `处理结果：${actionText}`,
+    orderNo ? `订单号：${orderNo}` : null,
+    refundMessage ? `退款说明：${refundMessage}` : null
+  ].filter(Boolean).join('\n')
+
+  const html = [
+    '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica Neue, Arial, PingFang SC, Microsoft YaHei, sans-serif; line-height: 1.6;">',
+    '<h2 style="margin: 0 0 12px;">开放账号订单退款通知</h2>',
+    '<p style="margin: 0 0 8px;">您的开放账号订单退款处理结果如下：</p>',
+    `<p style="margin: 0 0 6px;">处理结果：<strong>${escapeHtml(actionText)}</strong></p>`,
+    orderNo ? `<p style="margin: 0 0 6px;">订单号：<strong>${escapeHtml(orderNo)}</strong></p>` : '',
+    refundMessage ? `<p style="margin: 0 0 6px;">退款说明：${escapeHtml(refundMessage)}</p>` : '',
+    '<p style="margin: 12px 0 0;">如有疑问请联系管理员。</p>',
+    '</div>'
+  ].join('\n')
+
+  try {
+    await transporter.sendMail({
+      from,
+      to,
+      subject: subject || '开放账号邀请异常处理通知',
+      text,
+      html
+    })
+    console.log('[OpenAccountsRiskUserMail] 用户通知邮件已发送', { to, orderNo, action: action || 'unknown' })
+    return true
+  } catch (error) {
+    console.warn('[OpenAccountsRiskUserMail] 发送用户通知邮件失败', error?.message || error)
+    return false
+  }
+}
+
+export async function sendOpenAccountsDomainRiskAdminEmail(payload = {}) {
+  const action = String(payload?.action || '').trim().toLowerCase()
+  const actionText = action === 'transfer'
+    ? '自动转移成功'
+    : action === 'refunded'
+      ? '自动退款成功'
+      : action === 'refund_failed'
+        ? '自动退款失败'
+        : '已处理'
+
+  const orderNo = String(payload?.orderNo || '').trim()
+  const uid = String(payload?.uid || '').trim()
+  const username = String(payload?.username || '').trim()
+  const userEmail = String(payload?.userEmail || '').trim()
+  const triggerDomain = String(payload?.triggerDomain || '').trim()
+  const triggerAccountEmail = String(payload?.triggerAccountEmail || '').trim()
+  const triggerAccountId = Number(payload?.triggerAccountId || 0)
+  const transferAccountEmail = String(payload?.transferAccountEmail || '').trim()
+  const transferAccountId = Number(payload?.transferAccountId || 0)
+  const closedAccountCount = Number(payload?.closedAccountCount || 0)
+  const deletedUnusedCodeCount = Number(payload?.deletedUnusedCodeCount || 0)
+  const fallbackAttempted = Number(payload?.fallbackAttempted || 0)
+  const refundMessage = String(payload?.refundMessage || '').trim()
+  const attempts = normalizeRiskAttempts(payload?.attempts)
+
+  const attemptsText = attempts.length > 0
+    ? attempts.map(item => {
+      const label = item.accountEmail || `ID=${item.accountId || 'unknown'}`
+      const status = item.status ? `${item.status} / ` : ''
+      return `- [${item.index}] ${label}${item.accountId ? ` (ID=${item.accountId})` : ''} => ${status}${item.reason}`
+    }).join('\n')
+    : '无'
+
+  const attemptsHtml = attempts.length > 0
+    ? `<ul>${attempts.map(item => {
+      const label = item.accountEmail || `ID=${item.accountId || 'unknown'}`
+      const status = item.status ? `${escapeHtml(item.status)} / ` : ''
+      return `<li>[${item.index}] ${escapeHtml(label)}${item.accountId ? ` (ID=${item.accountId})` : ''} =&gt; ${status}${escapeHtml(item.reason)}</li>`
+    }).join('')}</ul>`
+    : '<p>无</p>'
+
+  const subject = String(
+    payload?.subject
+    || process.env.OPEN_ACCOUNTS_DOMAIN_RISK_ADMIN_SUBJECT
+    || `开放账号域名风控订单处置：${actionText}${orderNo ? ` #${orderNo}` : ''}`
+  ).trim()
+
+  const text = [
+    '开放账号订单触发域名风控后的自动处置结果如下：',
+    `结果：${actionText}`,
+    orderNo ? `订单号：${orderNo}` : null,
+    uid ? `用户UID：${uid}` : null,
+    username ? `用户名：${username}` : null,
+    userEmail ? `邀请邮箱：${userEmail}` : null,
+    triggerDomain ? `疑似风控域名：${triggerDomain}` : null,
+    triggerAccountEmail
+      ? `触发账号：${triggerAccountEmail}${triggerAccountId > 0 ? ` (ID=${triggerAccountId})` : ''}`
+      : null,
+    transferAccountEmail
+      ? `转移账号：${transferAccountEmail}${transferAccountId > 0 ? ` (ID=${transferAccountId})` : ''}`
+      : null,
+    `关闭账号数：${closedAccountCount}`,
+    `删除未使用兑换码数：${deletedUnusedCodeCount}`,
+    `后备账号尝试次数：${Math.max(0, fallbackAttempted)}`,
+    refundMessage ? `退款信息：${refundMessage}` : null,
+    '',
+    '后备账号尝试明细：',
+    attemptsText
+  ].filter(Boolean).join('\n')
+
+  const html = [
+    '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica Neue, Arial, PingFang SC, Microsoft YaHei, sans-serif; line-height: 1.6;">',
+    '<h2 style="margin: 0 0 12px;">开放账号域名风控订单处置</h2>',
+    `<p style="margin: 0 0 6px;">结果：<strong>${escapeHtml(actionText)}</strong></p>`,
+    orderNo ? `<p style="margin: 0 0 6px;">订单号：<strong>${escapeHtml(orderNo)}</strong></p>` : '',
+    uid ? `<p style="margin: 0 0 6px;">用户UID：${escapeHtml(uid)}</p>` : '',
+    username ? `<p style="margin: 0 0 6px;">用户名：${escapeHtml(username)}</p>` : '',
+    userEmail ? `<p style="margin: 0 0 6px;">邀请邮箱：${escapeHtml(userEmail)}</p>` : '',
+    triggerDomain ? `<p style="margin: 0 0 6px;">疑似风控域名：<strong>${escapeHtml(triggerDomain)}</strong></p>` : '',
+    triggerAccountEmail
+      ? `<p style="margin: 0 0 6px;">触发账号：<strong>${escapeHtml(triggerAccountEmail)}${triggerAccountId > 0 ? ` (ID=${triggerAccountId})` : ''}</strong></p>`
+      : '',
+    transferAccountEmail
+      ? `<p style="margin: 0 0 6px;">转移账号：<strong>${escapeHtml(transferAccountEmail)}${transferAccountId > 0 ? ` (ID=${transferAccountId})` : ''}</strong></p>`
+      : '',
+    `<p style="margin: 0 0 6px;">关闭账号数：<strong>${closedAccountCount}</strong></p>`,
+    `<p style="margin: 0 0 6px;">删除未使用兑换码数：<strong>${deletedUnusedCodeCount}</strong></p>`,
+    `<p style="margin: 0 0 6px;">后备账号尝试次数：<strong>${Math.max(0, fallbackAttempted)}</strong></p>`,
+    refundMessage ? `<p style="margin: 0 0 6px;">退款信息：${escapeHtml(refundMessage)}</p>` : '',
+    '<h4 style="margin: 12px 0 6px;">后备账号尝试明细</h4>',
+    attemptsHtml,
+    '</div>'
+  ].join('\n')
+
+  return sendAdminAlertEmail({
+    subject: subject || '开放账号域名风控订单处置',
+    text,
+    html
+  })
+}
+
 export async function sendRedemptionOwnerNotificationEmail(payload = {}) {
   const settings = await getSmtpSettings()
   const smtpConfig = buildSmtpConfig(settings)
