@@ -4,6 +4,7 @@ import { getTurnstileSettings } from '../utils/turnstile-settings.js'
 import { getFeatureFlags } from '../utils/feature-flags.js'
 import { getChannels } from '../utils/channels.js'
 import { getRedemptionCodeSettings } from '../utils/redemption-settings.js'
+import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 
 const router = express.Router()
 
@@ -35,6 +36,7 @@ router.get('/runtime', async (req, res) => {
     const { list: channelList } = await getChannels()
     const db = await getDatabase()
     const redemptionSettings = getRedemptionCodeSettings(db)
+    const openAccountsCapacityLimit = getOpenAccountsCapacityLimit(db)
     const channels = (channelList || [])
       .filter(channel => channel?.isActive)
       .map(channel => ({
@@ -57,6 +59,7 @@ router.get('/runtime', async (req, res) => {
       features,
       channels,
       redemptionBatchCreateMaxCount: redemptionSettings.batchCreateMaxCount,
+      openAccountsCapacityLimit,
       openAccountsEnabled,
       openAccountsMaintenanceMessage: openAccountsEnabled ? null : getOpenAccountsMaintenanceMessage()
     })

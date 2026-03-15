@@ -292,6 +292,136 @@
         </template>
       </div>
 
+      <div v-if="linuxDoUser" class="mt-12 space-y-5">
+        <div class="flex items-end justify-between gap-3">
+          <div class="space-y-1">
+            <p class="text-xs font-semibold uppercase tracking-wider text-[#86868b]">LDC Shop</p>
+            <h2 class="text-2xl font-bold text-[#1d1d1f] dark:text-white flex items-center gap-2">
+              <Store class="h-5 w-5 text-blue-600 dark:text-blue-400" />
+              LDC 商品小店
+            </h2>
+            <p class="text-sm text-[#86868b]">可选页面直出或邮件发送。下单后自动记录订单与交付详情。</p>
+          </div>
+          <AppleButton variant="secondary" :loading="shopLoading" :disabled="!sessionToken" @click="loadShopProducts">
+            {{ shopLoading ? '刷新中' : '刷新商品' }}
+          </AppleButton>
+        </div>
+
+        <div v-if="shopError" class="rounded-2xl border border-red-200 bg-red-50/70 dark:bg-red-900/20 dark:border-red-900/40 px-4 py-3 text-sm text-red-600 dark:text-red-300">
+          {{ shopError }}
+        </div>
+
+        <div v-if="shopLoading" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div v-for="i in 3" :key="`shop-loading-${i}`" class="h-[168px] rounded-2xl bg-gray-100/60 dark:bg-white/5 animate-pulse"></div>
+        </div>
+
+        <div v-else-if="!shopProducts.length" class="rounded-2xl border border-gray-200/70 dark:border-white/10 bg-white/70 dark:bg-black/20 px-6 py-10 text-center text-[#86868b]">
+          暂无上架商品
+        </div>
+
+        <div v-else class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <AppleCard
+            v-for="product in shopProducts"
+            :key="product.productKey"
+            variant="glass"
+            padding="none"
+            radius="xl"
+            :interactive="true"
+            class="border border-white/60 dark:border-white/10 overflow-hidden"
+          >
+            <div class="p-5 space-y-4">
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="text-base font-bold text-[#1d1d1f] dark:text-white truncate">{{ product.productName }}</p>
+                  <p class="text-xs text-[#86868b] font-mono">{{ product.productKey }}</p>
+                </div>
+                <span class="px-2 py-1 text-xs rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 font-semibold">
+                  {{ product.deliveryMode }}
+                </span>
+              </div>
+
+              <div class="grid grid-cols-2 gap-3 text-sm">
+                <div class="rounded-xl bg-white/60 dark:bg-white/5 px-3 py-2 border border-black/5 dark:border-white/10">
+                  <p class="text-[11px] uppercase tracking-wider text-[#86868b]">价格</p>
+                  <p class="font-bold text-[#1d1d1f] dark:text-white">{{ product.amount }} Credit</p>
+                </div>
+                <div class="rounded-xl bg-white/60 dark:bg-white/5 px-3 py-2 border border-black/5 dark:border-white/10">
+                  <p class="text-[11px] uppercase tracking-wider text-[#86868b]">库存</p>
+                  <p class="font-bold" :class="Number(product.availableCount || 0) > 0 ? 'text-emerald-600 dark:text-emerald-300' : 'text-red-600 dark:text-red-300'">
+                    {{ product.availableCount }}
+                  </p>
+                </div>
+              </div>
+
+              <AppleButton
+                variant="premium"
+                class="w-full justify-center"
+                :disabled="!sessionToken || Number(product.availableCount || 0) <= 0 || Boolean(shopCreatingProductKey)"
+                :loading="shopCreatingProductKey === product.productKey"
+                @click="buyShopProduct(product)"
+              >
+                {{ Number(product.availableCount || 0) > 0 ? '立即购买' : '已售罄' }}
+              </AppleButton>
+            </div>
+          </AppleCard>
+        </div>
+
+        <div v-if="shopCurrentOrder" class="rounded-2xl border border-gray-200/70 dark:border-white/10 bg-white/70 dark:bg-black/20 p-5 space-y-3">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <Receipt class="h-4 w-4 text-[#86868b]" />
+              <p class="font-semibold text-[#1d1d1f] dark:text-white">当前订单</p>
+            </div>
+            <span class="px-2 py-1 text-xs rounded-full bg-slate-100 text-slate-700 dark:bg-white/10 dark:text-gray-200">{{ shopCurrentOrder.status }}</span>
+          </div>
+          <div class="text-sm text-[#86868b] space-y-1">
+            <p>订单号：<span class="font-mono">{{ shopCurrentOrder.orderNo }}</span></p>
+            <p>商品：{{ shopCurrentOrder.productName }}</p>
+            <p>金额：{{ shopCurrentOrder.amount }} Credit</p>
+            <p>交付方式：{{ shopCurrentOrder.deliveryMode }}</p>
+            <p v-if="shopCurrentOrder.deliveryEmailSentAt" class="flex items-center gap-1 text-emerald-600 dark:text-emerald-300">
+              <MailCheck class="h-3.5 w-3.5" /> 邮件已发送：{{ shopCurrentOrder.deliveryEmailSentAt }}
+            </p>
+            <p v-if="shopCurrentOrder.deliveryError" class="text-red-600 dark:text-red-300">{{ shopCurrentOrder.deliveryError }}</p>
+          </div>
+
+          <div v-if="shopInlineContent" class="rounded-xl border border-emerald-200/70 dark:border-emerald-900/40 bg-emerald-50/70 dark:bg-emerald-900/20 p-4">
+            <div class="flex items-center gap-2 text-emerald-700 dark:text-emerald-300 font-semibold text-sm mb-2">
+              <Eye class="h-4 w-4" />
+              页面交付内容
+            </div>
+            <pre class="whitespace-pre-wrap break-all text-xs text-emerald-900 dark:text-emerald-100 font-mono">{{ shopInlineContent }}</pre>
+          </div>
+        </div>
+
+        <div class="rounded-2xl border border-gray-200/70 dark:border-white/10 bg-white/70 dark:bg-black/20 p-5 space-y-3">
+          <div class="flex items-center gap-2">
+            <Package class="h-4 w-4 text-[#86868b]" />
+            <p class="font-semibold text-[#1d1d1f] dark:text-white">最近订单</p>
+          </div>
+          <div v-if="shopOrdersLoading" class="text-sm text-[#86868b]">加载中...</div>
+          <div v-else-if="!shopOrders.length" class="text-sm text-[#86868b]">暂无订单</div>
+          <div v-else class="space-y-2">
+            <div
+              v-for="order in shopOrders"
+              :key="order.orderNo"
+              class="rounded-xl border border-black/5 dark:border-white/10 bg-white/70 dark:bg-white/5 px-3 py-2 flex items-center justify-between gap-2"
+            >
+              <div class="min-w-0">
+                <p class="text-sm font-medium text-[#1d1d1f] dark:text-white truncate">{{ order.productName }}</p>
+                <p class="text-xs text-[#86868b] font-mono truncate">{{ order.orderNo }}</p>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-700 dark:bg-white/10 dark:text-gray-200">{{ order.status }}</span>
+                <AppleButton variant="secondary" class="h-8 px-3 text-xs" :disabled="!sessionToken" @click="fetchShopOrder(order.orderNo)">
+                  查看
+                </AppleButton>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
 	      <LinuxDoUserPopover
 	        v-if="linuxDoUser"
 	        :user="linuxDoUser"
@@ -436,7 +566,7 @@
 	</template>
 
 	<script setup lang="ts">
-		import { AlertCircle, Mail, Users, Clock, Calendar, HelpCircle, ExternalLink } from 'lucide-vue-next'
+		import { AlertCircle, Mail, Users, Clock, Calendar, HelpCircle, ExternalLink, Store, Package, MailCheck, Eye, Receipt } from 'lucide-vue-next'
 	import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
   import { useRouter } from 'vue-router'
 	import AppleButton from '@/components/ui/apple/Button.vue'
@@ -445,7 +575,15 @@
 	import RedeemShell from '@/components/RedeemShell.vue'
 	import LinuxDoUserPopover from '@/components/LinuxDoUserPopover.vue'
 	import { useLinuxDoAuthSession } from '@/composables/useLinuxDoAuthSession'
-	import { creditService, openAccountsService, linuxDoUserService, type OpenAccountItem, type OpenAccountsResponse } from '@/services/api'
+	import {
+    creditService,
+    openAccountsService,
+    linuxDoUserService,
+    type OpenAccountItem,
+    type OpenAccountsResponse,
+    type LdcShopProduct,
+    type LdcShopOrder
+  } from '@/services/api'
 		import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 	import { useToast } from '@/components/ui/toast'
   import { useAppConfigStore } from '@/stores/appConfig'
@@ -471,6 +609,16 @@ const pendingCreditAccountId = ref<number | null>(null)
 const creditPollingTimer = ref<number | null>(null)
 const creditPollingInFlight = ref(false)
 const rules = ref<OpenAccountsResponse['rules'] | null>(null)
+const shopProducts = ref<LdcShopProduct[]>([])
+const shopLoading = ref(false)
+const shopError = ref('')
+const shopCreatingProductKey = ref('')
+const shopCurrentOrder = ref<LdcShopOrder | null>(null)
+const shopPendingOrderNo = ref<string | null>(null)
+const shopPollingTimer = ref<number | null>(null)
+const shopPollingInFlight = ref(false)
+const shopOrders = ref<LdcShopOrder[]>([])
+const shopOrdersLoading = ref(false)
 
 const creditCostRange = computed(() => {
   if (!rules.value?.creditCost) return '...'
@@ -506,6 +654,11 @@ const sortedAccounts = computed(() => {
   const current = list.find(item => item.id === currentId)
   if (!current) return list
   return [current, ...list.filter(item => item.id !== currentId)]
+})
+
+const shopInlineContent = computed(() => {
+  const content = shopCurrentOrder.value?.delivery?.inlineContent
+  return String(content || '').trim()
 })
 
 const {
@@ -606,6 +759,123 @@ const loadMe = async () => {
 	  }
 	}
 
+const loadShopProducts = async () => {
+  if (!sessionToken.value) return
+  shopLoading.value = true
+  shopError.value = ''
+  try {
+    const response = await openAccountsService.shopListProducts(sessionToken.value)
+    shopProducts.value = Array.isArray(response.products) ? response.products : []
+  } catch (error: any) {
+    shopError.value = error?.response?.data?.error || '加载商品失败，请稍后重试'
+  } finally {
+    shopLoading.value = false
+  }
+}
+
+const loadShopOrders = async () => {
+  if (!sessionToken.value) return
+  shopOrdersLoading.value = true
+  try {
+    const response = await openAccountsService.shopListOrders(sessionToken.value, { page: 1, pageSize: 10 })
+    shopOrders.value = Array.isArray(response.orders) ? response.orders : []
+  } catch {
+    // ignore
+  } finally {
+    shopOrdersLoading.value = false
+  }
+}
+
+const stopShopPolling = () => {
+  if (shopPollingTimer.value) {
+    window.clearInterval(shopPollingTimer.value)
+    shopPollingTimer.value = null
+  }
+  shopPendingOrderNo.value = null
+}
+
+const fetchShopOrder = async (orderNo: string, options?: { silent?: boolean }) => {
+  if (!sessionToken.value || !orderNo) return
+  try {
+    const response = await openAccountsService.shopGetOrder(sessionToken.value, orderNo)
+    shopCurrentOrder.value = response.order || null
+    await loadShopOrders()
+  } catch (error: any) {
+    if (!options?.silent) {
+      showErrorToast(error?.response?.data?.error || '查询订单失败')
+    }
+  }
+}
+
+const pollShopOrder = async () => {
+  if (!sessionToken.value) return
+  if (!shopPendingOrderNo.value) return
+  if (shopPollingInFlight.value) return
+
+  shopPollingInFlight.value = true
+  try {
+    const response = await openAccountsService.shopGetOrder(sessionToken.value, shopPendingOrderNo.value)
+    const order = response.order
+    shopCurrentOrder.value = order || null
+    await loadShopOrders()
+
+    if (!order) return
+    if (order.status === 'delivered') {
+      showSuccessToast('商品已交付')
+      stopShopPolling()
+      await loadShopProducts()
+      return
+    }
+    if (['failed', 'expired', 'refunded', 'delivery_failed'].includes(order.status)) {
+      showErrorToast(order.deliveryError || `订单状态异常：${order.status}`)
+      stopShopPolling()
+      await loadShopProducts()
+      return
+    }
+  } catch (error: any) {
+    showErrorToast(error?.response?.data?.error || '查询订单失败')
+    stopShopPolling()
+  } finally {
+    shopPollingInFlight.value = false
+  }
+}
+
+const startShopPolling = (orderNo: string) => {
+  if (typeof window === 'undefined') return
+  stopShopPolling()
+  shopPendingOrderNo.value = orderNo
+  void pollShopOrder()
+  shopPollingTimer.value = window.setInterval(() => {
+    void pollShopOrder()
+  }, 3000)
+}
+
+const buyShopProduct = async (product: LdcShopProduct) => {
+  if (!sessionToken.value) return
+  if (!product?.productKey) return
+  if (Number(product.availableCount || 0) <= 0) {
+    showErrorToast('该商品已售罄')
+    return
+  }
+
+  shopCreatingProductKey.value = product.productKey
+  shopError.value = ''
+  try {
+    const response = await openAccountsService.shopCreateOrder(sessionToken.value, { productKey: product.productKey })
+    showInfoToast(response.reused ? '已复用未支付订单，请完成授权' : '订单已创建，请在新窗口完成 Credit 授权')
+    openCreditPayPage(response.creditOrder)
+    startShopPolling(response.orderNo)
+    await fetchShopOrder(response.orderNo, { silent: true })
+    await loadShopProducts()
+  } catch (error: any) {
+    const message = error?.response?.data?.error || '创建订单失败，请稍后重试'
+    shopError.value = message
+    showErrorToast(message)
+  } finally {
+    shopCreatingProductKey.value = ''
+  }
+}
+
 watch([linuxDoUser, sessionToken], ([user, token]) => {
   if (!user) return
   if (!token) {
@@ -614,6 +884,8 @@ watch([linuxDoUser, sessionToken], ([user, token]) => {
   }
   loadOpenAccounts()
   loadMe()
+  loadShopProducts()
+  loadShopOrders()
 })
 
 const openEmailDialog = () => {
@@ -873,5 +1145,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopCreditPolling()
+  stopShopPolling()
 })
 </script>

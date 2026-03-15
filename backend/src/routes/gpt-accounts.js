@@ -6,11 +6,14 @@ import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { requireMenu } from '../middleware/rbac.js'
 import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite, refreshAccessTokenWithRefreshToken, persistAccountTokens, deleteUnusedCodesByAccountId } from '../services/account-sync.js'
 import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
+import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
+import { withLocks } from '../utils/locks.js'
 
 const router = express.Router()
 const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 const normalizeBoolean = (value) => {
   if (typeof value === 'boolean') return value
@@ -89,6 +92,7 @@ const collectEmails = (payload) => {
 const CHECK_STATUS_ALLOWED_RANGE_DAYS = new Set([7, 15, 30])
 const MAX_CHECK_ACCOUNTS = 300
 const CHECK_STATUS_CONCURRENCY = 3
+const ZERO_JOINED_SYNC_CONCURRENCY = 3
 
 const pad2 = (value) => String(value).padStart(2, '0')
 const EXPIRE_AT_PARSE_REGEX = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/
@@ -116,6 +120,436 @@ const parseExpireAtToMs = (value) => {
   const iso = `${match[1]}-${pad2(month)}-${pad2(day)}T${pad2(hour)}:${pad2(minute)}:${pad2(second)}+08:00`
   const parsed = Date.parse(iso)
   return Number.isNaN(parsed) ? null : parsed
+}
+
+const parseDateTimeToMs = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const parsed = Date.parse(raw.replace(' ', 'T'))
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+const calculateBannedDays = (isBanned, bannedAt) => {
+  if (!isBanned || !bannedAt) return null
+  const bannedAtMs = parseDateTimeToMs(bannedAt)
+  if (!Number.isFinite(bannedAtMs)) return null
+  return Math.max(0, Math.floor((Date.now() - bannedAtMs) / (24 * 60 * 60 * 1000)))
+}
+
+const mapGptAccountRow = (row) => {
+  if (!row) return null
+  const isBanned = Boolean(row[10])
+  const bannedAt = row[11] || null
+  return {
+    id: row[0],
+    email: row[1],
+    token: row[2],
+    refreshToken: row[3],
+    userCount: row[4],
+    inviteCount: row[5],
+    chatgptAccountId: row[6],
+    oaiDeviceId: row[7],
+    expireAt: row[8] || null,
+    isOpen: Boolean(row[9]),
+    isDemoted: false,
+    isBanned,
+    bannedAt,
+    bannedDays: calculateBannedDays(isBanned, bannedAt),
+    createdAt: row[12],
+    updatedAt: row[13]
+  }
+}
+
+const mapInvitableAccount = (row) => {
+  if (!row) return null
+  return {
+    id: Number(row[0]),
+    email: String(row[1] || ''),
+    userCount: Number(row[2] || 0),
+    inviteCount: Number(row[3] || 0),
+    token: String(row[4] || ''),
+    chatgptAccountId: String(row[5] || ''),
+    expireAt: row[6] ? String(row[6]) : null,
+    isOpen: Number(row[7] || 0) === 1,
+    isBanned: Number(row[8] || 0) === 1
+  }
+}
+
+const DIRECT_INVITE_COMMON_CHANNEL_CONDITION = "COALESCE(NULLIF(lower(trim(channel)), ''), 'common') = 'common'"
+const DIRECT_INVITE_UNUSED_CODE_CONDITION = `
+  is_redeemed = 0
+  AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
+  AND (reserved_for_order_no IS NULL OR trim(reserved_for_order_no) = '')
+  AND COALESCE(reserved_for_entry_id, 0) = 0
+`
+
+const normalizeDirectInviteCodeStats = (totalCount, availableCount) => {
+  const normalizedTotal = Number(totalCount || 0)
+  const normalizedAvailable = Number(availableCount || 0)
+  return {
+    totalCount: Number.isFinite(normalizedTotal) && normalizedTotal > 0 ? normalizedTotal : 0,
+    availableCount: Number.isFinite(normalizedAvailable) && normalizedAvailable > 0 ? normalizedAvailable : 0
+  }
+}
+
+const getDirectInviteCodeStats = (db, accountEmail) => {
+  if (!db) return normalizeDirectInviteCodeStats(0, 0)
+  const normalizedEmail = normalizeEmail(accountEmail)
+  if (!normalizedEmail) return normalizeDirectInviteCodeStats(0, 0)
+
+  const result = db.exec(
+    `
+      SELECT
+        COUNT(*) AS total_count,
+        SUM(
+          CASE
+            WHEN ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
+            THEN 1 ELSE 0
+          END
+        ) AS available_count
+      FROM redemption_codes
+      WHERE lower(trim(account_email)) = ?
+        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+    `,
+    [normalizedEmail]
+  )
+  const row = result?.[0]?.values?.[0] || []
+  return normalizeDirectInviteCodeStats(row[0], row[1])
+}
+
+const hasEligibleDirectInviteCodes = (stats) => {
+  const normalized = normalizeDirectInviteCodeStats(stats?.totalCount, stats?.availableCount)
+  // 快捷邀请规则：未创建邀请码（total=0）可邀请；创建后必须仍有可用邀请码。
+  return normalized.totalCount === 0 || normalized.availableCount > 0
+}
+
+const loadDirectInviteCodeStatsByEmails = (db, emails) => {
+  const map = new Map()
+  if (!db) return map
+  const normalizedEmails = [...new Set((emails || []).map(normalizeEmail).filter(Boolean))]
+  if (!normalizedEmails.length) return map
+
+  const placeholders = normalizedEmails.map(() => '?').join(',')
+  const result = db.exec(
+    `
+      SELECT
+        lower(trim(account_email)) AS account_email,
+        COUNT(*) AS total_count,
+        SUM(
+          CASE
+            WHEN ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
+            THEN 1 ELSE 0
+          END
+        ) AS available_count
+      FROM redemption_codes
+      WHERE ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND lower(trim(account_email)) IN (${placeholders})
+      GROUP BY lower(trim(account_email))
+    `,
+    normalizedEmails
+  )
+
+  for (const row of result?.[0]?.values || []) {
+    const email = normalizeEmail(row[0])
+    if (!email) continue
+    map.set(email, normalizeDirectInviteCodeStats(row[1], row[2]))
+  }
+
+  return map
+}
+
+const reserveDirectInviteCode = (db, accountEmail, inviteEmail, reserveKey) => {
+  if (!db || !reserveKey) return null
+  const normalizedEmail = normalizeEmail(accountEmail)
+  if (!normalizedEmail) return null
+
+  const selected = db.exec(
+    `
+      SELECT id, code
+      FROM redemption_codes
+      WHERE lower(trim(account_email)) = ?
+        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
+      ORDER BY datetime(created_at) ASC, id ASC
+      LIMIT 1
+    `,
+    [normalizedEmail]
+  )
+  const row = selected?.[0]?.values?.[0]
+  if (!row) return null
+
+  const codeId = Number(row[0])
+  const code = String(row[1] || '')
+  if (!Number.isFinite(codeId) || codeId <= 0 || !code) return null
+
+  db.run(
+    `
+      UPDATE redemption_codes
+      SET reserved_for_order_no = ?,
+          reserved_for_order_email = ?,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+        AND ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
+    `,
+    [reserveKey, inviteEmail || null, codeId]
+  )
+
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified <= 0) return null
+
+  return { id: codeId, code }
+}
+
+const releaseDirectInviteCodeReservation = (db, codeId, reserveKey) => {
+  if (!db || !reserveKey) return false
+  const normalizedCodeId = Number(codeId)
+  if (!Number.isFinite(normalizedCodeId) || normalizedCodeId <= 0) return false
+  db.run(
+    `
+      UPDATE redemption_codes
+      SET reserved_for_order_no = NULL,
+          reserved_for_order_email = NULL,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+        AND is_redeemed = 0
+        AND reserved_for_order_no = ?
+    `,
+    [normalizedCodeId, reserveKey]
+  )
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified > 0) {
+    saveDatabase()
+  }
+  return modified > 0
+}
+
+const consumeReservedDirectInviteCode = (db, codeId, reserveKey) => {
+  if (!db || !reserveKey) return false
+  const normalizedCodeId = Number(codeId)
+  if (!Number.isFinite(normalizedCodeId) || normalizedCodeId <= 0) return false
+  db.run(
+    `
+      DELETE FROM redemption_codes
+      WHERE id = ?
+        AND is_redeemed = 0
+        AND reserved_for_order_no = ?
+    `,
+    [normalizedCodeId, reserveKey]
+  )
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified > 0) {
+    saveDatabase()
+  }
+  return modified > 0
+}
+
+const forceConsumeDirectInviteCode = (db, codeId) => {
+  if (!db) return false
+  const normalizedCodeId = Number(codeId)
+  if (!Number.isFinite(normalizedCodeId) || normalizedCodeId <= 0) return false
+  db.run(
+    `
+      DELETE FROM redemption_codes
+      WHERE id = ?
+        AND is_redeemed = 0
+    `,
+    [normalizedCodeId]
+  )
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified > 0) {
+    saveDatabase()
+  }
+  return modified > 0
+}
+
+const assertInvitableAccount = (account, { capacityLimit, nowMs }) => {
+  if (!account) {
+    throw new AccountSyncError('账号不存在', 404)
+  }
+
+  if (account.isBanned) {
+    throw new AccountSyncError('账号已封禁，无法邀请', 400)
+  }
+
+  if (!account.isOpen) {
+    throw new AccountSyncError('账号未开放，无法邀请', 400)
+  }
+
+  if (!account.token || !account.chatgptAccountId) {
+    throw new AccountSyncError('账号缺少 token 或 chatgpt_account_id，无法邀请', 400)
+  }
+
+  const expireAtMs = parseExpireAtToMs(account.expireAt)
+  if (expireAtMs != null && expireAtMs < nowMs) {
+    throw new AccountSyncError('账号已过期，无法邀请', 400)
+  }
+
+  const occupancy = Number(account.userCount || 0) + Number(account.inviteCount || 0)
+  if (occupancy >= capacityLimit) {
+    throw new AccountSyncError('账号已满员，无法邀请', 409)
+  }
+}
+
+const resolveDirectInviteAccount = (db, accountId = null) => {
+  const capacityLimit = getOpenAccountsCapacityLimit(db)
+  const nowMs = Date.now()
+
+  if (Number.isFinite(accountId) && Number(accountId) > 0) {
+    const result = db.exec(
+      `
+        SELECT id, email, COALESCE(user_count, 0), COALESCE(invite_count, 0),
+               token, chatgpt_account_id, expire_at, COALESCE(is_open, 0), COALESCE(is_banned, 0)
+        FROM gpt_accounts
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [Number(accountId)]
+    )
+    const account = mapInvitableAccount(result?.[0]?.values?.[0] || null)
+    assertInvitableAccount(account, { capacityLimit, nowMs })
+    const codeStats = getDirectInviteCodeStats(db, account?.email)
+    if (!hasEligibleDirectInviteCodes(codeStats)) {
+      throw new AccountSyncError('所选账号已创建邀请码但无未使用邀请码，请先补充邀请码', 409)
+    }
+    return account
+  }
+
+  const result = db.exec(
+    `
+      SELECT id, email, COALESCE(user_count, 0), COALESCE(invite_count, 0),
+             token, chatgpt_account_id, expire_at, COALESCE(is_open, 0), COALESCE(is_banned, 0)
+      FROM gpt_accounts
+      WHERE COALESCE(is_open, 0) = 1
+        AND COALESCE(is_banned, 0) = 0
+        AND token IS NOT NULL
+        AND TRIM(token) != ''
+        AND chatgpt_account_id IS NOT NULL
+        AND TRIM(chatgpt_account_id) != ''
+      ORDER BY COALESCE(user_count, 0) + COALESCE(invite_count, 0) ASC, id ASC
+      LIMIT 300
+    `
+  )
+  const rows = result?.[0]?.values || []
+  for (const row of rows) {
+    const account = mapInvitableAccount(row)
+    try {
+      assertInvitableAccount(account, { capacityLimit, nowMs })
+      const codeStats = getDirectInviteCodeStats(db, account?.email)
+      if (!hasEligibleDirectInviteCodes(codeStats)) {
+        continue
+      }
+      return account
+    } catch {
+      // 继续尝试下一个候选账号
+    }
+  }
+
+  throw new AccountSyncError('暂无符合快捷邀请条件的账号（需未满员，且邀请码为未创建或存在未使用）', 409)
+}
+
+const buildQuickInviteMeta = (account, { capacityLimit, nowMs, codeStats }) => {
+  const occupancy = Number(account?.userCount || 0) + Number(account?.inviteCount || 0)
+  const normalizedStats = normalizeDirectInviteCodeStats(codeStats?.totalCount, codeStats?.availableCount)
+  const base = {
+    quickInviteOccupancy: occupancy,
+    quickInviteCapacityLimit: Number(capacityLimit || 0),
+    directInviteCodeTotal: normalizedStats.totalCount,
+    directInviteCodeAvailable: normalizedStats.availableCount
+  }
+
+  if (!account) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号不存在' }
+  }
+  if (account.isBanned) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号已封禁' }
+  }
+  if (!account.isOpen) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号未开放' }
+  }
+  if (!account.token || !account.chatgptAccountId) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号缺少 token 或 ChatGPT ID' }
+  }
+  const expireAtMs = parseExpireAtToMs(account.expireAt)
+  if (expireAtMs != null && expireAtMs < nowMs) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号已过期' }
+  }
+  if (occupancy >= capacityLimit) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '账号已满员' }
+  }
+  if (!hasEligibleDirectInviteCodes(normalizedStats)) {
+    return { ...base, quickInviteEligible: false, quickInviteReason: '已创建邀请码但无未使用邀请码' }
+  }
+
+  return { ...base, quickInviteEligible: true, quickInviteReason: null }
+}
+
+const parsePositiveInt = (value) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null
+}
+
+const readAccountInviteCount = (db, accountId) => {
+  const normalizedAccountId = parsePositiveInt(accountId)
+  if (!db || !normalizedAccountId) return null
+  const result = db.exec(
+    `
+      SELECT COALESCE(invite_count, 0)
+      FROM gpt_accounts
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [normalizedAccountId]
+  )
+  const row = result?.[0]?.values?.[0]
+  const inviteCount = row ? Number(row[0]) : NaN
+  return Number.isFinite(inviteCount) && inviteCount >= 0 ? inviteCount : null
+}
+
+const incrementInviteCountOptimistically = (db, accountId) => {
+  const normalizedAccountId = parsePositiveInt(accountId)
+  if (!db || !normalizedAccountId) return null
+  db.run(
+    `
+      UPDATE gpt_accounts
+      SET invite_count = COALESCE(invite_count, 0) + 1,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+    `,
+    [normalizedAccountId]
+  )
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified > 0) {
+    saveDatabase()
+  }
+  return readAccountInviteCount(db, normalizedAccountId)
+}
+
+const ensureInviteCountAtLeast = (db, accountId, minValue) => {
+  const normalizedAccountId = parsePositiveInt(accountId)
+  const normalizedMin = Number(minValue)
+  if (!db || !normalizedAccountId || !Number.isFinite(normalizedMin) || normalizedMin < 0) {
+    return readAccountInviteCount(db, normalizedAccountId)
+  }
+
+  const current = readAccountInviteCount(db, normalizedAccountId)
+  if (!Number.isFinite(current) || current >= normalizedMin) {
+    return current
+  }
+
+  db.run(
+    `
+      UPDATE gpt_accounts
+      SET invite_count = ?,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+    `,
+    [Math.floor(normalizedMin), normalizedAccountId]
+  )
+  const modified = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+  if (modified > 0) {
+    saveDatabase()
+  }
+  return readAccountInviteCount(db, normalizedAccountId)
 }
 
 const mapWithConcurrency = async (items, concurrency, fn) => {
@@ -261,6 +695,21 @@ const checkSingleAccountStatus = async (db, account, nowMs) => {
   }
 }
 
+const syncSingleAccountUserAndInvite = async (accountId) => {
+  const userSync = await syncAccountUserCount(accountId)
+  const inviteSync = await syncAccountInviteCount(accountId, {
+    accountRecord: userSync.account,
+    inviteListParams: { offset: 0, limit: 1, query: '' }
+  })
+
+  return {
+    account: inviteSync.account,
+    syncedUserCount: userSync.syncedUserCount,
+    inviteCount: inviteSync.inviteCount,
+    users: userSync.users
+  }
+}
+
 // 使用系统设置中的 API 密钥（x-api-key）标记账号为“封号”
 router.post('/ban', apiKeyAuth, async (req, res) => {
   try {
@@ -296,17 +745,18 @@ router.post('/ban', apiKeyAuth, async (req, res) => {
     const matchedSet = new Set(matched.map(item => normalizeEmail(item.email)))
     const notFound = emails.filter(email => !matchedSet.has(email))
 
-    if (matched.length > 0) {
-      db.run(
-        `
-          UPDATE gpt_accounts
-          SET is_open = 0,
-              is_banned = 1,
-              updated_at = DATETIME('now', 'localtime')
-          WHERE LOWER(email) IN (${placeholders})
-        `,
-        emails
-      )
+	    if (matched.length > 0) {
+	      db.run(
+	        `
+	          UPDATE gpt_accounts
+	          SET is_open = 0,
+	              is_banned = 1,
+	              banned_at = COALESCE(banned_at, DATETIME('now', 'localtime')),
+	              updated_at = DATETIME('now', 'localtime')
+	          WHERE LOWER(email) IN (${placeholders})
+	        `,
+	        emails
+	      )
       for (const item of matched) {
         await deleteUnusedCodesByAccountId(db, item.id)
       }
@@ -541,6 +991,7 @@ router.get('/', async (req, res) => {
 	    const dataResult = db.exec(`
 	      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 	             COALESCE(is_banned, 0) AS is_banned,
+	             banned_at,
 	             created_at, updated_at
 	      FROM gpt_accounts
 	      ${whereClause}
@@ -548,25 +999,25 @@ router.get('/', async (req, res) => {
 	      LIMIT ? OFFSET ?
 	    `, [...params, pageSize, offset])
 
-	    const accounts = (dataResult[0]?.values || []).map(row => ({
-	      id: row[0],
-	      email: row[1],
-	      token: row[2],
-	      refreshToken: row[3],
-	      userCount: row[4],
-	      inviteCount: row[5],
-	      chatgptAccountId: row[6],
-	      oaiDeviceId: row[7],
-	      expireAt: row[8] || null,
-	      isOpen: Boolean(row[9]),
-	      isDemoted: false,
-	      isBanned: Boolean(row[10]),
-	      createdAt: row[11],
-	      updatedAt: row[12]
-	    }))
+	    const accounts = (dataResult[0]?.values || []).map(mapGptAccountRow)
+      const capacityLimit = getOpenAccountsCapacityLimit(db)
+      const nowMs = Date.now()
+      const codeStatsByEmail = loadDirectInviteCodeStatsByEmails(
+        db,
+        accounts.map(account => account?.email)
+      )
+      const accountsWithQuickInviteMeta = accounts.map(account => {
+        const normalizedEmail = normalizeEmail(account?.email)
+        const stats = codeStatsByEmail.get(normalizedEmail) || normalizeDirectInviteCodeStats(0, 0)
+        const quickInviteMeta = buildQuickInviteMeta(account, { capacityLimit, nowMs, codeStats: stats })
+        return {
+          ...account,
+          ...quickInviteMeta
+        }
+      })
 
     res.json({
-      accounts,
+      accounts: accountsWithQuickInviteMeta,
       pagination: { page, pageSize, total }
     })
   } catch (error) {
@@ -582,6 +1033,7 @@ router.get('/:id', async (req, res) => {
 	    const result = db.exec(`
 	      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 	             COALESCE(is_banned, 0) AS is_banned,
+	             banned_at,
 	             created_at, updated_at
 	      FROM gpt_accounts
 	      WHERE id = ?
@@ -591,23 +1043,8 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Account not found' })
     }
 
-    const row = result[0].values[0]
-	    const account = {
-	      id: row[0],
-	      email: row[1],
-	      token: row[2],
-	      refreshToken: row[3],
-	      userCount: row[4],
-		      inviteCount: row[5],
-		      chatgptAccountId: row[6],
-		      oaiDeviceId: row[7],
-		      expireAt: row[8] || null,
-		      isOpen: Boolean(row[9]),
-		      isDemoted: false,
-		      isBanned: Boolean(row[10]),
-		      createdAt: row[11],
-		      updatedAt: row[12]
-		    }
+	    const row = result[0].values[0]
+	    const account = mapGptAccountRow(row)
 
     res.json(account)
   } catch (error) {
@@ -666,36 +1103,51 @@ router.post('/', async (req, res) => {
     // 设置默认人数为1而不是0
     const finalUserCount = userCount !== undefined ? userCount : 1
 
-    db.run(
-      `INSERT INTO gpt_accounts (email, token, refresh_token, user_count, chatgpt_account_id, oai_device_id, expire_at, is_banned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-      [normalizedEmail, token, refreshToken || null, finalUserCount, normalizedChatgptAccountId, normalizedOaiDeviceId || null, normalizedExpireAt, isBannedValue]
-    )
+	    db.run(
+	      `
+	        INSERT INTO gpt_accounts (
+	          email,
+	          token,
+	          refresh_token,
+	          user_count,
+	          chatgpt_account_id,
+	          oai_device_id,
+	          expire_at,
+	          is_banned,
+	          banned_at,
+	          created_at,
+	          updated_at
+	        ) VALUES (
+	          ?, ?, ?, ?, ?, ?, ?, ?,
+	          CASE WHEN ? = 1 THEN DATETIME('now', 'localtime') ELSE NULL END,
+	          DATETIME('now', 'localtime'),
+	          DATETIME('now', 'localtime')
+	        )
+	      `,
+	      [
+	        normalizedEmail,
+	        token,
+	        refreshToken || null,
+	        finalUserCount,
+	        normalizedChatgptAccountId,
+	        normalizedOaiDeviceId || null,
+	        normalizedExpireAt,
+	        isBannedValue,
+	        isBannedValue
+	      ]
+	    )
 
 		    // 获取新创建账号的ID
 		    const accountResult = db.exec(`
 		      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 		             COALESCE(is_banned, 0) AS is_banned,
+		             banned_at,
 		             created_at, updated_at
 		      FROM gpt_accounts
 		      WHERE id = last_insert_rowid()
 		    `)
-    const row = accountResult[0].values[0]
-	    const account = {
-	      id: row[0],
-	      email: row[1],
-	      token: row[2],
-	      refreshToken: row[3],
-	      userCount: row[4],
-		      inviteCount: row[5],
-		      chatgptAccountId: row[6],
-		      oaiDeviceId: row[7],
-		      expireAt: row[8] || null,
-		      isOpen: Boolean(row[9]),
-		      isDemoted: false,
-		      isBanned: Boolean(row[10]),
-		      createdAt: row[11],
-		      updatedAt: row[12]
-		    }
+	    const row = accountResult[0].values[0]
+	    const account = mapGptAccountRow(row)
 
     saveDatabase()
 
@@ -764,21 +1216,22 @@ router.put('/:id', async (req, res) => {
 
     const existingEmail = checkResult[0].values[0][1]
 
-    db.run(
-      `UPDATE gpt_accounts
-       SET email = ?,
-           token = ?,
-           refresh_token = ?,
-           user_count = ?,
-           chatgpt_account_id = ?,
-           oai_device_id = ?,
-           expire_at = CASE WHEN ? = 1 THEN ? ELSE expire_at END,
-           is_banned = CASE WHEN ? = 1 THEN ? ELSE is_banned END,
-           is_open = CASE WHEN ? = 1 THEN 0 ELSE is_open END,
-           ban_processed = CASE WHEN ? = 1 THEN 0 ELSE ban_processed END,
-           updated_at = DATETIME('now', 'localtime')
-       WHERE id = ?`,
-      [
+	    db.run(
+	      `UPDATE gpt_accounts
+	       SET email = ?,
+	           token = ?,
+	           refresh_token = ?,
+	           user_count = ?,
+	           chatgpt_account_id = ?,
+	           oai_device_id = ?,
+	           expire_at = CASE WHEN ? = 1 THEN ? ELSE expire_at END,
+	           is_banned = CASE WHEN ? = 1 THEN ? ELSE is_banned END,
+	           banned_at = CASE WHEN ? = 1 THEN CASE WHEN ? = 1 THEN COALESCE(banned_at, DATETIME('now', 'localtime')) ELSE NULL END ELSE banned_at END,
+	           is_open = CASE WHEN ? = 1 THEN 0 ELSE is_open END,
+	           ban_processed = CASE WHEN ? = 1 THEN 0 ELSE ban_processed END,
+	           updated_at = DATETIME('now', 'localtime')
+	       WHERE id = ?`,
+	      [
         email,
         token,
         refreshToken || null,
@@ -786,14 +1239,16 @@ router.put('/:id', async (req, res) => {
         normalizedChatgptAccountId,
         normalizedOaiDeviceId || null,
         hasExpireAt ? 1 : 0,
-        normalizedExpireAt,
-        shouldUpdateIsBanned ? 1 : 0,
-        isBannedValue,
-        shouldApplyBanSideEffects ? 1 : 0,
-        shouldApplyBanSideEffects ? 1 : 0,
-        req.params.id
-      ]
-    )
+	        normalizedExpireAt,
+	        shouldUpdateIsBanned ? 1 : 0,
+	        isBannedValue,
+	        shouldUpdateIsBanned ? 1 : 0,
+	        isBannedValue,
+	        shouldApplyBanSideEffects ? 1 : 0,
+	        shouldApplyBanSideEffects ? 1 : 0,
+	        req.params.id
+	      ]
+	    )
 
     if (existingEmail && existingEmail !== email) {
       db.run(
@@ -813,27 +1268,13 @@ router.put('/:id', async (req, res) => {
 		    const result = db.exec(`
 		      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 		             COALESCE(is_banned, 0) AS is_banned,
+		             banned_at,
 		             created_at, updated_at
 		      FROM gpt_accounts
 		      WHERE id = ?
 		    `, [req.params.id])
-    const row = result[0].values[0]
-	    const account = {
-	      id: row[0],
-	      email: row[1],
-	      token: row[2],
-	      refreshToken: row[3],
-	      userCount: row[4],
-		      inviteCount: row[5],
-		      chatgptAccountId: row[6],
-		      oaiDeviceId: row[7],
-		      expireAt: row[8] || null,
-		      isOpen: Boolean(row[9]),
-		      isDemoted: false,
-		      isBanned: Boolean(row[10]),
-		      createdAt: row[11],
-		      updatedAt: row[12]
-		    }
+	    const row = result[0].values[0]
+	    const account = mapGptAccountRow(row)
 
     res.json(account)
   } catch (error) {
@@ -868,33 +1309,19 @@ router.patch('/:id/open', async (req, res) => {
 	    )
 	    saveDatabase()
 
-		    const result = db.exec(
-		      `
-		        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-		               COALESCE(is_banned, 0) AS is_banned,
-		               created_at, updated_at
-		        FROM gpt_accounts
-		        WHERE id = ?
-		      `,
-		      [req.params.id]
-		    )
-	    const row = result[0].values[0]
-	    const account = {
-	      id: row[0],
-	      email: row[1],
-	      token: row[2],
-	      refreshToken: row[3],
-	      userCount: row[4],
-		      inviteCount: row[5],
-		      chatgptAccountId: row[6],
-		      oaiDeviceId: row[7],
-		      expireAt: row[8] || null,
-		      isOpen: Boolean(row[9]),
-		      isDemoted: false,
-		      isBanned: Boolean(row[10]),
-		      createdAt: row[11],
-		      updatedAt: row[12]
-		    }
+			    const result = db.exec(
+			      `
+			        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+			               COALESCE(is_banned, 0) AS is_banned,
+			               banned_at,
+			               created_at, updated_at
+			        FROM gpt_accounts
+			        WHERE id = ?
+			      `,
+			      [req.params.id]
+			    )
+		    const row = result[0].values[0]
+		    const account = mapGptAccountRow(row)
 
     res.json(account)
   } catch (error) {
@@ -917,51 +1344,157 @@ router.patch('/:id/ban', async (req, res) => {
       return res.status(404).json({ error: 'Account not found' })
     }
 
-    db.run(
-      `
-        UPDATE gpt_accounts
-        SET is_open = 0,
-            is_banned = 1,
-            ban_processed = 0,
-            updated_at = DATETIME('now', 'localtime')
-        WHERE id = ?
-      `,
-      [accountId]
-    )
+	    db.run(
+	      `
+	        UPDATE gpt_accounts
+	        SET is_open = 0,
+	            is_banned = 1,
+	            ban_processed = 0,
+	            banned_at = COALESCE(banned_at, DATETIME('now', 'localtime')),
+	            updated_at = DATETIME('now', 'localtime')
+	        WHERE id = ?
+	      `,
+	      [accountId]
+	    )
     saveDatabase()
 
-    const result = db.exec(
-      `
-        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-               COALESCE(is_banned, 0) AS is_banned,
-               created_at, updated_at
-        FROM gpt_accounts
-        WHERE id = ?
-      `,
-      [accountId]
-    )
-    const row = result[0].values[0]
-    const account = {
-      id: row[0],
-      email: row[1],
-      token: row[2],
-      refreshToken: row[3],
-      userCount: row[4],
-      inviteCount: row[5],
-      chatgptAccountId: row[6],
-      oaiDeviceId: row[7],
-      expireAt: row[8] || null,
-      isOpen: Boolean(row[9]),
-      isDemoted: false,
-      isBanned: Boolean(row[10]),
-      createdAt: row[11],
-      updatedAt: row[12]
-    }
+	    const result = db.exec(
+	      `
+	        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+	               COALESCE(is_banned, 0) AS is_banned,
+	               banned_at,
+	               created_at, updated_at
+	        FROM gpt_accounts
+	        WHERE id = ?
+	      `,
+	      [accountId]
+	    )
+	    const row = result[0].values[0]
+	    const account = mapGptAccountRow(row)
 
     res.json(account)
   } catch (error) {
     console.error('Ban GPT account error:', error)
     res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 批量删除封号账号（仅删除 is_banned = 1 的记录）
+router.delete('/banned/batch', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const rawAccountIds = Array.isArray(req.body?.accountIds) ? req.body.accountIds : null
+    const normalizedAccountIds = rawAccountIds
+      ? [...new Set(rawAccountIds.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0))]
+      : null
+
+    if (rawAccountIds && normalizedAccountIds && normalizedAccountIds.length === 0) {
+      return res.status(400).json({ error: 'accountIds 必须是正整数数组' })
+    }
+
+    let query = 'SELECT id FROM gpt_accounts WHERE COALESCE(is_banned, 0) = 1'
+    let params = []
+
+    if (normalizedAccountIds && normalizedAccountIds.length > 0) {
+      const placeholders = normalizedAccountIds.map(() => '?').join(',')
+      query += ` AND id IN (${placeholders})`
+      params = normalizedAccountIds
+    }
+
+    const matchedResult = db.exec(query, params)
+    const bannedIds = (matchedResult[0]?.values || [])
+      .map(row => Number(row[0]))
+      .filter(id => Number.isInteger(id) && id > 0)
+
+    if (bannedIds.length === 0) {
+      return res.json({
+        message: '没有可删除的封号账号',
+        deleted: 0,
+        matched: 0,
+        requestedIds: normalizedAccountIds || null
+      })
+    }
+
+    const deletePlaceholders = bannedIds.map(() => '?').join(',')
+    db.run(`DELETE FROM gpt_accounts WHERE id IN (${deletePlaceholders})`, bannedIds)
+    saveDatabase()
+
+    return res.json({
+      message: '封号账号批量删除成功',
+      deleted: bannedIds.length,
+      matched: bannedIds.length,
+      requestedIds: normalizedAccountIds || null
+    })
+  } catch (error) {
+    console.error('Batch delete banned GPT accounts error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 批量删除过期账号（仅删除“过期”状态，不包含封号账号）
+router.delete('/expired/batch', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const rawAccountIds = Array.isArray(req.body?.accountIds) ? req.body.accountIds : null
+    const normalizedAccountIds = rawAccountIds
+      ? [...new Set(rawAccountIds.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0))]
+      : null
+
+    if (rawAccountIds && normalizedAccountIds && normalizedAccountIds.length === 0) {
+      return res.status(400).json({ error: 'accountIds 必须是正整数数组' })
+    }
+
+    let query = `
+      SELECT id, expire_at
+      FROM gpt_accounts
+      WHERE COALESCE(is_banned, 0) = 0
+        AND expire_at IS NOT NULL
+        AND TRIM(expire_at) != ''
+    `
+    let params = []
+
+    if (normalizedAccountIds && normalizedAccountIds.length > 0) {
+      const placeholders = normalizedAccountIds.map(() => '?').join(',')
+      query += ` AND id IN (${placeholders})`
+      params = normalizedAccountIds
+    }
+
+    const matchedResult = db.exec(query, params)
+    const nowMs = Date.now()
+    const expiredIds = (matchedResult[0]?.values || [])
+      .map(row => ({
+        id: Number(row[0]),
+        expireAt: row[1] == null ? '' : String(row[1]).trim()
+      }))
+      .filter(item => Number.isInteger(item.id) && item.id > 0)
+      .filter(item => {
+        const expireAtMs = parseExpireAtToMs(item.expireAt)
+        return expireAtMs != null && expireAtMs < nowMs
+      })
+      .map(item => item.id)
+
+    if (expiredIds.length === 0) {
+      return res.json({
+        message: '没有可删除的过期账号',
+        deleted: 0,
+        matched: 0,
+        requestedIds: normalizedAccountIds || null
+      })
+    }
+
+    const deletePlaceholders = expiredIds.map(() => '?').join(',')
+    db.run(`DELETE FROM gpt_accounts WHERE id IN (${deletePlaceholders})`, expiredIds)
+    saveDatabase()
+
+    return res.json({
+      message: '过期账号批量删除成功',
+      deleted: expiredIds.length,
+      matched: expiredIds.length,
+      requestedIds: normalizedAccountIds || null
+    })
+  } catch (error) {
+    console.error('Batch delete expired GPT accounts error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
   }
 })
 
@@ -994,18 +1527,14 @@ router.post('/:id/sync-user-count', async (req, res) => {
   }
 
   try {
-    const userSync = await syncAccountUserCount(accountId)
-    const inviteSync = await syncAccountInviteCount(accountId, {
-      accountRecord: userSync.account,
-      inviteListParams: { offset: 0, limit: 1, query: '' }
-    })
+    const synced = await syncSingleAccountUserAndInvite(accountId)
 
     res.json({
       message: '账号同步成功',
-      account: inviteSync.account,
-      syncedUserCount: userSync.syncedUserCount,
-      inviteCount: inviteSync.inviteCount,
-      users: userSync.users
+      account: synced.account,
+      syncedUserCount: synced.syncedUserCount,
+      inviteCount: synced.inviteCount,
+      users: synced.users
     })
   } catch (error) {
     console.error('同步账号人数错误:', error)
@@ -1015,6 +1544,75 @@ router.post('/:id/sync-user-count', async (req, res) => {
     }
 
     res.status(500).json({ error: '内部服务器错误' })
+  }
+})
+
+// 一键同步“已加入 = 0”的账号
+router.post('/sync-user-count/zero-joined', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const result = db.exec(
+      `
+        SELECT id, email
+        FROM gpt_accounts
+        WHERE COALESCE(is_banned, 0) = 0
+          AND COALESCE(user_count, 0) = 0
+        ORDER BY created_at DESC
+      `
+    )
+    const targets = (result[0]?.values || [])
+      .map(row => ({
+        id: Number(row[0]),
+        email: String(row[1] || '')
+      }))
+      .filter(item => Number.isInteger(item.id) && item.id > 0)
+
+    if (targets.length === 0) {
+      return res.json({
+        message: '没有可同步的账号',
+        targetCount: 0,
+        syncedCount: 0,
+        failedCount: 0,
+        items: []
+      })
+    }
+
+    const items = await mapWithConcurrency(targets, ZERO_JOINED_SYNC_CONCURRENCY, async (item) => {
+      try {
+        const synced = await syncSingleAccountUserAndInvite(item.id)
+        return {
+          id: item.id,
+          email: item.email,
+          status: 'synced',
+          syncedUserCount: synced.syncedUserCount,
+          inviteCount: synced.inviteCount,
+          error: null
+        }
+      } catch (error) {
+        return {
+          id: item.id,
+          email: item.email,
+          status: 'failed',
+          syncedUserCount: null,
+          inviteCount: null,
+          error: error?.message ? String(error.message) : '同步失败'
+        }
+      }
+    })
+
+    const syncedCount = items.filter(item => item.status === 'synced').length
+    const failedCount = items.length - syncedCount
+
+    return res.json({
+      message: failedCount > 0 ? '部分账号同步失败' : '账号同步成功',
+      targetCount: items.length,
+      syncedCount,
+      failedCount,
+      items
+    })
+  } catch (error) {
+    console.error('Batch sync zero-joined GPT accounts error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
   }
 })
 
@@ -1041,16 +1639,26 @@ router.delete('/:id/users/:userId', async (req, res) => {
 router.post('/:id/invite-user', async (req, res) => {
   try {
     const { email } = req.body || {}
+    const accountId = Number(req.params.id)
     if (!email) {
       return res.status(400).json({ error: '请提供邀请邮箱地址' })
     }
-    const result = await inviteAccountUser(Number(req.params.id), email)
-    let inviteCount = null
+    const result = await inviteAccountUser(accountId, email)
+    const db = await getDatabase()
+    const optimisticInviteCount = incrementInviteCountOptimistically(db, accountId)
+    let inviteCount = Number.isFinite(optimisticInviteCount) ? optimisticInviteCount : null
     try {
-      const synced = await syncAccountInviteCount(Number(req.params.id), {
+      const synced = await syncAccountInviteCount(accountId, {
         inviteListParams: { offset: 0, limit: 1, query: '' }
       })
-      inviteCount = synced.inviteCount
+      const syncedInviteCount = Number(synced.inviteCount)
+      if (Number.isFinite(syncedInviteCount)) {
+        inviteCount = syncedInviteCount
+      }
+      if (Number.isFinite(optimisticInviteCount)) {
+        const normalizedFloor = Math.max(Number(optimisticInviteCount), Number(inviteCount || 0))
+        inviteCount = ensureInviteCountAtLeast(db, accountId, normalizedFloor) ?? normalizedFloor
+      }
     } catch (syncError) {
       console.warn('邀请发送成功，但同步邀请数失败:', syncError?.message || syncError)
     }
@@ -1066,6 +1674,110 @@ router.post('/:id/invite-user', async (req, res) => {
       return res.status(error.status || 500).json({ error: error.message })
     }
 
+    res.status(500).json({ error: '内部服务器错误' })
+  }
+})
+
+router.post('/invite/direct', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email)
+    const accountIdInput = Number.parseInt(String(req.body?.accountId ?? '').trim(), 10)
+    const preferredAccountId = Number.isFinite(accountIdInput) && accountIdInput > 0 ? accountIdInput : null
+
+    if (!email) {
+      return res.status(400).json({ error: '请提供邀请邮箱地址' })
+    }
+
+    if (!EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: '邮箱格式不正确' })
+    }
+
+    const lockKeys = ['direct-invite:global']
+    if (preferredAccountId) {
+      lockKeys.push(`direct-invite:account:${preferredAccountId}`)
+    }
+
+    const response = await withLocks(lockKeys, async () => {
+      const db = await getDatabase()
+      const account = resolveDirectInviteAccount(db, preferredAccountId)
+      const codeStats = getDirectInviteCodeStats(db, account.email)
+      const needsCodeConsume = codeStats.totalCount > 0
+      const reserveKey = needsCodeConsume
+        ? `direct_invite:${account.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+        : null
+      const reservedCode = needsCodeConsume && reserveKey
+        ? reserveDirectInviteCode(db, account.email, email, reserveKey)
+        : null
+
+      if (needsCodeConsume && !reservedCode) {
+        throw new AccountSyncError('账号邀请码已不足，请补充未使用邀请码后重试', 409)
+      }
+
+      let result
+      try {
+        result = await inviteAccountUser(account.id, email)
+      } catch (error) {
+        if (reservedCode && reserveKey) {
+          try {
+            releaseDirectInviteCodeReservation(db, reservedCode.id, reserveKey)
+          } catch (releaseError) {
+            console.error('快捷邀请失败后释放兑换码预留失败:', releaseError)
+          }
+        }
+        throw error
+      }
+
+      const optimisticInviteCount = incrementInviteCountOptimistically(db, account.id)
+
+      let codeConsumed = reservedCode && reserveKey
+        ? consumeReservedDirectInviteCode(db, reservedCode.id, reserveKey)
+        : false
+      if (reservedCode && !codeConsumed) {
+        codeConsumed = forceConsumeDirectInviteCode(db, reservedCode.id)
+      }
+      if (reservedCode && !codeConsumed) {
+        console.error('快捷邀请扣减兑换码失败', {
+          accountId: account.id,
+          accountEmail: account.email,
+          inviteEmail: email,
+          reservedCodeId: reservedCode?.id
+        })
+      }
+
+      let inviteCount = Number.isFinite(optimisticInviteCount) ? optimisticInviteCount : null
+      try {
+        const synced = await syncAccountInviteCount(account.id, {
+          inviteListParams: { offset: 0, limit: 1, query: '' }
+        })
+        const syncedInviteCount = Number(synced.inviteCount)
+        if (Number.isFinite(syncedInviteCount)) {
+          inviteCount = syncedInviteCount
+        }
+        if (Number.isFinite(optimisticInviteCount)) {
+          const normalizedFloor = Math.max(Number(optimisticInviteCount), Number(inviteCount || 0))
+          inviteCount = ensureInviteCountAtLeast(db, account.id, normalizedFloor) ?? normalizedFloor
+        }
+      } catch (syncError) {
+        console.warn('快捷邀请发送成功，但同步邀请数失败:', syncError?.message || syncError)
+      }
+
+      return {
+        ...result,
+        accountId: account.id,
+        accountEmail: account.email,
+        inviteCount,
+        autoSelected: !preferredAccountId,
+        consumedCodeId: codeConsumed && reservedCode ? reservedCode.id : null,
+        consumedCode: codeConsumed && reservedCode ? reservedCode.code : null
+      }
+    })
+
+    res.json(response)
+  } catch (error) {
+    console.error('快捷邀请失败:', error)
+    if (error instanceof AccountSyncError || error?.status) {
+      return res.status(error.status || 500).json({ error: error.message })
+    }
     res.status(500).json({ error: '内部服务器错误' })
   }
 })
@@ -1140,27 +1852,12 @@ router.post('/:id/refresh-token', async (req, res) => {
 
     const persisted = await persistAccountTokens(db, accountId, tokens)
 
-    const updatedResult = db.exec(
-      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, created_at, updated_at FROM gpt_accounts WHERE id = ?',
-      [accountId]
-    )
-    const updatedRow = updatedResult[0].values[0]
-    const account = {
-      id: updatedRow[0],
-      email: updatedRow[1],
-      token: updatedRow[2],
-      refreshToken: updatedRow[3],
-      userCount: updatedRow[4],
-      inviteCount: updatedRow[5],
-      chatgptAccountId: updatedRow[6],
-      oaiDeviceId: updatedRow[7],
-      expireAt: updatedRow[8] || null,
-      isOpen: Boolean(updatedRow[9]),
-      isDemoted: false,
-      isBanned: Boolean(updatedRow[10]),
-      createdAt: updatedRow[11],
-      updatedAt: updatedRow[12]
-    }
+	    const updatedResult = db.exec(
+	      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, banned_at, created_at, updated_at FROM gpt_accounts WHERE id = ?',
+	      [accountId]
+	    )
+	    const updatedRow = updatedResult[0].values[0]
+	    const account = mapGptAccountRow(updatedRow)
 
     res.json({
       message: 'Token 刷新成功',

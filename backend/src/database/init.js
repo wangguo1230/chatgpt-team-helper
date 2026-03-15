@@ -365,6 +365,7 @@ const ensureRbacTables = (database) => {
       { key: 'user_info', label: '用户信息', path: '/admin/user-info', sortOrder: 2 },
       { key: 'accounts', label: '账号管理', path: '/admin/accounts', sortOrder: 3 },
       { key: 'redemption_codes', label: '兑换码管理', path: '/admin/redemption-codes', sortOrder: 4 },
+      { key: 'ldc_shop_products', label: 'LDC 商品管理', path: '/admin/ldc-shop-products', sortOrder: 5 },
       { key: 'order_management', label: '订单管理', path: '', sortOrder: 6 },
       { key: 'purchase_orders', label: '支付订单', path: '/admin/purchase-orders', parentKey: 'order_management', sortOrder: 1 },
       { key: 'xhs_orders', label: '小红书订单', path: '/admin/xhs-orders', parentKey: 'order_management', sortOrder: 2 },
@@ -1296,6 +1297,10 @@ const ensurePurchaseProductsTable = (database) => {
           code_channels TEXT NOT NULL,
           is_active INTEGER DEFAULT 1,
           sort_order INTEGER DEFAULT 0,
+          category TEXT NOT NULL DEFAULT 'code',
+          delivery_mode TEXT NOT NULL DEFAULT 'email',
+          fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool',
+          redeem_provider TEXT,
           created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
           updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
         )
@@ -1318,12 +1323,47 @@ const ensurePurchaseProductsTable = (database) => {
       addColumn('code_channels', 'code_channels TEXT')
       addColumn('is_active', 'is_active INTEGER DEFAULT 1')
       addColumn('sort_order', 'sort_order INTEGER DEFAULT 0')
+      addColumn('category', "category TEXT NOT NULL DEFAULT 'code'")
+      addColumn('delivery_mode', "delivery_mode TEXT NOT NULL DEFAULT 'email'")
+      addColumn('fulfillment_mode', "fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool'")
+      addColumn('redeem_provider', 'redeem_provider TEXT')
       addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
       addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
     }
 
+    database.run(
+      `
+        UPDATE purchase_products
+        SET category = COALESCE(NULLIF(TRIM(category), ''), 'code'),
+            delivery_mode = COALESCE(NULLIF(TRIM(delivery_mode), ''), 'email'),
+            fulfillment_mode = COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool'),
+            redeem_provider = CASE
+              WHEN COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool') = 'redeem_api'
+                THEN CASE
+                  WHEN LOWER(TRIM(COALESCE(redeem_provider, ''))) IN ('yyl')
+                    THEN LOWER(TRIM(redeem_provider))
+                  ELSE 'yyl'
+                END
+              ELSE NULLIF(TRIM(redeem_provider), '')
+            END,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE category IS NULL OR TRIM(category) = ''
+           OR delivery_mode IS NULL OR TRIM(delivery_mode) = ''
+           OR fulfillment_mode IS NULL OR TRIM(fulfillment_mode) = ''
+           OR (
+             COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool') = 'redeem_api'
+             AND (
+               redeem_provider IS NULL
+               OR TRIM(redeem_provider) = ''
+               OR LOWER(TRIM(redeem_provider)) NOT IN ('yyl')
+             )
+           )
+      `
+    )
+
     database.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_products_key ON purchase_products(product_key)')
     database.run('CREATE INDEX IF NOT EXISTS idx_purchase_products_active_sort ON purchase_products(is_active, sort_order, id)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_purchase_products_category_active_sort ON purchase_products(category, is_active, sort_order, id)')
   } catch (error) {
     console.warn('[DB] 无法初始化 purchase_products 表:', error)
   }
@@ -1357,10 +1397,11 @@ const ensurePurchaseProductsTable = (database) => {
     database.run(
       `
         INSERT INTO purchase_products (
-          product_key, product_name, amount, service_days, order_type, code_channels, is_active, sort_order, created_at, updated_at
+          product_key, product_name, amount, service_days, order_type, code_channels, is_active, sort_order, category, delivery_mode, fulfillment_mode, redeem_provider,
+          created_at, updated_at
         ) VALUES
-          (?, ?, ?, ?, ?, ?, 1, 10, DATETIME('now', 'localtime'), DATETIME('now', 'localtime')),
-          (?, ?, ?, ?, ?, ?, 1, 20, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+          (?, ?, ?, ?, ?, ?, 1, 10, 'code', 'email', 'item_pool', NULL, DATETIME('now', 'localtime'), DATETIME('now', 'localtime')),
+          (?, ?, ?, ?, ?, ?, 1, 20, 'code', 'email', 'item_pool', NULL, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
       `,
       [
         'warranty',
@@ -1388,8 +1429,9 @@ const ensurePurchaseProductsTable = (database) => {
       database.run(
         `
           INSERT INTO purchase_products (
-            product_key, product_name, amount, service_days, order_type, code_channels, is_active, sort_order, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'anti_ban', 'common', 0, 30, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+            product_key, product_name, amount, service_days, order_type, code_channels, is_active, sort_order, category, delivery_mode, fulfillment_mode, redeem_provider,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'anti_ban', 'common', 0, 30, 'code', 'email', 'item_pool', NULL, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
         `,
         ['anti_ban', antiBanName, antiBanAmount, antiBanDays]
       )
@@ -1652,6 +1694,312 @@ const ensurePurchaseOrdersTable = (database) => {
     )
   } catch (error) {
     console.warn('[DB] 无法回填 purchase_orders.product_key/code_channel:', error)
+  }
+
+  return changed
+}
+
+const ensurePurchaseProductItemsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'purchase_product_items')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS purchase_product_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_key TEXT NOT NULL,
+          content TEXT NOT NULL,
+          preview_text TEXT,
+          status TEXT NOT NULL DEFAULT 'available',
+          reserved_order_no TEXT,
+          sold_order_no TEXT,
+          reserved_at DATETIME,
+          sold_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'purchase_product_items')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE purchase_product_items ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('product_key', 'product_key TEXT')
+      addColumn('content', 'content TEXT')
+      addColumn('preview_text', 'preview_text TEXT')
+      addColumn('status', "status TEXT NOT NULL DEFAULT 'available'")
+      addColumn('reserved_order_no', 'reserved_order_no TEXT')
+      addColumn('sold_order_no', 'sold_order_no TEXT')
+      addColumn('reserved_at', 'reserved_at DATETIME')
+      addColumn('sold_at', 'sold_at DATETIME')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    database.run(
+      `
+        UPDATE purchase_product_items
+        SET status = COALESCE(NULLIF(TRIM(status), ''), 'available'),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE status IS NULL OR TRIM(status) = ''
+      `
+    )
+
+    database.run('CREATE INDEX IF NOT EXISTS idx_purchase_product_items_product_status ON purchase_product_items(product_key, status, id)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_purchase_product_items_reserved_order ON purchase_product_items(reserved_order_no)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_purchase_product_items_sold_order ON purchase_product_items(sold_order_no)')
+  } catch (error) {
+    console.warn('[DB] 无法初始化 purchase_product_items 表:', error)
+  }
+
+  return changed
+}
+
+const ensureLdcShopOrdersTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'ldc_shop_orders')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS ldc_shop_orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_no TEXT NOT NULL UNIQUE,
+          credit_order_no TEXT,
+          uid TEXT NOT NULL,
+          username TEXT,
+          user_email TEXT,
+          product_key TEXT NOT NULL,
+          product_name TEXT NOT NULL,
+          amount TEXT NOT NULL,
+          delivery_mode TEXT NOT NULL DEFAULT 'email',
+          fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool',
+          redeem_provider TEXT,
+          item_id INTEGER,
+          redeem_code_id INTEGER,
+          item_preview TEXT,
+          status TEXT NOT NULL DEFAULT 'created',
+          paid_at DATETIME,
+          delivery_inline_content TEXT,
+          delivery_inline_at DATETIME,
+          delivery_email_to TEXT,
+          delivery_email_sent_at DATETIME,
+          delivery_error TEXT,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'ldc_shop_orders')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE ldc_shop_orders ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('order_no', 'order_no TEXT')
+      addColumn('credit_order_no', 'credit_order_no TEXT')
+      addColumn('uid', 'uid TEXT')
+      addColumn('username', 'username TEXT')
+      addColumn('user_email', 'user_email TEXT')
+      addColumn('product_key', 'product_key TEXT')
+      addColumn('product_name', 'product_name TEXT')
+      addColumn('amount', 'amount TEXT')
+      addColumn('delivery_mode', "delivery_mode TEXT NOT NULL DEFAULT 'email'")
+      addColumn('fulfillment_mode', "fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool'")
+      addColumn('redeem_provider', 'redeem_provider TEXT')
+      addColumn('item_id', 'item_id INTEGER')
+      addColumn('redeem_code_id', 'redeem_code_id INTEGER')
+      addColumn('item_preview', 'item_preview TEXT')
+      addColumn('status', "status TEXT NOT NULL DEFAULT 'created'")
+      addColumn('paid_at', 'paid_at DATETIME')
+      addColumn('delivery_inline_content', 'delivery_inline_content TEXT')
+      addColumn('delivery_inline_at', 'delivery_inline_at DATETIME')
+      addColumn('delivery_email_to', 'delivery_email_to TEXT')
+      addColumn('delivery_email_sent_at', 'delivery_email_sent_at DATETIME')
+      addColumn('delivery_error', 'delivery_error TEXT')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    database.run(
+      `
+        UPDATE ldc_shop_orders
+        SET delivery_mode = COALESCE(NULLIF(TRIM(delivery_mode), ''), 'email'),
+            fulfillment_mode = COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool'),
+            redeem_provider = CASE
+              WHEN COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool') = 'redeem_api'
+                THEN CASE
+                  WHEN LOWER(TRIM(COALESCE(redeem_provider, ''))) IN ('yyl')
+                    THEN LOWER(TRIM(redeem_provider))
+                  ELSE 'yyl'
+                END
+              ELSE NULLIF(TRIM(redeem_provider), '')
+            END,
+            status = COALESCE(NULLIF(TRIM(status), ''), 'created'),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE delivery_mode IS NULL OR TRIM(delivery_mode) = ''
+           OR fulfillment_mode IS NULL OR TRIM(fulfillment_mode) = ''
+           OR (
+             COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool') = 'redeem_api'
+             AND (
+               redeem_provider IS NULL
+               OR TRIM(redeem_provider) = ''
+               OR LOWER(TRIM(redeem_provider)) NOT IN ('yyl')
+             )
+           )
+           OR status IS NULL OR TRIM(status) = ''
+      `
+    )
+
+    database.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_ldc_shop_orders_order_no ON ldc_shop_orders(order_no)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_orders_uid_created ON ldc_shop_orders(uid, created_at)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_orders_status_created ON ldc_shop_orders(status, created_at)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_orders_product_created ON ldc_shop_orders(product_key, created_at)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_orders_item_id ON ldc_shop_orders(item_id)')
+  } catch (error) {
+    console.warn('[DB] 无法初始化 ldc_shop_orders 表:', error)
+  }
+
+  return changed
+}
+
+const ensureLdcShopRedeemCodesTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'ldc_shop_redeem_codes')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS ldc_shop_redeem_codes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_key TEXT NOT NULL,
+          redeem_code TEXT NOT NULL,
+          provider TEXT NOT NULL DEFAULT 'yyl',
+          status TEXT NOT NULL DEFAULT 'available',
+          reserved_order_no TEXT,
+          reserved_at DATETIME,
+          used_order_no TEXT,
+          used_at DATETIME,
+          card_snapshot TEXT,
+          last_error TEXT,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_attempt_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'ldc_shop_redeem_codes')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE ldc_shop_redeem_codes ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('product_key', 'product_key TEXT')
+      addColumn('redeem_code', 'redeem_code TEXT')
+      addColumn('provider', "provider TEXT NOT NULL DEFAULT 'yyl'")
+      addColumn('status', "status TEXT NOT NULL DEFAULT 'available'")
+      addColumn('reserved_order_no', 'reserved_order_no TEXT')
+      addColumn('reserved_at', 'reserved_at DATETIME')
+      addColumn('used_order_no', 'used_order_no TEXT')
+      addColumn('used_at', 'used_at DATETIME')
+      addColumn('card_snapshot', 'card_snapshot TEXT')
+      addColumn('last_error', 'last_error TEXT')
+      addColumn('attempt_count', 'attempt_count INTEGER NOT NULL DEFAULT 0')
+      addColumn('last_attempt_at', 'last_attempt_at DATETIME')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    database.run(
+      `
+        UPDATE ldc_shop_redeem_codes
+        SET provider = COALESCE(NULLIF(TRIM(provider), ''), 'yyl'),
+            status = COALESCE(NULLIF(TRIM(status), ''), 'available'),
+            attempt_count = COALESCE(attempt_count, 0),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE provider IS NULL OR TRIM(provider) = ''
+           OR status IS NULL OR TRIM(status) = ''
+           OR attempt_count IS NULL
+      `
+    )
+
+    database.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_ldc_shop_redeem_codes_code ON ldc_shop_redeem_codes(redeem_code)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_redeem_codes_product_status ON ldc_shop_redeem_codes(product_key, status, id)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_redeem_codes_reserved_order ON ldc_shop_redeem_codes(reserved_order_no)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_redeem_codes_used_order ON ldc_shop_redeem_codes(used_order_no)')
+  } catch (error) {
+    console.warn('[DB] 无法初始化 ldc_shop_redeem_codes 表:', error)
+  }
+
+  return changed
+}
+
+const ensureLdcShopDeliveryAttemptsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'ldc_shop_delivery_attempts')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS ldc_shop_delivery_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_no TEXT NOT NULL,
+          product_key TEXT,
+          code_id INTEGER,
+          redeem_code TEXT,
+          provider TEXT,
+          phase TEXT NOT NULL,
+          success INTEGER NOT NULL DEFAULT 0,
+          http_status INTEGER,
+          error_code TEXT,
+          error_message TEXT,
+          request_payload TEXT,
+          response_payload TEXT,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'ldc_shop_delivery_attempts')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE ldc_shop_delivery_attempts ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('order_no', 'order_no TEXT')
+      addColumn('product_key', 'product_key TEXT')
+      addColumn('code_id', 'code_id INTEGER')
+      addColumn('redeem_code', 'redeem_code TEXT')
+      addColumn('provider', 'provider TEXT')
+      addColumn('phase', 'phase TEXT')
+      addColumn('success', 'success INTEGER NOT NULL DEFAULT 0')
+      addColumn('http_status', 'http_status INTEGER')
+      addColumn('error_code', 'error_code TEXT')
+      addColumn('error_message', 'error_message TEXT')
+      addColumn('request_payload', 'request_payload TEXT')
+      addColumn('response_payload', 'response_payload TEXT')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_delivery_attempts_order_created ON ldc_shop_delivery_attempts(order_no, created_at)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_ldc_shop_delivery_attempts_code_id ON ldc_shop_delivery_attempts(code_id)')
+  } catch (error) {
+    console.warn('[DB] 无法初始化 ldc_shop_delivery_attempts 表:', error)
   }
 
   return changed
@@ -2007,6 +2355,10 @@ export async function initDatabase() {
         const linuxDoUsersCreated = ensureLinuxDoUsersTable(database)
         const accountRecoveryCreated = ensureAccountRecoveryTable(database)
         const purchaseOrdersCreated = ensurePurchaseOrdersTable(database)
+        const purchaseProductItemsCreated = ensurePurchaseProductItemsTable(database)
+        const ldcShopOrdersCreated = ensureLdcShopOrdersTable(database)
+        const ldcShopRedeemCodesCreated = ensureLdcShopRedeemCodesTable(database)
+        const ldcShopDeliveryAttemptsCreated = ensureLdcShopDeliveryAttemptsTable(database)
         const creditOrdersCreated = ensureCreditOrdersTable(database)
         const channelsCreated = ensureChannelsTable(database)
         const purchaseProductsCreated = ensurePurchaseProductsTable(database)
@@ -2014,7 +2366,25 @@ export async function initDatabase() {
         const pointsLedgerCreated = ensurePointsLedgerTable(database)
         const announcementsCreated = ensureAnnouncementsTables(database)
         const rbacInitialized = ensureRbacTables(database)
-        if (waitingRoomCreated || xhsTablesCreated || xianyuTablesCreated || linuxDoUsersCreated || accountRecoveryCreated || purchaseOrdersCreated || creditOrdersCreated || channelsCreated || purchaseProductsCreated || pointsWithdrawalsCreated || pointsLedgerCreated || announcementsCreated || rbacInitialized) {
+        if (
+          waitingRoomCreated ||
+          xhsTablesCreated ||
+          xianyuTablesCreated ||
+          linuxDoUsersCreated ||
+          accountRecoveryCreated ||
+          purchaseOrdersCreated ||
+          purchaseProductItemsCreated ||
+          ldcShopOrdersCreated ||
+          ldcShopRedeemCodesCreated ||
+          ldcShopDeliveryAttemptsCreated ||
+          creditOrdersCreated ||
+          channelsCreated ||
+          purchaseProductsCreated ||
+          pointsWithdrawalsCreated ||
+          pointsLedgerCreated ||
+          announcementsCreated ||
+          rbacInitialized
+        ) {
           saveDatabase()
         }
 
@@ -2074,11 +2444,22 @@ export async function initDatabase() {
 	              saveDatabase()
 	            }
 
-	            if (!columns.includes('ban_processed')) {
-	              database.run('ALTER TABLE gpt_accounts ADD COLUMN ban_processed INTEGER DEFAULT 0')
-	              console.log('已添加 ban_processed 列到 gpt_accounts 表')
+		            if (!columns.includes('ban_processed')) {
+		              database.run('ALTER TABLE gpt_accounts ADD COLUMN ban_processed INTEGER DEFAULT 0')
+		              console.log('已添加 ban_processed 列到 gpt_accounts 表')
+		              saveDatabase()
+		            }
+	            if (!columns.includes('banned_at')) {
+	              database.run('ALTER TABLE gpt_accounts ADD COLUMN banned_at DATETIME')
+	              console.log('已添加 banned_at 列到 gpt_accounts 表')
 	              saveDatabase()
 	            }
+	            database.run(`
+	              UPDATE gpt_accounts
+	              SET banned_at = COALESCE(banned_at, updated_at)
+	              WHERE COALESCE(is_banned, 0) = 1
+	            `)
+	            saveDatabase()
 	          }
 
 	          // 检查 redemption_codes 表的列
@@ -2223,14 +2604,15 @@ export async function initDatabase() {
 	      chatgpt_account_id TEXT,
 	      oai_device_id TEXT,
 	      expire_at TEXT,
-	      is_open INTEGER DEFAULT 0,
-	      is_demoted INTEGER DEFAULT 0,
-	      is_banned INTEGER DEFAULT 0,
-	      ban_processed INTEGER DEFAULT 0,
-	      created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
-	      updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
-	    )
-	  `)
+		      is_open INTEGER DEFAULT 0,
+		      is_demoted INTEGER DEFAULT 0,
+		      is_banned INTEGER DEFAULT 0,
+		      ban_processed INTEGER DEFAULT 0,
+		      banned_at DATETIME,
+		      created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+		      updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+		    )
+		  `)
 
   // Create redemption_codes table to manage redemption codes
 	  database.run(`
@@ -2264,13 +2646,34 @@ export async function initDatabase() {
 	  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
   const accountRecoveryInitialized = ensureAccountRecoveryTable(database)
   const purchaseOrdersInitialized = ensurePurchaseOrdersTable(database)
+  const purchaseProductItemsInitialized = ensurePurchaseProductItemsTable(database)
+  const ldcShopOrdersInitialized = ensureLdcShopOrdersTable(database)
+  const ldcShopRedeemCodesInitialized = ensureLdcShopRedeemCodesTable(database)
+  const ldcShopDeliveryAttemptsInitialized = ensureLdcShopDeliveryAttemptsTable(database)
   const creditOrdersInitialized = ensureCreditOrdersTable(database)
   const channelsInitialized = ensureChannelsTable(database)
   const purchaseProductsInitialized = ensurePurchaseProductsTable(database)
   const pointsWithdrawalsInitialized = ensurePointsWithdrawalsTable(database)
   const pointsLedgerInitialized = ensurePointsLedgerTable(database)
   const announcementsInitialized = ensureAnnouncementsTables(database)
-  if (waitingRoomInitialized || xhsTablesInitialized || xianyuTablesInitialized || linuxDoUsersInitialized || accountRecoveryInitialized || purchaseOrdersInitialized || creditOrdersInitialized || channelsInitialized || purchaseProductsInitialized || pointsWithdrawalsInitialized || pointsLedgerInitialized || announcementsInitialized) {
+  if (
+    waitingRoomInitialized ||
+    xhsTablesInitialized ||
+    xianyuTablesInitialized ||
+    linuxDoUsersInitialized ||
+    accountRecoveryInitialized ||
+    purchaseOrdersInitialized ||
+    purchaseProductItemsInitialized ||
+    ldcShopOrdersInitialized ||
+    ldcShopRedeemCodesInitialized ||
+    ldcShopDeliveryAttemptsInitialized ||
+    creditOrdersInitialized ||
+    channelsInitialized ||
+    purchaseProductsInitialized ||
+    pointsWithdrawalsInitialized ||
+    pointsLedgerInitialized ||
+    announcementsInitialized
+  ) {
     saveDatabase()
   }
 
@@ -2325,6 +2728,15 @@ export async function initDatabase() {
 	        database.run('ALTER TABLE gpt_accounts ADD COLUMN ban_processed INTEGER DEFAULT 0')
 	        console.log('已添加 ban_processed 列到 gpt_accounts 表')
 	      }
+	      if (!columns.includes('banned_at')) {
+	        database.run('ALTER TABLE gpt_accounts ADD COLUMN banned_at DATETIME')
+	        console.log('已添加 banned_at 列到 gpt_accounts 表')
+	      }
+	      database.run(`
+	        UPDATE gpt_accounts
+	        SET banned_at = COALESCE(banned_at, updated_at)
+	        WHERE COALESCE(is_banned, 0) = 1
+	      `)
 	    }
 	  } catch (err) {
 	    console.log('列检查/添加已跳过:', err.message)

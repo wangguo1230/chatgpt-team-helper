@@ -60,6 +60,50 @@ const shouldRetryError = (error) => {
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
 const normalizeUid = (value) => String(value ?? '').trim()
 
+const fetchActionOrderByNo = (db, orderNo) => {
+  if (!db || !orderNo) return null
+  const result = db.exec(
+    `
+      SELECT order_no, uid, username, target_account_id, status, paid_at, refunded_at,
+             action_status, action_message, action_payload, order_email
+      FROM credit_orders
+      WHERE order_no = ?
+      LIMIT 1
+    `,
+    [orderNo]
+  )
+  const row = result?.[0]?.values?.[0]
+  if (!row) return null
+  return {
+    orderNo: row[0],
+    uid: row[1],
+    username: row[2],
+    targetAccountId: row[3],
+    status: row[4],
+    paidAt: row[5],
+    refundedAt: row[6],
+    actionStatus: row[7],
+    actionMessage: row[8],
+    actionPayload: row[9],
+    orderEmail: row[10] || null
+  }
+}
+
+const hasRedeemedCodeForOrder = (db, orderNo) => {
+  if (!db || !orderNo) return false
+  const result = db.exec(
+    `
+      SELECT 1
+      FROM redemption_codes
+      WHERE reserved_for_order_no = ?
+        AND is_redeemed = 1
+      LIMIT 1
+    `,
+    [orderNo]
+  )
+  return Boolean(result?.[0]?.values?.length)
+}
+
 const loadReservedOrderEmail = (db, orderNo) => {
   if (!db || !orderNo) return ''
   const result = db.exec(
@@ -209,19 +253,26 @@ const updateLinuxDoUserCurrentAccount = (db, uid, accountId, openAccountEmail) =
 
 const fulfillOpenAccountsBoardOrder = async (db, row) => {
   const orderNo = String(row.orderNo || '').trim()
-  const uid = normalizeUid(row.uid)
-  const username = String(row.username || '').trim()
-  const targetAccountId = Number(row.targetAccountId)
-  const paidAt = row.paidAt ? String(row.paidAt) : null
+  if (!orderNo) return { ok: true, skipped: true }
 
-  const existingPayload = safeJsonParse(row.actionPayload) || {}
+  const latest = fetchActionOrderByNo(db, orderNo)
+  if (!latest) return { ok: true, skipped: true }
+  if (latest.refundedAt || String(latest.status || '').trim() !== 'paid') return { ok: true, skipped: true }
+  if (String(latest.actionStatus || '').trim() === 'fulfilled') return { ok: true, skipped: true }
+
+  const uid = normalizeUid(latest.uid)
+  const username = String(latest.username || '').trim()
+  const targetAccountId = Number(latest.targetAccountId)
+  const paidAt = latest.paidAt ? String(latest.paidAt) : null
+  if (!uid || !Number.isFinite(targetAccountId) || targetAccountId <= 0) return { ok: true, skipped: true }
+
+  const existingPayload = safeJsonParse(latest.actionPayload) || {}
   const orderType = normalizeOrderType(existingPayload.orderType || existingPayload.order_type)
   const attempts = Math.max(0, toInt(existingPayload.attempts, 0))
   const stopRetry = Boolean(existingPayload.stopRetry)
   const nextRetryAt = String(existingPayload.nextRetryAt || '').trim()
   const alertSentAt = String(existingPayload.alertSentAt || '').trim()
 
-  if (!orderNo || !uid || !Number.isFinite(targetAccountId) || targetAccountId <= 0) return { ok: true, skipped: true }
   if (stopRetry) return { ok: true, skipped: true }
 
   if (nextRetryAt) {
@@ -231,7 +282,7 @@ const fulfillOpenAccountsBoardOrder = async (db, row) => {
     }
   }
 
-  const email = resolveOpenAccountsOrderEmail(db, { orderNo, uid, rowOrderEmail: row.orderEmail })
+  const email = resolveOpenAccountsOrderEmail(db, { orderNo, uid, rowOrderEmail: latest.orderEmail })
   if (!email) {
     const message = '缺少用户邮箱，无法执行邀请'
     const payload = { ...existingPayload, attempts, stopRetry: true, lastAttemptAt: nowIso(), lastError: message }
@@ -310,6 +361,25 @@ const fulfillOpenAccountsBoardOrder = async (db, row) => {
 
     const baseCapacity = 5
     const redeemCapacity = isMember || isInvited ? 6 : baseCapacity
+
+    // 幂等保护：若该订单预留码已经核销且用户已在成员/邀请列表，直接视为成功，避免重复兑换误报失败。
+    if ((isMember || isInvited) && hasRedeemedCodeForOrder(db, orderNo)) {
+      updateLinuxDoUserCurrentAccount(db, uid, targetAccountId, email)
+      const body = {
+        message: isMember ? '上车成功，用户已在团队成员中' : '上车成功，邀请已存在',
+        currentOpenAccountId: targetAccountId,
+        account: {
+          id: targetAccountId,
+          userCount,
+          inviteCount
+        }
+      }
+      markFulfilled(db, orderNo, { message: body.message, body, payload: attemptPayload })
+      await saveDatabase()
+      console.info(LABEL, 'fulfilled (idempotent)', { orderNo, uid, targetAccountId, durationMs: Date.now() - startedAt })
+      return { ok: true, fulfilled: true, deduped: true }
+    }
+
     const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
       orderNo,
       uid,

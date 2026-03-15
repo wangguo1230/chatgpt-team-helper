@@ -4,6 +4,8 @@ import { authenticateLinuxDoSession } from '../middleware/linuxdo-session.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { requireMenu } from '../middleware/rbac.js'
 import { buildCreditSign, formatCreditMoney, getCreditGatewayConfig, queryCreditOrder, refundCreditOrder } from '../services/credit-gateway.js'
+import { releaseOpenAccountsOrderCode } from '../services/open-accounts-redemption.js'
+import { settleLdcShopOrderByCreditOrderNo } from './open-accounts-shop.js'
 import { withLocks } from '../utils/locks.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
 
@@ -22,9 +24,17 @@ router.get('/admin/orders/summary', async (req, res) => {
     const params = []
 
     if (search) {
-      conditions.push(`(LOWER(order_no) LIKE ? OR LOWER(uid) LIKE ? OR LOWER(username) LIKE ? OR LOWER(title) LIKE ?)`)
+      conditions.push(`(
+        LOWER(order_no) LIKE ?
+        OR LOWER(uid) LIKE ?
+        OR LOWER(username) LIKE ?
+        OR LOWER(title) LIKE ?
+        OR LOWER(COALESCE(order_email, '')) LIKE ?
+        OR LOWER(COALESCE(code_account_email, '')) LIKE ?
+        OR LOWER(COALESCE(code, '')) LIKE ?
+      )`)
       const searchPattern = `%${search}%`
-      params.push(searchPattern, searchPattern, searchPattern, searchPattern)
+      params.push(searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern)
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
@@ -381,9 +391,17 @@ router.get('/admin/orders', async (req, res) => {
     const params = []
 
     if (search) {
-      conditions.push(`(LOWER(order_no) LIKE ? OR LOWER(uid) LIKE ? OR LOWER(username) LIKE ? OR LOWER(title) LIKE ?)`)
+      conditions.push(`(
+        LOWER(order_no) LIKE ?
+        OR LOWER(uid) LIKE ?
+        OR LOWER(username) LIKE ?
+        OR LOWER(title) LIKE ?
+        OR LOWER(COALESCE(order_email, '')) LIKE ?
+        OR LOWER(COALESCE(code_account_email, '')) LIKE ?
+        OR LOWER(COALESCE(code, '')) LIKE ?
+      )`)
       const searchPattern = `%${search}%`
-      params.push(searchPattern, searchPattern, searchPattern, searchPattern)
+      params.push(searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern)
     }
 
     if (status && status !== 'all') {
@@ -401,7 +419,8 @@ router.get('/admin/orders', async (req, res) => {
     const offset = (page - 1) * pageSize
     const result = db.exec(
       `
-        SELECT order_no, uid, username, scene, title, amount, status, target_account_id, created_at, paid_at, refunded_at
+        SELECT order_no, uid, username, scene, title, amount, status, target_account_id, created_at, paid_at, refunded_at,
+               order_email, code_id, code_account_email
         FROM credit_orders
         ${whereClause}
         ORDER BY created_at DESC
@@ -422,7 +441,10 @@ router.get('/admin/orders', async (req, res) => {
         targetAccountId: row[7] != null ? Number(row[7]) : null,
         createdAt: row[8],
         paidAt: row[9] || null,
-        refundedAt: row[10] || null
+        refundedAt: row[10] || null,
+        orderEmail: row[11] ? String(row[11]) : null,
+        codeId: row[12] != null ? Number(row[12]) : null,
+        codeAccountEmail: row[13] ? String(row[13]) : null
       })),
       pagination: { page, pageSize, total }
     })
@@ -526,7 +548,23 @@ router.post('/admin/orders/:orderNo/refund', async (req, res) => {
         `,
         [successMsg, orderNo]
       )
+      if (String(order.scene || '').trim() === 'open_accounts_board') {
+        releaseOpenAccountsOrderCode(db, orderNo)
+      }
       saveDatabase()
+
+      if (String(order.scene || '').trim() === 'ldc_shop_purchase') {
+        const settled = await settleLdcShopOrderByCreditOrderNo({
+          orderNo,
+          source: 'credit_admin_refund'
+        })
+        if (!settled?.ok) {
+          console.warn('[Credit] sync ldc_shop after refund failed', {
+            orderNo,
+            reason: settled?.reason || 'unknown'
+          })
+        }
+      }
       console.info('[Credit] admin refund succeeded', { orderNo, tradeNo, message: successMsg })
       return { ok: true, message: successMsg }
     })
@@ -561,6 +599,19 @@ router.post('/admin/orders/:orderNo/sync', async (req, res) => {
 
       const syncResult = await syncCreditOrderStatusFromGateway(db, orderNo, { force: true })
       const updated = fetchCreditOrder(db, orderNo) || order
+
+      if (String(updated.scene || '').trim() === 'ldc_shop_purchase') {
+        const settled = await settleLdcShopOrderByCreditOrderNo({
+          orderNo,
+          source: 'credit_admin_sync'
+        })
+        if (!settled?.ok) {
+          console.warn('[Credit] sync ldc_shop after manual sync failed', {
+            orderNo,
+            reason: settled?.reason || 'unknown'
+          })
+        }
+      }
 
       if (!syncResult.ok) {
         const msg =
@@ -644,6 +695,19 @@ const processCreditNotify = async (orderNo, payload) => {
       notifyPayload: payload,
       source: 'notify'
     })
+
+    if (String(order.scene || '').trim() === 'ldc_shop_purchase') {
+      const settled = await settleLdcShopOrderByCreditOrderNo({
+        orderNo,
+        source: 'credit_notify'
+      })
+      if (!settled?.ok) {
+        console.warn('[Credit] notify sync ldc_shop failed', {
+          orderNo,
+          reason: settled?.reason || 'unknown'
+        })
+      }
+    }
 
     const updated = fetchCreditOrder(db, orderNo)
     console.info('[Credit] notify async handled', {

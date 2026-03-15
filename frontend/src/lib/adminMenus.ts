@@ -48,6 +48,7 @@ const ICONS_BY_MENU_KEY: Record<string, any> = {
   stats: BarChart3,
   user_management: User,
   redemption_codes: Ticket,
+  ldc_shop_products: Package,
   xhs_orders: Package,
   xianyu_orders: Package,
   purchase_orders: CreditCard,
@@ -65,6 +66,7 @@ const FALLBACK_ADMIN_MENU_TREE: AdminMenuDraftNode[] = [
   { key: 'user_info', path: '/admin/user-info', label: '用户信息' },
   { key: 'accounts', path: '/admin/accounts', label: '账号管理' },
   { key: 'redemption_codes', path: '/admin/redemption-codes', label: '兑换码管理' },
+  { key: 'ldc_shop_products', path: '/admin/ldc-shop-products', label: 'LDC 商品管理' },
   {
     key: 'order_management',
     path: '',

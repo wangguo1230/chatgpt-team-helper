@@ -28,7 +28,7 @@ import {
 } from '@/components/ui/dialog'
 import { useToast } from '@/components/ui/toast'
 import AppleNativeDateTimeInput from '@/components/ui/apple/NativeDateTimeInput.vue'
-import { Plus, Eye, EyeOff, RefreshCw, Ban, FilePenLine, Trash2, AlertTriangle, X, FolderOpen, Search } from 'lucide-vue-next'
+import { Plus, Eye, EyeOff, RefreshCw, Ban, FilePenLine, Trash2, AlertTriangle, X, FolderOpen, Search, Mail } from 'lucide-vue-next'
 
 const router = useRouter()
 const accounts = ref<GptAccount[]>([])
@@ -81,6 +81,32 @@ onUnmounted(() => {
 // 计算总页数
 const totalPages = computed(() => Math.max(1, Math.ceil(paginationMeta.value.total / paginationMeta.value.pageSize)))
 
+const quickInviteAccountOptions = computed(() => {
+  return [...accounts.value]
+    .filter(account => {
+      if (!Boolean(account?.isOpen) || Boolean(account?.isBanned)) return false
+
+      if (typeof account?.quickInviteEligible === 'boolean') {
+        return account.quickInviteEligible
+      }
+
+      const occupancy = Number(account?.userCount || 0) + Number(account?.inviteCount || 0)
+      const capacityLimit = Number(account?.quickInviteCapacityLimit || 0)
+      const underCapacity = !Number.isFinite(capacityLimit) || capacityLimit <= 0 || occupancy < capacityLimit
+      const codeTotal = Number(account?.directInviteCodeTotal || 0)
+      const codeAvailable = Number(account?.directInviteCodeAvailable || 0)
+      const codeEligible = codeTotal <= 0 || codeAvailable > 0
+
+      return underCapacity && codeEligible
+    })
+    .sort((a, b) => {
+      const aLoad = Number(a.userCount || 0) + Number(a.inviteCount || 0)
+      const bLoad = Number(b.userCount || 0) + Number(b.inviteCount || 0)
+      if (aLoad !== bLoad) return aLoad - bLoad
+      return Number(a.id || 0) - Number(b.id || 0)
+    })
+})
+
 // 同步相关状态
 const syncingAccountId = ref<number | null>(null)
 const showSyncResultDialog = ref(false)
@@ -93,8 +119,15 @@ const revokingInviteEmail = ref<string | null>(null)
 const showInviteForm = ref(false)
 const inviteEmail = ref('')
 const inviting = ref(false)
+const showQuickInviteDialog = ref(false)
+const quickInviteEmail = ref('')
+const quickInviteAccountId = ref('auto')
+const quickInviting = ref(false)
 const togglingOpenAccountId = ref<number | null>(null)
 const banningAccountId = ref<number | null>(null)
+const deletingBannedBatch = ref(false)
+const deletingExpiredBatch = ref(false)
+const syncingZeroJoinedBatch = ref(false)
 
 // 批量检查相关状态
 type CheckResultFilter = 'all' | 'abnormal' | 'banned' | 'expired' | 'normal' | 'failed'
@@ -559,6 +592,23 @@ const getAccountListStatus = (account: GptAccount): AccountStatus => {
   return 'normal'
 }
 
+const getAccountBannedDays = (account: GptAccount): number | null => {
+  if (!account?.isBanned) return null
+  if (Number.isFinite(account?.bannedDays)) {
+    return Math.max(0, Number(account.bannedDays))
+  }
+  const bannedAtMs = parseExpireAtToMs(account?.bannedAt || null)
+  if (bannedAtMs == null) return null
+  return Math.max(0, Math.floor((Date.now() - bannedAtMs) / (24 * 60 * 60 * 1000)))
+}
+
+const formatAccountBannedAt = (account: GptAccount): string => {
+  if (!account?.isBanned) return '-'
+  const raw = String(account?.bannedAt || '').trim()
+  if (!raw) return '-'
+  return formatShanghaiDate(raw, dateFormatOptions.value)
+}
+
 const STATUS_BADGE_MAP: Record<AccountStatus, { label: string; class: string }> = {
   normal: { label: '正常', class: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
   expired: { label: '过期', class: 'bg-orange-50 text-orange-700 border-orange-200' },
@@ -609,12 +659,8 @@ const applyCheckedAccountSelection = (accountId: string) => {
   const matched = checkedChatgptAccounts.value.find(acc => acc.accountId === normalized)
   if (!matched) return
 
-  if (matched.expiresAt) {
-    const localValue = isoToDatetimeLocal(matched.expiresAt)
-    if (localValue) {
-      formData.value.expireAt = localValue
-    }
-  }
+  const localValue = matched.expiresAt ? isoToDatetimeLocal(matched.expiresAt) : ''
+  formData.value.expireAt = localValue || ''
 }
 
 const openChatgptIdDropdown = async () => {
@@ -1168,6 +1214,76 @@ const handleDelete = async (id: number) => {
   }
 }
 
+const handleBatchDeleteBanned = async () => {
+  if (deletingBannedBatch.value) return
+
+  const prompt = '将批量删除所有“封号”状态账号，且不可恢复。确定继续吗？'
+  if (!confirm(prompt)) return
+
+  deletingBannedBatch.value = true
+  try {
+    const result = await gptAccountService.deleteBannedBatch()
+    if (result.deleted > 0) {
+      showSuccessToast(`已删除 ${result.deleted} 个封号账号`)
+    } else {
+      showInfoToast('没有可删除的封号账号')
+    }
+    paginationMeta.value.page = 1
+    await loadAccounts()
+  } catch (err: any) {
+    error.value = err.response?.data?.error || '批量删除失败'
+    showErrorToast(error.value)
+  } finally {
+    deletingBannedBatch.value = false
+  }
+}
+
+const handleBatchDeleteExpired = async () => {
+  if (deletingExpiredBatch.value) return
+
+  const prompt = '将批量删除所有“过期”状态账号，且不可恢复。确定继续吗？'
+  if (!confirm(prompt)) return
+
+  deletingExpiredBatch.value = true
+  try {
+    const result = await gptAccountService.deleteExpiredBatch()
+    if (result.deleted > 0) {
+      showSuccessToast(`已删除 ${result.deleted} 个过期账号`)
+    } else {
+      showInfoToast('没有可删除的过期账号')
+    }
+    paginationMeta.value.page = 1
+    await loadAccounts()
+  } catch (err: any) {
+    error.value = err.response?.data?.error || '批量删除失败'
+    showErrorToast(error.value)
+  } finally {
+    deletingExpiredBatch.value = false
+  }
+}
+
+const handleSyncZeroJoinedBatch = async () => {
+  if (syncingZeroJoinedBatch.value) return
+
+  syncingZeroJoinedBatch.value = true
+  try {
+    const result = await gptAccountService.syncZeroJoinedBatch()
+    if (result.targetCount === 0) {
+      showInfoToast('没有已加入为 0 的账号需要同步')
+    } else if (result.failedCount > 0) {
+      showWarningToast(`同步完成：成功 ${result.syncedCount} 个，失败 ${result.failedCount} 个`)
+    } else {
+      showSuccessToast(`同步完成：共 ${result.syncedCount} 个账号`)
+    }
+    await loadAccounts()
+  } catch (err: any) {
+    error.value = err.response?.data?.error || '批量同步失败'
+    showErrorToast(error.value)
+  } finally {
+    syncingZeroJoinedBatch.value = false
+  }
+}
+
 const handleToggleOpen = async (account: GptAccount) => {
   togglingOpenAccountId.value = account.id
   try {
@@ -1313,6 +1429,11 @@ const handleSyncUserCount = async (account: GptAccount) => {
     showSyncResultDialog.value = true
   } finally {
     syncingAccountId.value = null
+    try {
+      await loadAccounts()
+    } catch {
+      // ignore list refresh errors; keep sync dialog visible
+    }
   }
 }
 
@@ -1457,6 +1578,75 @@ const handleInviteSubmit = async () => {
     inviting.value = false
   }
 }
+
+const openQuickInviteDialog = () => {
+  quickInviteEmail.value = ''
+  quickInviteAccountId.value = 'auto'
+  showQuickInviteDialog.value = true
+}
+
+const closeQuickInviteDialog = () => {
+  showQuickInviteDialog.value = false
+  quickInviting.value = false
+}
+
+const handleQuickInviteSubmit = async () => {
+  const email = quickInviteEmail.value.trim()
+  if (!email) {
+    showErrorToast('请输入邮箱地址')
+    return
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+  if (!emailRegex.test(email)) {
+    showErrorToast('邮箱格式不正确')
+    return
+  }
+
+  const selectedAccountId = quickInviteAccountId.value !== 'auto'
+    ? Number.parseInt(String(quickInviteAccountId.value), 10)
+    : null
+  const resolvedAccountId = Number.isFinite(Number(selectedAccountId)) && Number(selectedAccountId) > 0
+    ? Number(selectedAccountId)
+    : undefined
+
+  quickInviting.value = true
+  try {
+    const result = await gptAccountService.inviteAccountUserDirect(email, resolvedAccountId)
+    const accountEmail = String(result.accountEmail || '').trim()
+    showSuccessToast(accountEmail ? `邀请已发送（账号：${accountEmail}）` : (result.message || '邀请已发送'))
+
+    if (typeof result.inviteCount === 'number') {
+      const index = accounts.value.findIndex(item => item.id === Number(result.accountId))
+      if (index >= 0 && accounts.value[index]) {
+        accounts.value[index] = {
+          ...accounts.value[index],
+          inviteCount: Number(result.inviteCount),
+          updatedAt: new Date().toISOString()
+        }
+        accounts.value = [...accounts.value]
+      }
+    }
+
+    if (syncResult.value?.account?.id === Number(result.accountId)) {
+      scheduleResyncAfterAction(Number(result.accountId))
+    }
+
+    try {
+      await loadAccounts()
+    } catch {
+      showWarningToast('邀请已发送，但列表刷新失败，请手动刷新')
+    }
+
+    quickInviteEmail.value = ''
+    quickInviteAccountId.value = 'auto'
+    showQuickInviteDialog.value = false
+  } catch (err: any) {
+    showErrorToast(err.response?.data?.error || '邀请失败')
+  } finally {
+    quickInviting.value = false
+  }
+}
 </script>
 
 <template>
@@ -1483,6 +1673,44 @@ const handleInviteSubmit = async () => {
           检查
         </Button>
         <Button
+          variant="outline"
+          class="bg-white border-blue-200 text-blue-600 hover:bg-blue-50 h-10 rounded-xl px-4"
+          :disabled="loading || syncingZeroJoinedBatch"
+          @click="handleSyncZeroJoinedBatch"
+        >
+          <RefreshCw class="w-4 h-4 mr-2" :class="{ 'animate-spin': syncingZeroJoinedBatch }" />
+          一键同步0人
+        </Button>
+        <Button
+          variant="outline"
+          class="bg-white border-orange-200 text-orange-600 hover:bg-orange-50 h-10 rounded-xl px-4"
+          :disabled="deletingExpiredBatch"
+          @click="handleBatchDeleteExpired"
+        >
+          <span v-if="deletingExpiredBatch" class="animate-spin mr-2">⏳</span>
+          <Trash2 v-else class="w-4 h-4 mr-2" />
+          批量删过期
+        </Button>
+        <Button
+          variant="outline"
+          class="bg-white border-red-200 text-red-600 hover:bg-red-50 h-10 rounded-xl px-4"
+          :disabled="deletingBannedBatch"
+          @click="handleBatchDeleteBanned"
+        >
+          <span v-if="deletingBannedBatch" class="animate-spin mr-2">⏳</span>
+          <Trash2 v-else class="w-4 h-4 mr-2" />
+          批量删封号
+        </Button>
+        <Button
+          variant="outline"
+          class="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50 h-10 rounded-xl px-4"
+          :disabled="loading || quickInviting"
+          @click="openQuickInviteDialog"
+        >
+          <Mail class="w-4 h-4 mr-2" />
+          快捷邀请
+        </Button>
+        <Button
           @click="showDialog = true"
           class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
         >
@@ -1491,6 +1719,50 @@ const handleInviteSubmit = async () => {
         </Button>
       </div>
     </Teleport>
+
+    <Dialog :open="showQuickInviteDialog" @update:open="(open) => { if (!open) closeQuickInviteDialog() }">
+      <DialogContent class="sm:max-w-lg rounded-2xl">
+        <DialogHeader>
+          <DialogTitle class="text-xl font-bold text-gray-900">管理员快捷邀请</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-4 pt-2">
+          <div class="space-y-2">
+            <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邮箱</Label>
+            <Input
+              v-model.trim="quickInviteEmail"
+              type="email"
+              placeholder="name@example.com"
+              :disabled="quickInviting"
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邀请账号</Label>
+            <Select v-model="quickInviteAccountId" :disabled="quickInviting">
+              <SelectTrigger>
+                <SelectValue placeholder="自动选择开放账号（推荐）" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">自动选择开放账号（推荐）</SelectItem>
+                <SelectItem
+                  v-for="account in quickInviteAccountOptions"
+                  :key="account.id"
+                  :value="String(account.id)"
+                >
+                  {{ account.email }}（{{ Number(account.userCount || 0) + Number(account.inviteCount || 0) }}/{{ Number(account.quickInviteCapacityLimit || 0) || '-' }}人，邀请码{{ Number(account.directInviteCodeAvailable || 0) }}/{{ Number(account.directInviteCodeTotal || 0) }}）
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <DialogFooter class="pt-2">
+          <Button variant="outline" :disabled="quickInviting" @click="closeQuickInviteDialog">取消</Button>
+          <Button :disabled="quickInviting" @click="handleQuickInviteSubmit">
+            <span v-if="quickInviting" class="animate-spin mr-2">⏳</span>
+            发送邀请
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <!-- 筛选控制栏 -->
     <div class="flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
@@ -1554,11 +1826,13 @@ const handleInviteSubmit = async () => {
             <thead>
 	              <tr class="border-b border-gray-100 bg-gray-50/50">
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">ID</th>
-	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
-	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
-	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
-	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
-	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
+		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
+		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
+		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">封禁时间</th>
+		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">封禁天数</th>
+		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
+		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
+		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
 	                <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
 	              </tr>
@@ -1587,18 +1861,28 @@ const handleInviteSubmit = async () => {
                       </div>
 	                  </div>
 	                </td>
+		                <td class="px-6 py-5 text-center">
+		                  <span
+		                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
+		                    :class="statusBadge(getAccountListStatus(account)).class"
+		                  >
+		                    {{ statusBadge(getAccountListStatus(account)).label }}
+		                  </span>
+		                </td>
+		                <td class="px-6 py-5 text-sm text-gray-500">
+		                  <span :class="account.isBanned ? 'text-red-600 font-medium' : ''">
+		                    {{ formatAccountBannedAt(account) }}
+		                  </span>
+		                </td>
+		                <td class="px-6 py-5 text-center text-sm">
+		                  <span :class="account.isBanned ? 'text-red-600 font-semibold' : 'text-gray-400'">
+		                    {{ getAccountBannedDays(account) != null ? `${getAccountBannedDays(account)} 天` : '-' }}
+		                  </span>
+		                </td>
 	                <td class="px-6 py-5 text-center">
-	                  <span
-	                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
-	                    :class="statusBadge(getAccountListStatus(account)).class"
-	                  >
-	                    {{ statusBadge(getAccountListStatus(account)).label }}
+	                  <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
+	                    {{ account.userCount }} 人
 	                  </span>
-	                </td>
-                <td class="px-6 py-5 text-center">
-                  <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-100">
-                    {{ account.userCount }} 人
-                  </span>
                 </td>
 	                <td class="px-6 py-5 text-center">
 	                   <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-purple-50 text-purple-600 border border-purple-100">
@@ -1713,16 +1997,28 @@ const handleInviteSubmit = async () => {
               </div>
 	            </div>
 
-            <div class="grid grid-cols-2 gap-4 text-xs text-gray-500 mb-4 bg-gray-50/50 p-3 rounded-xl">
-          <div>
-                  <p class="mb-1 text-gray-400">过期时间</p>
-                  <p class="font-mono text-gray-700">{{ account.expireAt || '-' }}</p>
-               </div>
-               <div>
-                  <p class="mb-1 text-gray-400">创建时间</p>
-                  <p class="text-gray-700">{{ formatShanghaiDate(account.createdAt, dateFormatOptions).split(' ')[0] }}</p>
-               </div>
-            </div>
+	            <div class="grid grid-cols-2 gap-4 text-xs text-gray-500 mb-4 bg-gray-50/50 p-3 rounded-xl">
+	          <div>
+	                  <p class="mb-1 text-gray-400">过期时间</p>
+	                  <p class="font-mono text-gray-700">{{ account.expireAt || '-' }}</p>
+	               </div>
+	               <div>
+	                  <p class="mb-1 text-gray-400">创建时间</p>
+	                  <p class="text-gray-700">{{ formatShanghaiDate(account.createdAt, dateFormatOptions).split(' ')[0] }}</p>
+	               </div>
+	               <div>
+	                  <p class="mb-1 text-gray-400">封禁时间</p>
+	                  <p :class="account.isBanned ? 'text-red-600 font-medium' : 'text-gray-700'">
+	                    {{ formatAccountBannedAt(account) }}
+	                  </p>
+	               </div>
+	               <div>
+	                  <p class="mb-1 text-gray-400">封禁天数</p>
+	                  <p :class="account.isBanned ? 'text-red-600 font-semibold' : 'text-gray-700'">
+	                    {{ getAccountBannedDays(account) != null ? `${getAccountBannedDays(account)} 天` : '-' }}
+	                  </p>
+	               </div>
+	            </div>
 
             <div class="flex items-center justify-between gap-2 pt-2 border-t border-gray-50">
                <!-- Toggle Open -->

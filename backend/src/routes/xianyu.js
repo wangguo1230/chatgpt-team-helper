@@ -22,6 +22,7 @@ import { getXianyuLoginRefreshState, runXianyuLoginRefreshNow } from '../service
 import { getXianyuWsDeliveryState, triggerXianyuWsDelivery } from '../services/xianyu-ws-delivery.js'
 import { sendTelegramBotNotification } from '../services/telegram-notifier.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
+import { getChannels } from '../utils/channels.js'
 
 const router = express.Router()
 let lastSyncResult = null
@@ -297,7 +298,7 @@ router.post('/orders/:id/bind-code', async (req, res) => {
 
     const codeRow = db.exec(
       `
-        SELECT id, code, is_redeemed, redeemed_by
+        SELECT id, code, is_redeemed, redeemed_by, channel
         FROM redemption_codes
         WHERE upper(code) = ?
         LIMIT 1
@@ -312,8 +313,19 @@ router.post('/orders/:id/bind-code', async (req, res) => {
     const codeId = Number(codeRow[0])
     const isRedeemed = Number(codeRow[2] || 0) === 1
     const redeemedBy = codeRow[3]
+    const rawCodeChannel = String(codeRow[4] || '').trim().toLowerCase()
+    const codeChannel = rawCodeChannel || 'common'
     if (!isRedeemed) {
       return res.status(409).json({ error: '该兑换码尚未使用，无法绑定' })
+    }
+
+    let allowCodeBind = codeChannel === 'xianyu'
+    if (!allowCodeBind && codeChannel === 'common') {
+      const { byKey: channelsByKey } = await getChannels(db)
+      allowCodeBind = Boolean(channelsByKey.get('xianyu')?.allowCommonFallback)
+    }
+    if (!allowCodeBind) {
+      return res.status(403).json({ error: '该兑换码渠道不匹配，无法绑定闲鱼订单' })
     }
 
     let resolvedEmail = normalizeEmail(req.body?.email)

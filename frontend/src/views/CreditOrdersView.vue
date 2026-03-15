@@ -390,7 +390,7 @@ onUnmounted(() => {
             <Input
                v-model="searchQuery"
                @keyup.enter="applySearch"
-               placeholder="搜索订单 / UID / 目标账号..."
+               placeholder="搜索订单 / UID / 兑换码邮箱 / 目标账号..."
                class="pl-9 h-11 bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] focus:shadow-[0_4px_12px_rgba(0,0,0,0.06)] rounded-xl transition-all"
             />
          </div>
@@ -447,6 +447,8 @@ onUnmounted(() => {
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">积分</th>
                    <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">目标账号</th>
+                   <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">下单邮箱</th>
+                   <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">兑换码账号</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">完成时间</th>
                    <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
@@ -474,6 +476,13 @@ onUnmounted(() => {
                    </td>
                    <td class="px-6 py-5">
                       <span class="text-sm text-gray-600">{{ item.targetAccountId ?? '-' }}</span>
+                   </td>
+                   <td class="px-6 py-5">
+                      <span class="text-sm text-gray-600 break-all">{{ item.orderEmail || '-' }}</span>
+                   </td>
+                   <td class="px-6 py-5">
+                      <div class="text-sm text-gray-600 break-all">{{ item.codeAccountEmail || '-' }}</div>
+                      <div v-if="item.codeId" class="text-xs text-gray-400 font-mono mt-1">codeId: {{ item.codeId }}</div>
                    </td>
                    <td class="px-6 py-5 text-sm text-gray-500 whitespace-nowrap">{{ formatDate(item.createdAt) }}</td>
                    <td class="px-6 py-5 text-sm text-gray-500 whitespace-nowrap">{{ formatDate(item.paidAt || null) }}</td>

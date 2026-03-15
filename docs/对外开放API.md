@@ -28,7 +28,7 @@ API Key 的读取优先级：
 
 | 方法 | Path | 用途 |
 | --- | --- | --- |
-| POST | `/api/auto-boarding` | 自动上车：创建/更新账号，并触发同步 |
+| POST | `/api/auto-boarding` | 自动上车：创建/更新账号，可按多渠道建码并触发同步 |
 | GET | `/api/auto-boarding/stats` | 自动上车统计 |
 | POST | `/api/openai-accounts/generate-auth-url` | 生成 OpenAI OAuth 授权链接（PKCE，会话 10 分钟） |
 | POST | `/api/openai-accounts/exchange-code` | 交换授权码，返回 token 与账号信息 |
@@ -56,6 +56,8 @@ API Key 的读取优先级：
 | `chatgptAccountId` | 否 | string | ChatGPT account id（用于优先匹配已有账号） |
 | `oaiDeviceId` | 否 | string | `oai-did` |
 | `expireAt` | 否 | string/number | 过期时间：支持 `YYYY/MM/DD HH:mm`、`YYYY-MM-DD HH:mm`、毫秒时间戳 |
+| `isOpen` / `is_open` | 否 | boolean/number/string | 是否设为开放账号；默认 `true`（`1/true/yes` 为开，`0/false/no` 为关） |
+| `codePlans` / `code_plans` | 否 | array | 按渠道批量建码计划（见下方） |
 | `isDemoted`/`is_demoted` | 否 | boolean/number | **Deprecated**：已弃用（请求会被忽略；响应恒为 `false`，仅保留兼容） |
 
 兼容别名（可直接传 OpenAI OAuth/客户端返回 JSON）：
@@ -65,12 +67,27 @@ API Key 的读取优先级：
 - `oai_device_id`
 - `expired` / `expires_at`
 
+`codePlans` 元素字段：
+
+| 字段 | 必填 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `channel` / `channelKey` / `channel_key` | 是 | string | 渠道 key（必须在 `channels` 表中存在且启用） |
+| `countMode` / `count_mode` | 否 | string | `fixed` 或 `max_minus`；缺省按 `fixed` |
+| `count` | `fixed` 时必填 | number | 固定生成数量（1-1000） |
+| `minus` / `maxMinus` / `max_minus` | `max_minus` 时可填 | number | 从剩余可用名额中扣减（0-1000，默认 0） |
+| `orderType` / `order_type` | 否 | string | `warranty` / `no_warranty` / `anti_ban`，默认 `warranty` |
+| `serviceDays` / `service_days` | 条件必填 | number | `orderType=warranty` 时必填（1-3650）；`no_warranty` 时会忽略 |
+
 **行为说明**
 
 - 更新逻辑：优先用 `chatgptAccountId` 查找，其次用 `email` 查找。
 - `expireAt`：如果未显式传入，后端会尝试从 `token` 的 JWT `exp` 字段推导并写入。
+- `isOpen`：默认 `true`；如账号已封号且请求要设为开放，会返回 `400`。
+- 账号封号时不允许通过该接口创建兑换码。
+- `codePlans`：可一次请求按多渠道创建兑换码；不传则只创建/更新账号，不自动建码。
+- 容量上限读取优先级：`system_config.open_accounts_capacity_limit` > `OPEN_ACCOUNTS_CAPACITY_LIMIT`（`.env`）> 默认 `5`。
+- `max_minus` 计算方式：`计划数量 = 当前剩余名额 - minus`，其中剩余名额 = 容量上限 - (`user_count + invite_count + 未兑换码数量`)。
 - `isDemoted`/`is_demoted`：已弃用，后端会忽略该字段。
-- 新建账号时会自动生成若干兑换码（`generatedCodes` 字段返回）。
 - 会触发一次账号同步（`syncResult`/`removedUsers` 字段返回）。
 - `token`/`refreshToken` 支持直接粘贴 JSON；如果请求体直接包含 `access_token` 等字段，也可直接创建/更新。
 
@@ -93,7 +110,28 @@ curl -X POST "https://<host>/api/auto-boarding" \
     "refreshToken": "rt_xxx",
     "chatgptAccountId": "acct_...",
     "oaiDeviceId": "oai-did-...",
-    "expireAt": "2026/01/27 12:00"
+    "expireAt": "2026/01/27 12:00",
+    "isOpen": true,
+    "codePlans": [
+      {
+        "channel": "linux-do",
+        "countMode": "max_minus",
+        "minus": 1,
+        "orderType": "warranty",
+        "serviceDays": 30
+      },
+      {
+        "channel": "xianyu",
+        "count": 2,
+        "orderType": "no_warranty"
+      },
+      {
+        "channel": "yizhifu",
+        "count": 1,
+        "orderType": "anti_ban",
+        "serviceDays": 7
+      }
+    ]
   }'
 ```
 
@@ -109,8 +147,73 @@ curl -X POST "https://<host>/api/auto-boarding" \
     "account_id": "fa337943-cf04-4eab-ad34-a9669f36a0b4",
     "email": "user@example.com",
     "expired": "2026-03-23T11:27:45+08:00",
-    "oai_device_id": "oai-did-..."
+    "oai_device_id": "oai-did-...",
+    "is_open": true,
+    "code_plans": [
+      {
+        "channel_key": "linux-do",
+        "count_mode": "fixed",
+        "count": 1,
+        "order_type": "warranty",
+        "service_days": 15
+      }
+    ]
   }'
+```
+
+**响应示例**
+
+```json
+{
+  "success": true,
+  "message": "自动上车成功！账号已添加到系统",
+  "action": "created",
+  "account": {
+    "id": 1001,
+    "email": "user@example.com",
+    "userCount": 1,
+    "inviteCount": 0,
+    "chatgptAccountId": "acct_xxx",
+    "oaiDeviceId": "oai-did-xxx",
+    "expireAt": "2026/03/23 11:27",
+    "isOpen": true
+  },
+  "generatedCodesCount": 2,
+  "capacityLimit": 5,
+  "remainingSlots": 2,
+  "generatedCodesByChannel": {
+    "linux-do": [
+      {
+        "code": "ABCD-EFGH-IJKL",
+        "orderType": "warranty",
+        "serviceDays": 30
+      }
+    ],
+    "xianyu": [
+      {
+        "code": "MNOP-QRST-UVWX",
+        "orderType": "no_warranty",
+        "serviceDays": null
+      }
+    ]
+  },
+  "generatedCodes": [
+    {
+      "code": "ABCD-EFGH-IJKL",
+      "channel": "linux-do",
+      "orderType": "warranty",
+      "serviceDays": 30
+    },
+    {
+      "code": "MNOP-QRST-UVWX",
+      "channel": "xianyu",
+      "orderType": "no_warranty",
+      "serviceDays": null
+    }
+  ],
+  "syncResult": null,
+  "removedUsers": []
+}
 ```
 
 ### 4.2 GET `/api/auto-boarding/stats`

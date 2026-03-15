@@ -10,6 +10,7 @@ import {
 } from '../services/open-accounts-redemption.js'
 import { withLocks } from '../utils/locks.js'
 import { requireFeatureEnabled } from '../middleware/feature-flags.js'
+import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 
 const router = express.Router()
 
@@ -410,6 +411,7 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
   }
   try {
     const db = await getDatabase()
+    const openAccountsCapacityLimit = getOpenAccountsCapacityLimit(db)
     const user = uid ? await loadOrCreateLinuxDoUser(db, { uid, username: username || uid }) : null
     const currentAccountId = user?.currentOpenAccountId ? Number(user.currentOpenAccountId) : null
 
@@ -453,12 +455,12 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
 	        ) code_stats ON lower(trim(ga.email)) = code_stats.account_email_lower
 		        WHERE ga.is_open = 1
 		          AND COALESCE(ga.is_banned, 0) = 0
-		          AND (COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0)) < 5
-	          ${threshold ? "AND ga.created_at >= DATETIME('now', 'localtime', ?)" : ''}
-	        ORDER BY ga.created_at DESC
-	      `,
-      threshold ? [threshold] : []
-    )
+		          AND (COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0)) < ?
+		          ${threshold ? "AND ga.created_at >= DATETIME('now', 'localtime', ?)" : ''}
+		        ORDER BY ga.created_at DESC
+		      `,
+	      threshold ? [openAccountsCapacityLimit, threshold] : [openAccountsCapacityLimit]
+	    )
 
 	    const rows = result[0]?.values || []
 	    const items = rows.map(row => {
@@ -536,8 +538,9 @@ router.get('/', authenticateLinuxDoSession, async (req, res) => {
       rules: {
         creditCost,
         dailyLimit: dailyLimit || null,
-        todayBoardCount,
-        userDailyLimitEnabled,
+	        todayBoardCount,
+        capacityLimit: openAccountsCapacityLimit,
+	        userDailyLimitEnabled,
         userDailyLimit: userDailyLimitEnabled && userDailyLimit > 0 ? userDailyLimit : null,
         userTodayBoardCount,
         userDailyLimitRemaining,
@@ -576,6 +579,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
     }
 
     const db = await getDatabase()
+    const openAccountsCapacityLimit = getOpenAccountsCapacityLimit(db)
     const user = await loadOrCreateLinuxDoUser(db, { uid, username: username || uid })
     const profileEmail = normalizeEmail(user.email)
 
@@ -611,13 +615,11 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
 	      const accountExpireAt = accountRow[2] ? String(accountRow[2]) : null
 	      const discounted = formatCreditMoney(calculateDiscountedCredit(creditCost, accountExpireAt))
 	      const actualCreditCost = discounted || creditCost || null
-	      const requestedOrderType = ORDER_TYPE_WARRANTY
 	      if (!accountEmail) {
 	        return { type: 'error', status: 500, error: '开放账号缺少邮箱配置' }
 	      }
 
       let verifiedCreditOrderNo = null
-      let verifiedOrderType = requestedOrderType
       let orderEmail = normalizeEmail(freshUser.email || profileEmail)
       if (creditOrderNo) {
         const creditRow = db.exec(
@@ -688,15 +690,14 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
         const isCurrentAccountBound = Boolean(currentId && currentId === accountId)
 
         if (isCurrentAccountBound && (isMember || isInvited)) {
-          if (verifiedCreditOrderNo) {
-            const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
-              orderNo: verifiedCreditOrderNo,
-              uid,
-              email: orderEmail,
-              accountEmail,
-              capacityLimit: 6,
-              orderType: verifiedOrderType
-            })
+	          if (verifiedCreditOrderNo) {
+	            const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
+	              orderNo: verifiedCreditOrderNo,
+	              uid,
+	              email: orderEmail,
+	              accountEmail,
+	              capacityLimit: openAccountsCapacityLimit + 1
+	            })
             if (!redeemOutcome.ok) {
               const codeMessage = redeemOutcome.error === 'no_code'
                 ? '当前账号暂无可用兑换码，请稍后再试'
@@ -752,9 +753,9 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
 	            return { type: 'error', status: 500, error: '未配置上车所需积分' }
 	          }
 
-	          const baseCapacity = 5
-	          // 若用户尚未在目标账号的成员/邀请列表中，且账号已满员，则不创建订单，避免授权后无法上车。
-	          if (!isMember && !isInvited) {
+		          const baseCapacity = openAccountsCapacityLimit
+		          // 若用户尚未在目标账号的成员/邀请列表中，且账号已满员，则不创建订单，避免授权后无法上车。
+		          if (!isMember && !isInvited) {
 	            const seatsUsed = Number(account.userCount || 0) + Number(account.inviteCount || 0)
 	            if (seatsUsed >= baseCapacity) {
               return { type: 'error', status: 409, error: '该账号已满员，无法上车' }
@@ -867,7 +868,7 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
               reservedCode.id,
               reservedCode.code,
               reservedCode.accountEmail || null,
-              JSON.stringify({ accountId, orderType: requestedOrderType, orderEmail })
+              JSON.stringify({ accountId, orderEmail })
             ]
           )
           saveDatabase()
@@ -887,15 +888,14 @@ router.post('/:accountId/board', authenticateLinuxDoSession, async (req, res) =>
           }
         }
 
-	        const baseCapacity = 5
-	        const redeemCapacity = isMember || isInvited ? 6 : baseCapacity
+		        const baseCapacity = openAccountsCapacityLimit
+		        const redeemCapacity = isMember || isInvited ? baseCapacity + 1 : baseCapacity
 	        const redeemOutcome = await redeemOpenAccountsOrderCode(db, {
 	          orderNo: verifiedCreditOrderNo,
 	          uid,
 	          email: orderEmail,
           accountEmail,
-          capacityLimit: redeemCapacity,
-          orderType: verifiedOrderType
+          capacityLimit: redeemCapacity
         })
 
         if (!redeemOutcome.ok) {

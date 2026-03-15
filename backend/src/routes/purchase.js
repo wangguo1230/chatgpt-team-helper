@@ -9,7 +9,14 @@ import { withLocks } from '../utils/locks.js'
 import { sendPurchaseOrderEmail } from '../services/email-service.js'
 import { redeemCodeInternal, RedemptionError } from './redemption-codes.js'
 import { getChannels, normalizeChannelKey } from '../utils/channels.js'
-import { getPurchaseProductByKey, listPurchaseProducts, normalizeCodeChannels, normalizeProductKey } from '../services/purchase-products.js'
+import {
+  getPurchaseProductByKey,
+  listPurchaseProducts,
+  normalizeCodeChannels,
+  normalizeProductCategory,
+  normalizeProductKey,
+  PURCHASE_PRODUCT_CATEGORY_CODE
+} from '../services/purchase-products.js'
 import { safeInsertPointsLedgerEntry } from '../utils/points-ledger.js'
 import { getZpaySettings } from '../utils/zpay-settings.js'
 import { sendTelegramBotNotification } from '../services/telegram-notifier.js'
@@ -214,6 +221,8 @@ const getPurchasePlans = () => {
 const getPurchaseOrderExpireMinutes = () => Math.max(5, toInt(process.env.PURCHASE_ORDER_EXPIRE_MINUTES, 15))
 
 const parseProductCodeChannels = (product, channelsByKey) => {
+  const category = normalizeProductCategory(product?.category, PURCHASE_PRODUCT_CATEGORY_CODE)
+  if (category !== PURCHASE_PRODUCT_CATEGORY_CODE) return []
   const { list } = normalizeCodeChannels(product?.codeChannels)
   const resolved = []
   const seen = new Set()
@@ -1090,7 +1099,7 @@ router.get('/meta', async (req, res) => {
         saveDatabase()
       }
     })
-    const products = await listPurchaseProducts(db, { activeOnly: true })
+    const products = await listPurchaseProducts(db, { activeOnly: true, category: PURCHASE_PRODUCT_CATEGORY_CODE })
     const { byKey: channelsByKey } = await getChannels(db)
 
     const responsePlans = []
@@ -1205,8 +1214,12 @@ router.post('/orders', async (req, res) => {
         product = await getPurchaseProductByKey(db, requestedOrderType)
       }
 
+      if (product && normalizeProductCategory(product.category, PURCHASE_PRODUCT_CATEGORY_CODE) !== PURCHASE_PRODUCT_CATEGORY_CODE) {
+        return { ok: false, status: 400, error: '该商品不可用于支付下单' }
+      }
+
       if (!product) {
-        const products = await listPurchaseProducts(db, { activeOnly: true })
+        const products = await listPurchaseProducts(db, { activeOnly: true, category: PURCHASE_PRODUCT_CATEGORY_CODE })
         product = products?.[0] || null
       }
 

@@ -199,6 +199,12 @@ const router = createRouter({
           meta: { requiredMenuKey: 'redemption_codes' },
         },
         {
+          path: 'ldc-shop-products',
+          name: 'ldc-shop-products',
+          component: SettingsView,
+          meta: { requiredMenuKey: 'ldc_shop_products', settingsSubTab: 'billing' },
+        },
+        {
           path: 'xhs-orders',
           name: 'xhs-orders',
           component: XhsOrdersView,

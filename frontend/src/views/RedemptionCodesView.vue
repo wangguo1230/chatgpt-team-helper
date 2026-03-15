@@ -31,6 +31,7 @@ import { Search, Plus, Download, Trash2, ChevronLeft, ChevronRight, RefreshCcw, 
 
 const router = useRouter()
 const route = useRoute()
+const DEFAULT_BATCH_COUNT = 4
 const codes = ref<RedemptionCode[]>([])
 const totalCodes = ref(0)
 const accounts = ref<GptAccount[]>([])
@@ -38,7 +39,7 @@ const loading = ref(true)
 const error = ref('')
 const teleportReady = ref(false)
 const showBatchDialog = ref(false)
-const batchCount = ref(10)
+const batchCount = ref(DEFAULT_BATCH_COUNT)
 const batchCreateMaxCount = ref(5)
 const selectedAccountEmail = ref('')
 const selectedBatchChannel = ref('common')
@@ -49,7 +50,6 @@ const selectedCodes = ref<number[]>([])
 const showRedeemDialog = ref(false)
 const redeemTargetCode = ref<RedemptionCode | null>(null)
 const redeemEmail = ref('')
-const redeemOrderType = ref<PurchaseOrderType>('warranty')
 const redeeming = ref(false)
 const reinvitingCodeIds = ref<number[]>([])
 const appConfigStore = useAppConfigStore()
@@ -420,7 +420,7 @@ const truncateText = (text?: string | null, maxLength: number = 20) => {
 }
 
 const openBatchDialog = () => {
-  batchCount.value = Math.min(10, batchCreateMaxCount.value)
+  batchCount.value = Math.min(DEFAULT_BATCH_COUNT, batchCreateMaxCount.value)
   selectedAccountEmail.value = activeAccounts.value.length > 0 ? (activeAccounts.value[0]?.email || '') : ''
   selectedBatchChannel.value = 'common'
   showBatchDialog.value = true
@@ -428,7 +428,7 @@ const openBatchDialog = () => {
 
 const closeBatchDialog = () => {
   showBatchDialog.value = false
-  batchCount.value = Math.min(10, batchCreateMaxCount.value)
+  batchCount.value = Math.min(DEFAULT_BATCH_COUNT, batchCreateMaxCount.value)
   selectedAccountEmail.value = ''
   selectedBatchChannel.value = 'common'
   batchOrderType.value = 'warranty'
@@ -664,7 +664,6 @@ const openRedeemDialog = (code: RedemptionCode) => {
 
   redeemTargetCode.value = code
   redeemEmail.value = code.redeemedBy || ''
-  redeemOrderType.value = code.orderType === 'no_warranty' ? 'no_warranty' : 'warranty'
   showRedeemDialog.value = true
 }
 
@@ -672,7 +671,6 @@ const closeRedeemDialog = () => {
   showRedeemDialog.value = false
   redeemTargetCode.value = null
   redeemEmail.value = ''
-  redeemOrderType.value = 'warranty'
   redeeming.value = false
 }
 
@@ -699,8 +697,7 @@ const handleRedeemInvite = async () => {
     const response = await redemptionCodeService.redeemAdmin({
       email,
       code: redeemTargetCode.value.code,
-      channel: redeemTargetCode.value.channel || 'common',
-      orderType: redeemOrderType.value
+      channel: redeemTargetCode.value.channel || 'common'
     })
 
     const successMessage = response.data?.message || '兑换成功，邀请已发送'
@@ -712,8 +709,7 @@ const handleRedeemInvite = async () => {
       isRedeemed: true,
       redeemedBy: email,
       redeemedEmail: email,
-      redeemedAt: updatedAt,
-      orderType: redeemOrderType.value
+      redeemedAt: updatedAt
     }
 
     redeemTargetCode.value = updatedCode
@@ -1678,21 +1674,6 @@ const handleInviteSubmit = async () => {
                    {{ redeemTargetCode.accountEmail || '未指定' }}
                  </span>
               </div>
-           </div>
-
-           <div class="space-y-2">
-              <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">订单类型</Label>
-              <Select v-model="redeemOrderType">
-                <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500">
-                  <SelectValue placeholder="选择订单类型" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="option in orderTypeOptions" :key="option.value" :value="option.value">
-                    {{ option.label }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-xs text-gray-400">无质保订单不支持退款与补号。</p>
            </div>
 
            <div class="space-y-2">

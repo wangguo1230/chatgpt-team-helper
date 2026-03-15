@@ -63,7 +63,23 @@ const resolveRequestProxy = (proxy, { key, attempt } = {}) => {
   return entry ? entry.url : null
 }
 
+const parseDateTimeToMs = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const parsed = Date.parse(raw.replace(' ', 'T'))
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+const calculateBannedDays = (isBanned, bannedAt) => {
+  if (!isBanned || !bannedAt) return null
+  const bannedAtMs = parseDateTimeToMs(bannedAt)
+  if (!Number.isFinite(bannedAtMs)) return null
+  return Math.max(0, Math.floor((Date.now() - bannedAtMs) / (24 * 60 * 60 * 1000)))
+}
+
 function mapRowToAccount(row) {
+  const isBanned = Boolean(row[10])
+  const bannedAt = row[11] || null
   return {
     id: row[0],
     email: row[1],
@@ -76,21 +92,24 @@ function mapRowToAccount(row) {
     expireAt: row[8] || null,
     isOpen: Boolean(row[9]),
     isDemoted: false,
-    isBanned: Boolean(row[10]),
-    createdAt: row[11],
-    updatedAt: row[12]
+    isBanned,
+    bannedAt,
+    bannedDays: calculateBannedDays(isBanned, bannedAt),
+    createdAt: row[12],
+    updatedAt: row[13]
   }
 }
 
 async function fetchAccountById(db, accountId) {
   const result = db.exec(
     `
-	    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-	           COALESCE(is_banned, 0) AS is_banned,
-	           created_at, updated_at
-	    FROM gpt_accounts
-	    WHERE id = ?
-  `,
+		    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+		           COALESCE(is_banned, 0) AS is_banned,
+		           banned_at,
+		           created_at, updated_at
+		    FROM gpt_accounts
+		    WHERE id = ?
+	  `,
     [accountId]
   )
 
@@ -103,13 +122,14 @@ async function fetchAccountById(db, accountId) {
 
 export async function fetchAllAccounts() {
 	  const db = await getDatabase()
-	  const result = db.exec(`
-	    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-	           COALESCE(is_banned, 0) AS is_banned,
-	           created_at, updated_at
-	    FROM gpt_accounts
-	    ORDER BY created_at DESC
-  `)
+		  const result = db.exec(`
+		    SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+		           COALESCE(is_banned, 0) AS is_banned,
+		           banned_at,
+		           created_at, updated_at
+		    FROM gpt_accounts
+		    ORDER BY created_at DESC
+	  `)
 
   if (result.length === 0) {
     return []
@@ -174,6 +194,12 @@ export const refreshAccessTokenWithRefreshToken = async (refreshToken, options =
     if (error?.response) {
       // 如果 OpenAI 明确返回 400/401，说明 RefreshToken 已失效，自动下架
       const status = error.response.status
+      const message =
+        error?.response?.data?.error_description
+        || error?.response?.data?.error
+        || error?.response?.data?.message
+        || error?.message
+        || '刷新 token 失败'
       if ((status === 400 || status === 401) && accountId) {
         const db = await getDatabase()
         await markAccountAsInvalid(db, accountId, `OAuth 刷新返回 ${status}: ${message}`)
@@ -371,52 +397,129 @@ const parseJsonOrThrow = (text, { logContext, message }) => {
   }
 }
 
+const INVALID_ACCOUNT_EXPIRE_AT = '1970/01/01 00:00:00'
+const shouldSendAlertEmail = (options = {}) => {
+  if (options?.sendAlertEmail === undefined || options?.sendAlertEmail === null) return true
+  return Boolean(options.sendAlertEmail)
+}
+
 /**
  * 删除指定账号关联的所有未使用兑换码
  */
 export async function deleteUnusedCodesByAccountId(db, accountId) {
+  let deletedCount = 0
+  let accountEmail = ''
   try {
     const account = await fetchAccountById(db, accountId)
     if (account?.email) {
+      accountEmail = account.email
       db.run(
         'DELETE FROM redemption_codes WHERE LOWER(TRIM(account_email)) = LOWER(TRIM(?)) AND is_redeemed = 0',
         [account.email]
       )
-      console.log(`[AccountSync] 已清理账号 ${account.email} 的所有未使用兑换码`)
+      deletedCount = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+      if (deletedCount > 0) {
+        await saveDatabase()
+      }
+      console.log(`[AccountSync] 已清理账号 ${account.email} 的未使用兑换码`, { deletedCount })
     }
   } catch (error) {
     console.error(`[AccountSync] 清理账号 ${accountId} 兑换码失败:`, error)
+  }
+  return {
+    accountId: Number(accountId),
+    accountEmail,
+    deletedCount
+  }
+}
+
+/**
+ * 将账号标记为封号并下架，同时清理未使用兑换码
+ */
+export const markAccountAsBannedAndCleanup = async (db, accountId, reason, options = {}) => {
+  const sendAlertEmail = shouldSendAlertEmail(options)
+  let account = null
+  let cleanup = { accountId: Number(accountId), accountEmail: '', deletedCount: 0 }
+
+  try {
+    db.run(
+      `
+        UPDATE gpt_accounts
+        SET is_open = 0,
+            is_banned = 1,
+            ban_processed = 0,
+            banned_at = COALESCE(banned_at, DATETIME('now', 'localtime')),
+            expire_at = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [INVALID_ACCOUNT_EXPIRE_AT, accountId]
+    )
+    await saveDatabase()
+    cleanup = await deleteUnusedCodesByAccountId(db, accountId)
+    account = await fetchAccountById(db, accountId)
+
+    console.warn('[AccountSync] 账号已标记为封号并下架', {
+      accountId,
+      reason,
+      deletedUnusedCodes: cleanup.deletedCount || 0
+    })
+
+    if (sendAlertEmail && account) {
+      await sendAdminAlertEmail({
+        subject: `[账号封号] ${account.email}`,
+        text: [
+          '账号已自动标记为封号并下架。',
+          `账号 ID: ${accountId}`,
+          `邮箱: ${account.email}`,
+          `原因: ${reason || '未知原因'}`,
+          `已删除未使用兑换码: ${cleanup.deletedCount || 0}`
+        ].join('\n')
+      })
+    }
+  } catch (error) {
+    console.error(`[AccountSync] 标记账号封号失败: ID=${accountId}`, error)
+  }
+
+  return {
+    accountId: Number(accountId),
+    accountEmail: account?.email || cleanup.accountEmail || '',
+    deletedUnusedCodeCount: Number(cleanup.deletedCount || 0),
+    reason: String(reason || '').trim()
   }
 }
 
 /**
  * 标记账号为失效并下架（用于 401 彻底无法修复的场景）
  */
-export const markAccountAsInvalid = async (db, accountId, reason) => {
+export const markAccountAsInvalid = async (db, accountId, reason, options = {}) => {
+  const sendAlertEmail = shouldSendAlertEmail(options)
+  let account = null
+  let cleanup = { accountId: Number(accountId), accountEmail: '', deletedCount: 0 }
   try {
     db.run(
       `
         UPDATE gpt_accounts
         SET is_open = 0,
-            expire_at = '1970/01/01 00:00:00',
+            expire_at = ?,
             updated_at = DATETIME('now', 'localtime')
         WHERE id = ?
       `,
-      [accountId]
+      [INVALID_ACCOUNT_EXPIRE_AT, accountId]
     )
     await saveDatabase()
     console.warn(`[AccountSync] 账号已标记为失效并下架: ID=${accountId}, 原因=${reason}`)
 
     // 清理该账号关联的未使用兑换码
-    await deleteUnusedCodesByAccountId(db, accountId)
+    cleanup = await deleteUnusedCodesByAccountId(db, accountId)
+    account = await fetchAccountById(db, accountId)
 
     // 触发即时邮件告警
     try {
-      const account = await fetchAccountById(db, accountId)
-      if (account) {
+      if (sendAlertEmail && account) {
         await sendAdminAlertEmail({
           subject: `[账号失效] ${account.email}`,
-          text: `账号已标记为失效并自动下架。\n账号 ID: ${accountId}\n邮箱: ${account.email}\n失效原因: ${reason}\n\n该操作会重置到期日期为 1970 年，前端管理列表将显示为“过期”状态。`
+          text: `账号已标记为失效并自动下架。\n账号 ID: ${accountId}\n邮箱: ${account.email}\n失效原因: ${reason}\n已删除未使用兑换码: ${cleanup.deletedCount || 0}\n\n该操作会重置到期日期为 1970 年，前端管理列表将显示为“过期”状态。`
         })
       }
     } catch (mailError) {
@@ -424,6 +527,13 @@ export const markAccountAsInvalid = async (db, accountId, reason) => {
     }
   } catch (error) {
     console.error(`[AccountSync] 标记账号失效失败: ID=${accountId}`, error)
+  }
+
+  return {
+    accountId: Number(accountId),
+    accountEmail: account?.email || cleanup.accountEmail || '',
+    deletedUnusedCodeCount: Number(cleanup.deletedCount || 0),
+    reason: String(reason || '').trim()
   }
 }
 
@@ -515,35 +625,13 @@ const throwChatgptApiStatusError = async ({ status, errorText, logContext, label
         if (Number.isFinite(accountId)) {
           try {
             const db = await getDatabase()
-            db.run(
-              `
-                UPDATE gpt_accounts
-                SET is_open = 0,
-                    is_banned = 1,
-                    ban_processed = 0,
-                    updated_at = DATETIME('now', 'localtime')
-                WHERE id = ?
-              `,
-              [accountId]
+            const suppressAlertEmail = Boolean(logContext?.suppressAlertEmail)
+            await markAccountAsBannedAndCleanup(
+              db,
+              accountId,
+              '系统检测到 OpenAI 账号已停用 (account_deactivated)',
+              { sendAlertEmail: !suppressAlertEmail }
             )
-            await saveDatabase()
-            console.warn('[AccountSync] upstream account_deactivated; auto-banned', { accountId })
-
-            // 清理该账号关联的未使用兑换码
-            await deleteUnusedCodesByAccountId(db, accountId)
-
-            // 触发即时邮件告警
-            try {
-              const account = await fetchAccountById(db, accountId)
-              if (account) {
-                await sendAdminAlertEmail({
-                  subject: `[账号封号] ${account.email}`,
-                  text: `系统检测到 OpenAI 账号已停用 (account_deactivated)。\n账号 ID: ${accountId}\n邮箱: ${account.email}\n系统已自动将该账号标记为封号并下架，请及时核查。`
-                })
-              }
-            } catch (mailError) {
-              console.error('[AccountSync] 发送封号告警邮件失败', mailError)
-            }
           } catch (error) {
             console.error('[AccountSync] auto-ban failed', {
               accountId,
@@ -585,7 +673,8 @@ async function requestAccountInvites(account, params = {}, requestOptions = {}) 
     chatgptAccountId: account.chatgptAccountId,
     limit,
     offset,
-    url: apiUrl
+    url: apiUrl,
+    suppressAlertEmail: Boolean(requestOptions.suppressAlertEmail)
   }
 
   const { status, text } = await requestChatgptText(
@@ -653,7 +742,8 @@ async function requestDeleteAccountInvite(account, emailAddress, requestOptions 
     accountId: account.id,
     chatgptAccountId: account.chatgptAccountId,
     email: trimmedEmail,
-    url: apiUrl
+    url: apiUrl,
+    suppressAlertEmail: Boolean(requestOptions.suppressAlertEmail)
   }
 
   const { status, text } = await requestChatgptText(
@@ -703,7 +793,8 @@ async function requestAccountUsers(account, params = {}, requestOptions = {}) {
     limit,
     offset,
     query,
-    url: apiUrl
+    url: apiUrl,
+    suppressAlertEmail: Boolean(requestOptions.suppressAlertEmail)
   }
 
   const { status, text } = await requestChatgptText(
@@ -810,13 +901,17 @@ async function executeWithTokenRefresh(accountId, operation, options = {}) {
           } catch (refreshError) {
             console.error(`[AccountSync] executeWithTokenRefresh 自动刷新失败: ${currentAccount.email}`, refreshError.message || refreshError)
             // 彻底失效，下架账号
-            await markAccountAsInvalid(db, currentAccount.id, `Token 自动刷新失败: ${refreshError.message || '未知错误'}`)
+            await markAccountAsInvalid(db, currentAccount.id, `Token 自动刷新失败: ${refreshError.message || '未知错误'}`, {
+              sendAlertEmail: !Boolean(options.suppressAlertEmail)
+            })
             throw error // 抛出原始 401 错误
           }
         }
 
         // 确定无法刷新且没有 refresh_token
-        await markAccountAsInvalid(db, currentAccount.id, 'Token 已过期且未配置 Refresh Token')
+        await markAccountAsInvalid(db, currentAccount.id, 'Token 已过期且未配置 Refresh Token', {
+          sendAlertEmail: !Boolean(options.suppressAlertEmail)
+        })
         throw error
       })
     }
@@ -826,7 +921,10 @@ async function executeWithTokenRefresh(accountId, operation, options = {}) {
 
 export async function fetchAccountUsersList(accountId, options = {}) {
   return executeWithTokenRefresh(accountId, (acc) =>
-    requestAccountUsers(acc, options.userListParams, { proxy: options.proxy }),
+    requestAccountUsers(acc, options.userListParams, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    }),
     options
   )
 }
@@ -834,7 +932,11 @@ export async function fetchAccountUsersList(accountId, options = {}) {
 export async function syncAccountUserCount(accountId, options = {}) {
   return executeWithTokenRefresh(accountId, async (acc) => {
     const db = await getDatabase()
-    const usersData = await requestAccountUsers(acc, { ...(options.userListParams || {}), query: '' }, { proxy: options.proxy })
+    const usersData = await requestAccountUsers(
+      acc,
+      { ...(options.userListParams || {}), query: '' },
+      { proxy: options.proxy, suppressAlertEmail: options.suppressAlertEmail }
+    )
 
     db.run(
       `UPDATE gpt_accounts SET user_count = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
@@ -854,7 +956,10 @@ export async function syncAccountUserCount(accountId, options = {}) {
 
 export async function fetchAccountInvites(accountId, options = {}) {
   return executeWithTokenRefresh(accountId, (acc) =>
-    requestAccountInvites(acc, options.inviteListParams, { proxy: options.proxy }),
+    requestAccountInvites(acc, options.inviteListParams, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    }),
     options
   )
 }
@@ -862,7 +967,10 @@ export async function fetchAccountInvites(accountId, options = {}) {
 export async function syncAccountInviteCount(accountId, options = {}) {
   return executeWithTokenRefresh(accountId, async (acc) => {
     const db = await getDatabase()
-    const invitesData = await requestAccountInvites(acc, options.inviteListParams, { proxy: options.proxy })
+    const invitesData = await requestAccountInvites(acc, options.inviteListParams, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    })
 
     db.run(
       `UPDATE gpt_accounts SET invite_count = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
@@ -888,11 +996,15 @@ export async function deleteAccountInvite(accountId, emailAddress, options = {})
       throw new AccountSyncError('邮箱格式不正确', 400)
     }
 
-    const result = await requestDeleteAccountInvite(acc, trimmedEmail, { proxy: options.proxy })
+    const result = await requestDeleteAccountInvite(acc, trimmedEmail, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    })
     const synced = await syncAccountInviteCount(acc.id, {
       accountRecord: acc,
       inviteListParams: { offset: 0, limit: 1, query: '' },
-      proxy: options.proxy
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
     })
 
     return {
@@ -916,7 +1028,8 @@ export async function deleteAccountUser(accountId, userId, options = {}) {
       accountId: acc.id,
       chatgptAccountId: acc.chatgptAccountId,
       userId: normalizedUserId,
-      url: apiUrl
+      url: apiUrl,
+      suppressAlertEmail: Boolean(options.suppressAlertEmail)
     }
 
     console.info('开始删除 ChatGPT 成员', deleteLogContext)
@@ -935,7 +1048,10 @@ export async function deleteAccountUser(accountId, userId, options = {}) {
       })
     }
 
-    const usersData = await requestAccountUsers(acc, options.userListParams, { proxy: options.proxy })
+    const usersData = await requestAccountUsers(acc, options.userListParams, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    })
 
     const db = await getDatabase()
     db.run(
@@ -984,7 +1100,8 @@ export async function inviteAccountUser(accountId, email, options = {}) {
       accountId: acc.id,
       chatgptAccountId: acc.chatgptAccountId,
       email: trimmedEmail,
-      url: apiUrl
+      url: apiUrl,
+      suppressAlertEmail: Boolean(options.suppressAlertEmail)
     }
 
     const { status, text } = await requestChatgptText(

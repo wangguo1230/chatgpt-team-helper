@@ -10,19 +10,21 @@ const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORD
 
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'no-warranty' || normalized === 'nowarranty') return ORDER_TYPE_NO_WARRANTY
+  if (normalized === 'anti-ban') return ORDER_TYPE_ANTI_BAN
   return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
 }
 
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
 
-const DEFAULT_WARRANTY_SERVICE_DAYS = Math.max(0, toInt(process.env.PURCHASE_SERVICE_DAYS, 30))
-const DEFAULT_NO_WARRANTY_SERVICE_DAYS = Math.max(
+const getDefaultWarrantyServiceDays = () => Math.max(0, toInt(process.env.PURCHASE_SERVICE_DAYS, 30))
+const getDefaultNoWarrantyServiceDays = () => Math.max(
   0,
-  toInt(process.env.PURCHASE_NO_WARRANTY_SERVICE_DAYS, DEFAULT_WARRANTY_SERVICE_DAYS)
+  toInt(process.env.PURCHASE_NO_WARRANTY_SERVICE_DAYS, getDefaultWarrantyServiceDays())
 )
 
 const resolveDefaultServiceDays = (orderType) => (
-  isNoWarrantyOrderType(orderType) ? DEFAULT_NO_WARRANTY_SERVICE_DAYS : DEFAULT_WARRANTY_SERVICE_DAYS
+  isNoWarrantyOrderType(orderType) ? getDefaultNoWarrantyServiceDays() : getDefaultWarrantyServiceDays()
 )
 
 const pad2 = (value) => String(value).padStart(2, '0')
@@ -83,7 +85,7 @@ export function resolveOrderDeadlineMs(db, { originalCodeId, originalCode, redee
     if (val != null) rcServiceDays = toInt(val, null)
   }
 
-  // 3. 尝试从 purchase_orders 订单表获取（权重更高，代表实际交易）
+  // 3. 尝试从 purchase_orders 订单表获取（仅兜底，不覆盖兑换码创建时配置）
   let orderMetaResult
   if (Number.isFinite(codeId) && codeId > 0 && sanitizedCode) {
     orderMetaResult = db.exec(
@@ -124,10 +126,14 @@ export function resolveOrderDeadlineMs(db, { originalCodeId, originalCode, redee
 
   const orderMetaRow = orderMetaResult?.[0]?.values?.[0] || null
 
-  // 优先级：订单表预设 > 兑换码表预设 > 全局配置文件默认值
-  const resolvedServiceDays = orderMetaRow
-    ? Math.max(0, toInt(orderMetaRow[0], rcServiceDays ?? defaultServiceDays))
-    : (rcServiceDays ?? defaultServiceDays)
+  // 优先级：兑换码表预设 > 订单表预设(兜底) > 全局默认值
+  const resolvedServiceDays = rcServiceDays != null
+    ? Math.max(0, rcServiceDays)
+    : (
+      orderMetaRow
+        ? Math.max(0, toInt(orderMetaRow[0], defaultServiceDays))
+        : defaultServiceDays
+    )
 
   const orderStartAt = orderMetaRow?.[1] || orderMetaRow?.[2] || orderMetaRow?.[3] || redeemedAt
   const orderDeadlineDate = addDays(orderStartAt, resolvedServiceDays)

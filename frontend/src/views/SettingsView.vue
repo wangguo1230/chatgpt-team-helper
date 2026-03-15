@@ -1,7 +1,20 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { authService, userService, adminService, versionService, purchaseService } from '@/services/api'
-import type { VersionInfo, LatestVersionInfo, Channel, PurchaseProduct, PurchaseMeta, PurchaseOrderType } from '@/services/api'
+import type {
+  VersionInfo,
+  LatestVersionInfo,
+  Channel,
+  PurchaseProduct,
+  PurchaseMeta,
+  PurchaseOrderType,
+  PurchaseProductCategory,
+  PurchaseDeliveryMode,
+  PurchaseFulfillmentMode,
+  PurchaseProductItem,
+  PurchaseProductRedeemCode
+} from '@/services/api'
 import { useAppConfigStore } from '@/stores/appConfig'
 import {
   Card,
@@ -34,6 +47,7 @@ import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw, 
 const teleportReady = ref(false)
 const activeTab = ref<'settings' | 'announcements'>('settings')
 const settingsSubTab = ref('general')
+const route = useRoute()
 
 const settingsNav = [
   { id: 'general', label: '基础设置', desc: '功能开关、白名单与补录', icon: Settings },
@@ -44,6 +58,19 @@ const settingsNav = [
 ]
 
 const activeNavItem = computed(() => settingsNav.find(n => n.id === settingsSubTab.value))
+const settingsSubTabIds = new Set(settingsNav.map(item => item.id))
+
+const applySettingsSubTabFromRoute = () => {
+  const rawSubTab = route.query?.subTab ?? route.query?.tab ?? (route.meta as any)?.settingsSubTab
+  const subTab = String(rawSubTab || '').trim()
+  if (settingsSubTabIds.has(subTab)) {
+    settingsSubTab.value = subTab
+    return
+  }
+  if (String(route.name || '') === 'ldc-shop-products') {
+    settingsSubTab.value = 'billing'
+  }
+}
 
 // 版本检查相关
 const versionLoading = ref(false)
@@ -142,10 +169,31 @@ const purchaseProductFormName = ref('')
 const purchaseProductFormAmount = ref('')
 const purchaseProductFormServiceDays = ref('30')
 const purchaseProductFormOrderType = ref<PurchaseOrderType>('warranty')
+const purchaseProductFormCategory = ref<PurchaseProductCategory>('code')
+const purchaseProductFormDeliveryMode = ref<PurchaseDeliveryMode>('email')
+const purchaseProductFormFulfillmentMode = ref<PurchaseFulfillmentMode>('item_pool')
+const purchaseProductFormRedeemProvider = ref('yyl')
 const purchaseProductFormCodeChannels = ref('')
 const purchaseProductFormIsActive = ref(true)
 const purchaseProductFormSortOrder = ref('0')
 const purchaseAvailability = ref<Record<string, number>>({})
+const purchaseItemDialogOpen = ref(false)
+const purchaseItemDialogProduct = ref<PurchaseProduct | null>(null)
+const purchaseItems = ref<PurchaseProductItem[]>([])
+const purchaseItemsLoading = ref(false)
+const purchaseItemsError = ref('')
+const purchaseItemsSuccess = ref('')
+const purchaseItemIncludeContent = ref(true)
+const purchaseItemFormMode = ref<'create' | 'edit'>('create')
+const purchaseItemEditingId = ref<number | null>(null)
+const purchaseItemFormContent = ref('')
+const purchaseItemFormPreview = ref('')
+const purchaseItemFormStatus = ref<'available' | 'offline'>('available')
+const purchaseItemStatusCount = ref<Record<string, number>>({})
+const purchaseRedeemCodes = ref<PurchaseProductRedeemCode[]>([])
+const purchaseRedeemCodesLoading = ref(false)
+const purchaseRedeemCodesImportText = ref('')
+const purchaseRedeemCodeImporting = ref(false)
 
 // 邮箱后缀白名单
 const emailDomainWhitelist = ref('')
@@ -155,9 +203,24 @@ const emailDomainWhitelistLoading = ref(false)
 
 // 兑换码设置（仅超级管理员）
 const redemptionBatchCreateMaxCount = ref('5')
+const redemptionLowStockThreshold = ref('0')
+const redemptionLowStockTestLoading = ref(false)
+const redemptionLowStockTestResult = ref<{
+  sent: boolean
+  threshold: number
+  lowStockChannels: Array<{ channel: string; channelName: string; availableCount: number }>
+} | null>(null)
 const redemptionCodeSettingsError = ref('')
 const redemptionCodeSettingsSuccess = ref('')
 const redemptionCodeSettingsLoading = ref(false)
+
+// ENV 配置同步（仅超级管理员）
+const envConfigRawText = ref('')
+const envConfigFilePath = ref('')
+const envConfigError = ref('')
+const envConfigSuccess = ref('')
+const envConfigLoading = ref(false)
+const envConfigSyncing = ref(false)
 
 // 积分提现设置（仅超级管理员）
 const pointsWithdrawRatePoints = ref('1')
@@ -246,6 +309,7 @@ const telegramLoading = ref(false)
 const showTelegramBotToken = ref(false)
 
 onMounted(async () => {
+  applySettingsSubTabFromRoute()
   await nextTick()
   teleportReady.value = !!document.getElementById('header-actions')
 
@@ -259,6 +323,7 @@ onMounted(async () => {
     loadPurchaseAvailability(),
     loadEmailDomainWhitelist(),
     loadRedemptionCodeSettings(),
+    loadEnvConfigs(),
     loadPointsWithdrawSettings(),
     loadSmtpSettings(),
     loadLinuxDoOAuthSettings(),
@@ -272,6 +337,13 @@ onMounted(async () => {
 onUnmounted(() => {
   teleportReady.value = false
 })
+
+watch(
+  () => route.fullPath,
+  () => {
+    applySettingsSubTabFromRoute()
+  }
+)
 
 const loadApiKey = async () => {
   try {
@@ -510,6 +582,10 @@ const openCreatePurchaseProductDialog = () => {
   purchaseProductFormAmount.value = ''
   purchaseProductFormServiceDays.value = '30'
   purchaseProductFormOrderType.value = 'warranty'
+  purchaseProductFormCategory.value = 'code'
+  purchaseProductFormDeliveryMode.value = 'email'
+  purchaseProductFormFulfillmentMode.value = 'item_pool'
+  purchaseProductFormRedeemProvider.value = 'yyl'
   purchaseProductFormCodeChannels.value = 'paypal,common'
   purchaseProductFormIsActive.value = true
   purchaseProductFormSortOrder.value = '0'
@@ -523,6 +599,10 @@ const openEditPurchaseProductDialog = (product: PurchaseProduct) => {
   purchaseProductFormAmount.value = product.amount
   purchaseProductFormServiceDays.value = String(product.serviceDays ?? 30)
   purchaseProductFormOrderType.value = product.orderType
+  purchaseProductFormCategory.value = (product.category || 'code') as PurchaseProductCategory
+  purchaseProductFormDeliveryMode.value = (product.deliveryMode || 'email') as PurchaseDeliveryMode
+  purchaseProductFormFulfillmentMode.value = (product.fulfillmentMode || 'item_pool') as PurchaseFulfillmentMode
+  purchaseProductFormRedeemProvider.value = String(product.redeemProvider || 'yyl') || 'yyl'
   purchaseProductFormCodeChannels.value = product.codeChannels
   purchaseProductFormIsActive.value = Boolean(product.isActive)
   purchaseProductFormSortOrder.value = String(product.sortOrder ?? 0)
@@ -539,7 +619,13 @@ const submitPurchaseProductDialog = async () => {
     amount: purchaseProductFormAmount.value.trim(),
     serviceDays: Number.parseInt(purchaseProductFormServiceDays.value || '0', 10),
     orderType: purchaseProductFormOrderType.value,
-    codeChannels: purchaseProductFormCodeChannels.value.trim(),
+    category: purchaseProductFormCategory.value,
+    deliveryMode: purchaseProductFormDeliveryMode.value,
+    fulfillmentMode: purchaseProductFormCategory.value === 'ldc_shop' ? purchaseProductFormFulfillmentMode.value : 'item_pool',
+    redeemProvider: purchaseProductFormCategory.value === 'ldc_shop' && purchaseProductFormFulfillmentMode.value === 'redeem_api'
+      ? purchaseProductFormRedeemProvider.value.trim() || 'yyl'
+      : '',
+    codeChannels: purchaseProductFormCategory.value === 'code' ? purchaseProductFormCodeChannels.value.trim() : '',
     isActive: purchaseProductFormIsActive.value,
     sortOrder: Number.parseInt(purchaseProductFormSortOrder.value || '0', 10) || 0,
   }
@@ -585,6 +671,225 @@ const deletePurchaseProduct = async (product: PurchaseProduct) => {
     purchaseProductsError.value = err.response?.data?.error || '删除失败'
   }
 }
+
+const isLdcShopProduct = (product: PurchaseProduct | null | undefined) => (product?.category || 'code') === 'ldc_shop'
+const getProductFulfillmentMode = (product: PurchaseProduct | null | undefined): PurchaseFulfillmentMode => {
+  return (product?.fulfillmentMode || 'item_pool') as PurchaseFulfillmentMode
+}
+const isRedeemApiProduct = (product: PurchaseProduct | null | undefined) => getProductFulfillmentMode(product) === 'redeem_api'
+const getFulfillmentModeLabel = (mode: PurchaseFulfillmentMode | string | null | undefined) => {
+  const normalized = String(mode || 'item_pool').trim().toLowerCase()
+  if (normalized === 'redeem_api') return '兑换码池（自动发卡）'
+  return '条目池（手工条目）'
+}
+const getFulfillmentModeTip = (mode: PurchaseFulfillmentMode | string | null | undefined) => {
+  const normalized = String(mode || 'item_pool').trim().toLowerCase()
+  if (normalized === 'redeem_api') return '支持批量导入兑换码'
+  return '不显示兑换码批量导入框'
+}
+
+const resetPurchaseItemForm = () => {
+  purchaseItemFormMode.value = 'create'
+  purchaseItemEditingId.value = null
+  purchaseItemFormContent.value = ''
+  purchaseItemFormPreview.value = ''
+  purchaseItemFormStatus.value = 'available'
+  purchaseRedeemCodesImportText.value = ''
+}
+
+const loadPurchaseItems = async () => {
+  const product = purchaseItemDialogProduct.value
+  if (!product?.productKey) return
+  if (isRedeemApiProduct(product)) {
+    purchaseRedeemCodesLoading.value = true
+    purchaseItemsError.value = ''
+    try {
+      const response = await adminService.getPurchaseProductRedeemCodes(product.productKey, {
+        page: 1,
+        pageSize: 300,
+        includeCode: true
+      })
+      purchaseRedeemCodes.value = Array.isArray(response.codes) ? response.codes : []
+      purchaseItemStatusCount.value = response.statusCount || {}
+    } catch (err: any) {
+      purchaseItemsError.value = err.response?.data?.error || '加载兑换码失败'
+    } finally {
+      purchaseRedeemCodesLoading.value = false
+    }
+    return
+  }
+  purchaseItemsLoading.value = true
+  purchaseItemsError.value = ''
+  try {
+    const response = await adminService.getPurchaseProductItems(product.productKey, {
+      page: 1,
+      pageSize: 200,
+      includeContent: purchaseItemIncludeContent.value
+    })
+    purchaseItems.value = Array.isArray(response.items) ? response.items : []
+    purchaseItemStatusCount.value = response.statusCount || {}
+  } catch (err: any) {
+    purchaseItemsError.value = err.response?.data?.error || '加载条目失败'
+  } finally {
+    purchaseItemsLoading.value = false
+  }
+}
+
+const openPurchaseItemDialog = async (product: PurchaseProduct) => {
+  if (!isLdcShopProduct(product)) return
+  purchaseItemDialogProduct.value = product
+  purchaseItems.value = []
+  purchaseRedeemCodes.value = []
+  purchaseItemStatusCount.value = {}
+  purchaseItemsError.value = ''
+  purchaseItemsSuccess.value = ''
+  resetPurchaseItemForm()
+  purchaseItemDialogOpen.value = true
+  await loadPurchaseItems()
+}
+
+const openEditPurchaseItem = (item: PurchaseProductItem) => {
+  purchaseItemFormMode.value = 'edit'
+  purchaseItemEditingId.value = item.id
+  purchaseItemFormContent.value = item.content || ''
+  purchaseItemFormPreview.value = item.previewText || ''
+  purchaseItemFormStatus.value = item.status === 'offline' ? 'offline' : 'available'
+}
+
+const submitPurchaseItemForm = async () => {
+  const product = purchaseItemDialogProduct.value
+  if (!product?.productKey) return
+
+  if (isRedeemApiProduct(product)) {
+    const codesText = purchaseRedeemCodesImportText.value.trim()
+    if (!codesText) {
+      purchaseItemsError.value = '请输入兑换码（每行一条）'
+      return
+    }
+    purchaseItemsError.value = ''
+    purchaseItemsSuccess.value = ''
+    purchaseRedeemCodeImporting.value = true
+    try {
+      const result = await adminService.importPurchaseProductRedeemCodes(product.productKey, {
+        codesText,
+        provider: product.redeemProvider || 'yyl'
+      })
+      purchaseItemsSuccess.value = `导入完成：新增 ${result.added}，跳过 ${result.skipped}`
+      purchaseRedeemCodesImportText.value = ''
+      await Promise.all([loadPurchaseItems(), loadPurchaseProducts()])
+      setTimeout(() => (purchaseItemsSuccess.value = ''), 2500)
+    } catch (err: any) {
+      purchaseItemsError.value = err.response?.data?.error || '导入兑换码失败'
+    } finally {
+      purchaseRedeemCodeImporting.value = false
+    }
+    return
+  }
+
+  const content = purchaseItemFormContent.value.trim()
+  if (!content) {
+    purchaseItemsError.value = '请输入条目内容'
+    return
+  }
+
+  purchaseItemsError.value = ''
+  purchaseItemsSuccess.value = ''
+  try {
+    if (purchaseItemFormMode.value === 'create') {
+      await adminService.createPurchaseProductItem(product.productKey, {
+        content,
+        previewText: purchaseItemFormPreview.value.trim() || undefined,
+        status: purchaseItemFormStatus.value
+      })
+      purchaseItemsSuccess.value = '条目已新增'
+    } else if (purchaseItemEditingId.value) {
+      await adminService.updatePurchaseProductItem(product.productKey, purchaseItemEditingId.value, {
+        content,
+        previewText: purchaseItemFormPreview.value.trim() || undefined,
+        status: purchaseItemFormStatus.value
+      })
+      purchaseItemsSuccess.value = '条目已更新'
+    }
+    resetPurchaseItemForm()
+    await Promise.all([loadPurchaseItems(), loadPurchaseProducts()])
+    setTimeout(() => (purchaseItemsSuccess.value = ''), 2500)
+  } catch (err: any) {
+    purchaseItemsError.value = err.response?.data?.error || '保存条目失败'
+  }
+}
+
+const deletePurchaseItem = async (item: PurchaseProductItem) => {
+  const product = purchaseItemDialogProduct.value
+  if (!product?.productKey) return
+  if (!confirm('确定删除该条目吗？')) return
+  purchaseItemsError.value = ''
+  purchaseItemsSuccess.value = ''
+  try {
+    await adminService.deletePurchaseProductItem(product.productKey, item.id)
+    await Promise.all([loadPurchaseItems(), loadPurchaseProducts()])
+    purchaseItemsSuccess.value = '条目已删除'
+    setTimeout(() => (purchaseItemsSuccess.value = ''), 2500)
+  } catch (err: any) {
+    purchaseItemsError.value = err.response?.data?.error || '删除条目失败'
+  }
+}
+
+const togglePurchaseRedeemCodeStatus = async (code: PurchaseProductRedeemCode) => {
+  const product = purchaseItemDialogProduct.value
+  if (!product?.productKey) return
+  const nextStatus = code.status === 'offline' ? 'available' : 'offline'
+  purchaseItemsError.value = ''
+  purchaseItemsSuccess.value = ''
+  try {
+    await adminService.updatePurchaseProductRedeemCode(product.productKey, code.id, { status: nextStatus })
+    await Promise.all([loadPurchaseItems(), loadPurchaseProducts()])
+    purchaseItemsSuccess.value = '兑换码状态已更新'
+    setTimeout(() => (purchaseItemsSuccess.value = ''), 2500)
+  } catch (err: any) {
+    purchaseItemsError.value = err.response?.data?.error || '更新兑换码状态失败'
+  }
+}
+
+const deletePurchaseRedeemCode = async (code: PurchaseProductRedeemCode) => {
+  const product = purchaseItemDialogProduct.value
+  if (!product?.productKey) return
+  if (!confirm(`确定删除兑换码「${code.codeMasked || code.id}」吗？`)) return
+  purchaseItemsError.value = ''
+  purchaseItemsSuccess.value = ''
+  try {
+    await adminService.deletePurchaseProductRedeemCode(product.productKey, code.id)
+    await Promise.all([loadPurchaseItems(), loadPurchaseProducts()])
+    purchaseItemsSuccess.value = '兑换码已删除'
+    setTimeout(() => (purchaseItemsSuccess.value = ''), 2500)
+  } catch (err: any) {
+    purchaseItemsError.value = err.response?.data?.error || '删除兑换码失败'
+  }
+}
+
+watch(purchaseItemIncludeContent, () => {
+  if (!purchaseItemDialogOpen.value) return
+  if (isRedeemApiProduct(purchaseItemDialogProduct.value)) return
+  void loadPurchaseItems()
+})
+
+watch(purchaseProductFormCategory, (next) => {
+  if (next === 'code' && !purchaseProductFormCodeChannels.value.trim()) {
+    purchaseProductFormCodeChannels.value = 'paypal,common'
+    purchaseProductFormFulfillmentMode.value = 'item_pool'
+  }
+  if (next === 'ldc_shop') {
+    purchaseProductFormCodeChannels.value = ''
+    if (!purchaseProductFormFulfillmentMode.value) {
+      purchaseProductFormFulfillmentMode.value = 'item_pool'
+    }
+  }
+})
+
+watch(purchaseProductFormFulfillmentMode, (next) => {
+  if (next === 'redeem_api' && !purchaseProductFormRedeemProvider.value.trim()) {
+    purchaseProductFormRedeemProvider.value = 'yyl'
+  }
+})
 
 const handleUpdateApiKey = async () => {
   apiKeyError.value = ''
@@ -693,9 +998,11 @@ const saveEmailDomainWhitelist = async () => {
 const loadRedemptionCodeSettings = async () => {
   redemptionCodeSettingsError.value = ''
   redemptionCodeSettingsSuccess.value = ''
+  redemptionLowStockTestResult.value = null
   try {
     const response = await adminService.getRedemptionCodeSettings()
     redemptionBatchCreateMaxCount.value = String(response.settings?.batchCreateMaxCount ?? response.effective?.batchCreateMaxCount ?? 5)
+    redemptionLowStockThreshold.value = String(response.settings?.lowStockThreshold ?? response.effective?.lowStockThreshold ?? 0)
   } catch (err: any) {
     redemptionCodeSettingsError.value = err.response?.data?.error || '加载兑换码设置失败'
   }
@@ -704,24 +1011,138 @@ const loadRedemptionCodeSettings = async () => {
 const saveRedemptionCodeSettings = async () => {
   redemptionCodeSettingsError.value = ''
   redemptionCodeSettingsSuccess.value = ''
+  redemptionLowStockTestResult.value = null
   redemptionCodeSettingsLoading.value = true
   try {
-    const parsed = Number.parseInt(redemptionBatchCreateMaxCount.value, 10)
-    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 1000) {
+    const parsedBatchCreateMaxCount = Number.parseInt(redemptionBatchCreateMaxCount.value, 10)
+    if (!Number.isFinite(parsedBatchCreateMaxCount) || parsedBatchCreateMaxCount < 1 || parsedBatchCreateMaxCount > 1000) {
       redemptionCodeSettingsError.value = '单次创建上限必须在 1-1000 之间'
+      return
+    }
+    const parsedLowStockThreshold = Number.parseInt(redemptionLowStockThreshold.value, 10)
+    if (!Number.isFinite(parsedLowStockThreshold) || parsedLowStockThreshold < 0 || parsedLowStockThreshold > 100000) {
+      redemptionCodeSettingsError.value = '补货阈值必须在 0-100000 之间'
       return
     }
 
     const response = await adminService.updateRedemptionCodeSettings({
-      batchCreateMaxCount: parsed
+      batchCreateMaxCount: parsedBatchCreateMaxCount,
+      lowStockThreshold: parsedLowStockThreshold
     })
-    redemptionBatchCreateMaxCount.value = String(response.settings?.batchCreateMaxCount ?? parsed)
+    redemptionBatchCreateMaxCount.value = String(response.settings?.batchCreateMaxCount ?? parsedBatchCreateMaxCount)
+    redemptionLowStockThreshold.value = String(response.settings?.lowStockThreshold ?? parsedLowStockThreshold)
     redemptionCodeSettingsSuccess.value = '已保存'
     setTimeout(() => (redemptionCodeSettingsSuccess.value = ''), 3000)
   } catch (err: any) {
     redemptionCodeSettingsError.value = err.response?.data?.error || '保存失败'
   } finally {
     redemptionCodeSettingsLoading.value = false
+  }
+}
+
+const testRedemptionLowStockAlert = async () => {
+  redemptionCodeSettingsError.value = ''
+  redemptionCodeSettingsSuccess.value = ''
+  redemptionLowStockTestLoading.value = true
+  try {
+    const response = await adminService.testRedemptionLowStockAlert()
+    redemptionLowStockTestResult.value = {
+      sent: Boolean(response.sent),
+      threshold: Number(response.threshold || 0),
+      lowStockChannels: Array.isArray(response.lowStockChannels) ? response.lowStockChannels : []
+    }
+    redemptionCodeSettingsSuccess.value = response.message || (response.sent ? '低库存告警邮件已发送' : '测试完成')
+    setTimeout(() => (redemptionCodeSettingsSuccess.value = ''), 3000)
+  } catch (err: any) {
+    redemptionCodeSettingsError.value = err.response?.data?.error || '阈值测试失败'
+  } finally {
+    redemptionLowStockTestLoading.value = false
+  }
+}
+
+const parseEnvConfigTextToEntries = (rawText: string) => {
+  const lines = String(rawText || '').split(/\r?\n/)
+  const keyRegex = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/
+  const entriesByKey = new Map<string, string>()
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trim()
+    if (!line || line.startsWith('#')) continue
+    const index = line.indexOf('=')
+    if (index <= 0) {
+      throw new Error(`无效配置行：${line}`)
+    }
+    const key = line.slice(0, index).trim()
+    const value = line.slice(index + 1)
+    if (!keyRegex.test(key)) {
+      throw new Error(`无效配置键：${key}`)
+    }
+    // 与后端写入行为保持一致：重复 key 以后者为准。
+    entriesByKey.set(key, value)
+  }
+
+  return Array.from(entriesByKey.entries()).map(([key, value]) => ({ key, value }))
+}
+
+const loadEnvConfigs = async () => {
+  envConfigError.value = ''
+  envConfigSuccess.value = ''
+  envConfigLoading.value = true
+  try {
+    const response = await adminService.getEnvConfigs()
+    envConfigFilePath.value = String(response.envFilePath || '')
+    envConfigRawText.value = (response.items || [])
+      .map(item => `${item.key}=${item.value}`)
+      .join('\n')
+  } catch (err: any) {
+    envConfigError.value = err.response?.data?.error || '加载 ENV 配置失败'
+  } finally {
+    envConfigLoading.value = false
+  }
+}
+
+const saveEnvConfigs = async () => {
+  envConfigError.value = ''
+  envConfigSuccess.value = ''
+  envConfigLoading.value = true
+  try {
+    const entries = parseEnvConfigTextToEntries(envConfigRawText.value)
+    const response = await adminService.updateEnvConfigs({ entries })
+    envConfigFilePath.value = String(response.envFilePath || envConfigFilePath.value || '')
+    envConfigRawText.value = (response.items || [])
+      .map(item => `${item.key}=${item.value}`)
+      .join('\n')
+    envConfigSuccess.value = `已保存 ${response.updatedKeys?.length || 0} 项配置`
+    setTimeout(() => (envConfigSuccess.value = ''), 3000)
+  } catch (err: any) {
+    envConfigError.value = err.response?.data?.error || err.message || '保存 ENV 配置失败'
+  } finally {
+    envConfigLoading.value = false
+  }
+}
+
+const syncEnvConfigs = async () => {
+  envConfigError.value = ''
+  envConfigSuccess.value = ''
+  envConfigSyncing.value = true
+  try {
+    const response = await adminService.syncEnvConfigs()
+    envConfigSuccess.value = response.message || '已同步 .env 到运行时配置'
+    setTimeout(() => (envConfigSuccess.value = ''), 3000)
+    await Promise.all([
+      loadRedemptionCodeSettings(),
+      loadSmtpSettings(),
+      loadLinuxDoOAuthSettings(),
+      loadLinuxDoCreditSettings(),
+      loadZpaySettings(),
+      loadTurnstileSettings(),
+      loadTelegramSettings(),
+      loadEnvConfigs()
+    ])
+  } catch (err: any) {
+    envConfigError.value = err.response?.data?.error || '同步 ENV 配置失败'
+  } finally {
+    envConfigSyncing.value = false
   }
 }
 
@@ -1460,27 +1881,42 @@ const savePointsWithdrawSettings = async () => {
         </CardContent>
       </Card>
 
-      <!-- 兑换码创建上限 -->
+      <!-- 兑换码创建与阈值 -->
       <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
-          <CardTitle class="text-xl font-bold text-gray-900">兑换码创建上限</CardTitle>
+          <CardTitle class="text-xl font-bold text-gray-900">兑换码创建与阈值</CardTitle>
           <CardDescription class="text-gray-500">
-            控制“批量生成兑换码”单次可提交的最大数量。默认 5，可在系统设置覆盖；未配置时使用环境变量。
+            控制批量创建上限与低库存补货阈值。阈值按渠道校验，低于阈值会触发汇总告警邮件。
           </CardDescription>
         </CardHeader>
         <CardContent class="p-6 sm:p-8 space-y-5 flex-1">
-          <div class="space-y-2">
-            <Label for="redemptionBatchCreateMaxCount" class="text-xs font-semibold text-gray-500 uppercase tracking-wider">单次创建最大数量</Label>
-            <Input
-              id="redemptionBatchCreateMaxCount"
-              v-model="redemptionBatchCreateMaxCount"
-              type="number"
-              min="1"
-              max="1000"
-              placeholder="5"
-              class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
-            />
-            <p class="text-xs text-gray-400">建议值：5（满足常见 Team 名额分配场景）。</p>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="space-y-2">
+              <Label for="redemptionBatchCreateMaxCount" class="text-xs font-semibold text-gray-500 uppercase tracking-wider">单次创建最大数量</Label>
+              <Input
+                id="redemptionBatchCreateMaxCount"
+                v-model="redemptionBatchCreateMaxCount"
+                type="number"
+                min="1"
+                max="1000"
+                placeholder="5"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+              />
+              <p class="text-xs text-gray-400">建议值：5（满足常见 Team 名额分配场景）。</p>
+            </div>
+            <div class="space-y-2">
+              <Label for="redemptionLowStockThreshold" class="text-xs font-semibold text-gray-500 uppercase tracking-wider">低库存补货阈值</Label>
+              <Input
+                id="redemptionLowStockThreshold"
+                v-model="redemptionLowStockThreshold"
+                type="number"
+                min="0"
+                max="100000"
+                placeholder="0"
+                class="h-11 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all font-mono text-sm"
+              />
+              <p class="text-xs text-gray-400">0 表示关闭阈值告警；大于 0 时按“可用兑换码数 &lt; 阈值”触发。</p>
+            </div>
           </div>
 
           <div v-if="redemptionCodeSettingsError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
@@ -1489,6 +1925,18 @@ const savePointsWithdrawSettings = async () => {
 
           <div v-if="redemptionCodeSettingsSuccess" class="rounded-xl bg-green-50 p-4 text-green-600 border border-green-100 text-sm font-medium">
             {{ redemptionCodeSettingsSuccess }}
+          </div>
+
+          <div v-if="redemptionLowStockTestResult" class="rounded-xl border border-blue-100 bg-blue-50/40 p-4 text-sm text-blue-900 space-y-2">
+            <p class="font-semibold">测试结果：阈值 {{ redemptionLowStockTestResult.threshold }}（{{ redemptionLowStockTestResult.sent ? '已发送邮件' : '未发送邮件' }}）</p>
+            <ul class="list-disc pl-5 space-y-1">
+              <li v-for="item in redemptionLowStockTestResult.lowStockChannels" :key="item.channel">
+                {{ item.channelName }}（{{ item.channel }}）：可用 {{ item.availableCount }}
+              </li>
+              <li v-if="!redemptionLowStockTestResult.lowStockChannels.length" class="list-none text-blue-700">
+                当前没有低于阈值的渠道。
+              </li>
+            </ul>
           </div>
 
           <div class="flex flex-col sm:flex-row gap-3">
@@ -1502,11 +1950,87 @@ const savePointsWithdrawSettings = async () => {
             </Button>
             <Button
               type="button"
+              variant="outline"
+              :disabled="redemptionLowStockTestLoading"
+              class="w-full sm:w-auto h-11 px-4 border-blue-200 text-blue-700 rounded-xl"
+              @click="testRedemptionLowStockAlert"
+            >
+              {{ redemptionLowStockTestLoading ? '测试中...' : '测试阈值告警' }}
+            </Button>
+            <Button
+              type="button"
               :disabled="redemptionCodeSettingsLoading"
               class="w-full h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5"
               @click="saveRedemptionCodeSettings"
             >
               {{ redemptionCodeSettingsLoading ? '保存中...' : '保存兑换码设置' }}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- ENV 配置同步 -->
+      <Card v-if="isSuperAdmin" class="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden flex flex-col lg:col-span-2">
+        <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
+          <CardTitle class="text-xl font-bold text-gray-900">ENV 配置同步</CardTitle>
+          <CardDescription class="text-gray-500">
+            可视化查看 `.env`，支持新增/修改配置，并同步到当前运行时（部分配置仍需重启服务生效）。
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="p-6 sm:p-8 space-y-5 flex-1">
+          <div class="space-y-2">
+            <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">ENV 文件路径</Label>
+            <Input
+              :model-value="envConfigFilePath"
+              readonly
+              class="h-11 bg-gray-50 border-gray-200 rounded-xl font-mono text-xs"
+            />
+          </div>
+
+          <div class="space-y-2">
+            <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">配置内容（KEY=VALUE）</Label>
+            <textarea
+              v-model="envConfigRawText"
+              rows="14"
+              class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-xs leading-5 focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none"
+              placeholder="例如：REDEMPTION_LOW_STOCK_THRESHOLD=10"
+            />
+            <p class="text-xs text-gray-400">支持注释行（`#` 开头）；重复 key 以后者为准。</p>
+          </div>
+
+          <div v-if="envConfigError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
+            {{ envConfigError }}
+          </div>
+          <div v-if="envConfigSuccess" class="rounded-xl bg-green-50 p-4 text-green-600 border border-green-100 text-sm font-medium">
+            {{ envConfigSuccess }}
+          </div>
+
+          <div class="flex flex-col sm:flex-row gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 px-4 border-gray-200 rounded-xl"
+              :disabled="envConfigLoading || envConfigSyncing"
+              @click="loadEnvConfigs"
+            >
+              {{ envConfigLoading ? '刷新中...' : '刷新 ENV' }}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              class="w-full sm:w-auto h-11 px-4 border-blue-200 text-blue-700 rounded-xl"
+              :disabled="envConfigLoading || envConfigSyncing"
+              @click="syncEnvConfigs"
+            >
+              {{ envConfigSyncing ? '同步中...' : '同步到运行时' }}
+            </Button>
+            <Button
+              type="button"
+              class="w-full h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5"
+              :disabled="envConfigLoading || envConfigSyncing"
+              @click="saveEnvConfigs"
+            >
+              {{ envConfigLoading ? '保存中...' : '保存 ENV 配置' }}
             </Button>
           </div>
         </CardContent>
@@ -1763,7 +2287,7 @@ const savePointsWithdrawSettings = async () => {
         <CardHeader class="border-b border-gray-50 bg-gray-50/30 px-6 py-5 sm:px-8 sm:py-6">
           <CardTitle class="text-xl font-bold text-gray-900">支付商品管理</CardTitle>
           <CardDescription class="text-gray-500">
-            配置商品价格/服务期/订单类型以及渠道优先级（codeChannels），下单时系统会按优先级自动匹配有库存的渠道并锁定。
+            支持两类商品：`code`（兑换码支付）与 `ldc_shop`（LDC 商品小店）。LDC 商品可配置 `item_pool` 条目池交付或 `redeem_api` 自动发卡。
           </CardDescription>
         </CardHeader>
         <CardContent class="p-6 sm:p-8 space-y-5 flex-1">
@@ -1774,6 +2298,13 @@ const savePointsWithdrawSettings = async () => {
             <Button type="button" class="w-full h-11 rounded-xl bg-black hover:bg-gray-800 text-white shadow-lg shadow-black/5" @click="openCreatePurchaseProductDialog">
               新增商品
             </Button>
+          </div>
+
+          <div class="rounded-xl border border-blue-100 bg-blue-50/40 p-4 text-sm text-blue-900 space-y-1">
+            <p class="font-semibold">LDC 自动发卡快速路径</p>
+            <p>1）新增/编辑商品时设置：`category=ldc_shop`、`fulfillmentMode=redeem_api`。</p>
+            <p>2）回到列表点击“兑换码池（批量导入）”。</p>
+            <p>3）在弹窗中按“每行一条”批量导入兑换码。</p>
           </div>
 
           <div v-if="purchaseProductsError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">
@@ -1789,9 +2320,12 @@ const savePointsWithdrawSettings = async () => {
                 <tr class="text-left text-gray-500">
                   <th class="px-4 py-3 font-semibold">Key</th>
                   <th class="px-4 py-3 font-semibold">名称</th>
+                  <th class="px-4 py-3 font-semibold">分类</th>
                   <th class="px-4 py-3 font-semibold">价格</th>
                   <th class="px-4 py-3 font-semibold">服务期</th>
-                  <th class="px-4 py-3 font-semibold">类型</th>
+                  <th class="px-4 py-3 font-semibold">订单类型</th>
+                  <th class="px-4 py-3 font-semibold">交付方式</th>
+                  <th class="px-4 py-3 font-semibold">交付来源</th>
                   <th class="px-4 py-3 font-semibold">渠道策略</th>
                   <th class="px-4 py-3 font-semibold">库存</th>
                   <th class="px-4 py-3 font-semibold">状态</th>
@@ -1802,13 +2336,38 @@ const savePointsWithdrawSettings = async () => {
                 <tr v-for="product in purchaseProducts" :key="product.productKey" class="border-t border-gray-100">
                   <td class="px-4 py-3 font-mono text-gray-900">{{ product.productKey }}</td>
                   <td class="px-4 py-3 text-gray-900">{{ product.productName }}</td>
-                  <td class="px-4 py-3 font-mono text-gray-700">¥ {{ product.amount }}</td>
+                  <td class="px-4 py-3">
+                    <span class="px-2 py-1 rounded-full text-xs font-medium" :class="(product.category || 'code') === 'ldc_shop' ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-700'">
+                      {{ product.category || 'code' }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-3 font-mono text-gray-700">{{ (product.category || 'code') === 'ldc_shop' ? `${product.amount} Credit` : `¥ ${product.amount}` }}</td>
                   <td class="px-4 py-3 text-gray-700">{{ product.serviceDays }} 天</td>
                   <td class="px-4 py-3">
                     <span class="px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700">{{ product.orderType }}</span>
                   </td>
-                  <td class="px-4 py-3 font-mono text-gray-700">{{ product.codeChannels }}</td>
-                  <td class="px-4 py-3 font-mono text-gray-700">{{ purchaseAvailability[product.productKey] ?? '-' }}</td>
+                  <td class="px-4 py-3">
+                    <span class="px-2 py-1 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">{{ product.deliveryMode || 'email' }}</span>
+                  </td>
+                  <td class="px-4 py-3">
+                    <span class="px-2 py-1 rounded-full text-xs font-medium" :class="(product.fulfillmentMode || 'item_pool') === 'redeem_api' ? 'bg-indigo-50 text-indigo-700' : 'bg-slate-100 text-slate-700'">
+                      {{ getFulfillmentModeLabel(product.fulfillmentMode || 'item_pool') }}
+                    </span>
+                    <div class="mt-1 text-xs text-gray-500">
+                      {{ getFulfillmentModeTip(product.fulfillmentMode || 'item_pool') }}
+                    </div>
+                    <div v-if="(product.fulfillmentMode || 'item_pool') === 'redeem_api'" class="mt-1 text-xs text-gray-500 font-mono">
+                      {{ product.redeemProvider || 'yyl' }}
+                    </div>
+                  </td>
+                  <td class="px-4 py-3 font-mono text-gray-700">{{ (product.category || 'code') === 'code' ? product.codeChannels : '-' }}</td>
+                  <td class="px-4 py-3 font-mono text-gray-700">
+                    {{
+                      (product.category || 'code') === 'code'
+                        ? (purchaseAvailability[product.productKey] ?? '-')
+                        : ((product.fulfillmentMode || 'item_pool') === 'redeem_api' ? '兑换码池管理' : '条目池管理')
+                    }}
+                  </td>
                   <td class="px-4 py-3">
                     <span class="px-2 py-1 rounded-full text-xs font-medium" :class="product.isActive ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'">
                       {{ product.isActive ? '上架' : '下架' }}
@@ -1818,6 +2377,15 @@ const savePointsWithdrawSettings = async () => {
                     <div class="flex items-center justify-end gap-2">
                       <Button type="button" variant="outline" class="h-9 px-3 border-gray-200 rounded-xl" @click="openEditPurchaseProductDialog(product)">
                         编辑
+                      </Button>
+                      <Button
+                        v-if="(product.category || 'code') === 'ldc_shop'"
+                        type="button"
+                        variant="outline"
+                        class="h-9 px-3 border-violet-200 text-violet-700 hover:bg-violet-50 rounded-xl"
+                        @click="openPurchaseItemDialog(product)"
+                      >
+                        {{ (product.fulfillmentMode || 'item_pool') === 'redeem_api' ? '兑换码池（批量导入）' : '条目池（手工）' }}
                       </Button>
                       <Button type="button" variant="outline" class="h-9 px-3 border-gray-200 rounded-xl" @click="togglePurchaseProductActive(product)">
                         {{ product.isActive ? '停用' : '启用' }}
@@ -1829,7 +2397,7 @@ const savePointsWithdrawSettings = async () => {
                   </td>
                 </tr>
                 <tr v-if="!purchaseProducts.length">
-                  <td colspan="9" class="px-4 py-6 text-center text-gray-400">暂无商品数据</td>
+                  <td colspan="12" class="px-4 py-6 text-center text-gray-400">暂无商品数据</td>
                 </tr>
               </tbody>
             </table>
@@ -1887,7 +2455,7 @@ const savePointsWithdrawSettings = async () => {
         <DialogContent class="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle class="text-xl font-bold text-gray-900">{{ purchaseProductDialogMode === 'create' ? '新增商品' : '编辑商品' }}</DialogTitle>
-            <DialogDescription class="text-gray-500">codeChannels 按优先级用英文逗号分隔，例如：paypal,common</DialogDescription>
+            <DialogDescription class="text-gray-500">`code` 类商品使用兑换码库存；`ldc_shop` 类商品可选择 `item_pool`（条目池）或 `redeem_api`（兑换码自动发卡）。</DialogDescription>
           </DialogHeader>
 
           <div class="space-y-4 py-4">
@@ -1901,6 +2469,33 @@ const savePointsWithdrawSettings = async () => {
             </div>
             <div class="grid grid-cols-2 gap-3">
               <div class="space-y-2">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">分类（category）</Label>
+                <Select v-model="purchaseProductFormCategory">
+                  <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
+                    <SelectValue placeholder="请选择" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="code">code</SelectItem>
+                    <SelectItem value="ldc_shop">ldc_shop</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div class="space-y-2">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">交付方式（deliveryMode）</Label>
+                <Select v-model="purchaseProductFormDeliveryMode">
+                  <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
+                    <SelectValue placeholder="请选择" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="email">email</SelectItem>
+                    <SelectItem value="inline">inline</SelectItem>
+                    <SelectItem value="both">both</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
                 <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">价格（amount）</Label>
                 <Input v-model="purchaseProductFormAmount" placeholder="15.00" class="h-11 bg-gray-50 border-gray-200 rounded-xl font-mono text-sm" />
               </div>
@@ -1909,7 +2504,25 @@ const savePointsWithdrawSettings = async () => {
                 <Input v-model="purchaseProductFormServiceDays" type="number" class="h-11 bg-gray-50 border-gray-200 rounded-xl font-mono text-sm" />
               </div>
             </div>
-            <div class="space-y-2">
+            <div class="grid grid-cols-2 gap-3" v-if="purchaseProductFormCategory === 'ldc_shop'">
+              <div class="space-y-2">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">交付来源（fulfillmentMode）</Label>
+                <Select v-model="purchaseProductFormFulfillmentMode">
+                  <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
+                    <SelectValue placeholder="请选择" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="item_pool">item_pool（条目池，手工）</SelectItem>
+                    <SelectItem value="redeem_api">redeem_api（兑换码池，批量导入）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div class="space-y-2" v-if="purchaseProductFormFulfillmentMode === 'redeem_api'">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">发卡提供商（redeemProvider）</Label>
+                <Input v-model="purchaseProductFormRedeemProvider" placeholder="yyl" class="h-11 bg-gray-50 border-gray-200 rounded-xl font-mono text-sm" />
+              </div>
+            </div>
+            <div class="space-y-2" v-if="purchaseProductFormCategory === 'code'">
               <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">订单类型（orderType）</Label>
               <Select v-model="purchaseProductFormOrderType">
                 <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
@@ -1922,7 +2535,7 @@ const savePointsWithdrawSettings = async () => {
                 </SelectContent>
               </Select>
             </div>
-            <div class="space-y-2">
+            <div class="space-y-2" v-if="purchaseProductFormCategory === 'code'">
               <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">渠道策略（codeChannels）</Label>
               <Input v-model="purchaseProductFormCodeChannels" placeholder="paypal,common" class="h-11 bg-gray-50 border-gray-200 rounded-xl font-mono text-sm" />
               <p class="text-xs text-gray-400">可用渠道：{{ channels.map(c => c.key).join(', ') || '（暂无）' }}</p>
@@ -1946,6 +2559,202 @@ const savePointsWithdrawSettings = async () => {
                 保存
               </Button>
             </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog v-model:open="purchaseItemDialogOpen">
+        <DialogContent class="sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle class="text-xl font-bold text-gray-900">{{ isRedeemApiProduct(purchaseItemDialogProduct) ? 'LDC 商品兑换码池' : 'LDC 商品条目池' }}</DialogTitle>
+            <DialogDescription class="text-gray-500">
+              商品：{{ purchaseItemDialogProduct?.productName || '-' }}（{{ purchaseItemDialogProduct?.productKey || '-' }}）
+            </DialogDescription>
+          </DialogHeader>
+
+          <div class="space-y-4 py-2">
+            <div class="flex flex-wrap items-center gap-2 text-xs">
+              <span class="px-2 py-1 rounded-full bg-gray-100 text-gray-700">available: {{ purchaseItemStatusCount.available || 0 }}</span>
+              <span class="px-2 py-1 rounded-full bg-amber-100 text-amber-700">reserved: {{ purchaseItemStatusCount.reserved || 0 }}</span>
+              <span v-if="!isRedeemApiProduct(purchaseItemDialogProduct)" class="px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">sold: {{ purchaseItemStatusCount.sold || 0 }}</span>
+              <span v-else class="px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">redeemed: {{ purchaseItemStatusCount.redeemed || 0 }}</span>
+              <span v-if="isRedeemApiProduct(purchaseItemDialogProduct)" class="px-2 py-1 rounded-full bg-rose-100 text-rose-700">invalid: {{ purchaseItemStatusCount.invalid || 0 }}</span>
+              <span v-if="isRedeemApiProduct(purchaseItemDialogProduct)" class="px-2 py-1 rounded-full bg-orange-100 text-orange-700">failed: {{ purchaseItemStatusCount.failed || 0 }}</span>
+              <span class="px-2 py-1 rounded-full bg-slate-100 text-slate-700">offline: {{ purchaseItemStatusCount.offline || 0 }}</span>
+              <label v-if="!isRedeemApiProduct(purchaseItemDialogProduct)" class="ml-auto inline-flex items-center gap-2 text-sm text-gray-600">
+                <input type="checkbox" v-model="purchaseItemIncludeContent" class="rounded border-gray-300" />
+                展示明文内容
+              </label>
+            </div>
+
+            <div v-if="purchaseItemsError" class="rounded-xl bg-red-50 p-3 text-red-600 border border-red-100 text-sm font-medium">
+              {{ purchaseItemsError }}
+            </div>
+            <div v-if="purchaseItemsSuccess" class="rounded-xl bg-green-50 p-3 text-green-600 border border-green-100 text-sm font-medium">
+              {{ purchaseItemsSuccess }}
+            </div>
+
+            <template v-if="!isRedeemApiProduct(purchaseItemDialogProduct)">
+              <div class="rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-sm text-amber-800">
+                当前商品是“条目池（item_pool）”模式，这里不会显示兑换码批量导入框。
+                如需批量导入兑换码，请先在商品编辑中将 `fulfillmentMode` 改为 `redeem_api`。
+              </div>
+              <div class="grid grid-cols-1 lg:grid-cols-5 gap-3">
+                <div class="lg:col-span-3 space-y-2">
+                  <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">条目内容</Label>
+                  <textarea
+                    v-model="purchaseItemFormContent"
+                    class="w-full min-h-[140px] rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-100"
+                    placeholder="可填写任意文本，如卡片信息、账号信息、密钥等。"
+                  />
+                </div>
+                <div class="lg:col-span-2 space-y-3">
+                  <div class="space-y-2">
+                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">预览文本（可选）</Label>
+                    <Input v-model="purchaseItemFormPreview" placeholder="用于后台列表展示" class="h-11 bg-gray-50 border-gray-200 rounded-xl text-sm" />
+                  </div>
+                  <div class="space-y-2">
+                    <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">状态</Label>
+                    <Select v-model="purchaseItemFormStatus">
+                      <SelectTrigger class="h-11 bg-gray-50 border-gray-200 rounded-xl">
+                        <SelectValue placeholder="请选择" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="available">available</SelectItem>
+                        <SelectItem value="offline">offline</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div class="flex gap-2 pt-2">
+                    <Button type="button" variant="outline" class="h-10 px-3 border-gray-200 rounded-xl" @click="resetPurchaseItemForm">
+                      重置
+                    </Button>
+                    <Button type="button" class="h-10 px-3 rounded-xl bg-black hover:bg-gray-800 text-white" @click="submitPurchaseItemForm">
+                      {{ purchaseItemFormMode === 'create' ? '新增条目' : '保存条目' }}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="overflow-x-auto border border-gray-100 rounded-2xl">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50">
+                    <tr class="text-left text-gray-500">
+                      <th class="px-4 py-3 font-semibold">ID</th>
+                      <th class="px-4 py-3 font-semibold">预览</th>
+                      <th class="px-4 py-3 font-semibold">状态</th>
+                      <th class="px-4 py-3 font-semibold">关联订单</th>
+                      <th class="px-4 py-3 font-semibold text-right">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="item in purchaseItems" :key="item.id" class="border-t border-gray-100 align-top">
+                      <td class="px-4 py-3 font-mono text-gray-900">{{ item.id }}</td>
+                      <td class="px-4 py-3">
+                        <div class="text-gray-900 whitespace-pre-wrap break-all">{{ item.previewText || '-' }}</div>
+                        <pre v-if="purchaseItemIncludeContent && item.content" class="mt-2 p-2 rounded bg-gray-50 border border-gray-100 text-xs whitespace-pre-wrap break-all text-gray-600">{{ item.content }}</pre>
+                      </td>
+                      <td class="px-4 py-3">
+                        <span class="px-2 py-1 rounded-full text-xs font-medium" :class="item.status === 'sold' ? 'bg-emerald-50 text-emerald-700' : item.status === 'reserved' ? 'bg-amber-50 text-amber-700' : item.status === 'offline' ? 'bg-slate-100 text-slate-700' : 'bg-blue-50 text-blue-700'">
+                          {{ item.status }}
+                        </span>
+                      </td>
+                      <td class="px-4 py-3 font-mono text-xs text-gray-500">
+                        <div v-if="item.reservedOrderNo">reserved: {{ item.reservedOrderNo }}</div>
+                        <div v-if="item.soldOrderNo">sold: {{ item.soldOrderNo }}</div>
+                        <div v-if="!item.reservedOrderNo && !item.soldOrderNo">-</div>
+                      </td>
+                      <td class="px-4 py-3">
+                        <div class="flex justify-end gap-2">
+                          <Button type="button" variant="outline" class="h-8 px-2 border-gray-200 rounded-lg" :disabled="item.status === 'reserved' || item.status === 'sold'" @click="openEditPurchaseItem(item)">
+                            编辑
+                          </Button>
+                          <Button type="button" variant="outline" class="h-8 px-2 border-red-200 text-red-600 hover:bg-red-50 rounded-lg" :disabled="item.status === 'reserved' || item.status === 'sold'" @click="deletePurchaseItem(item)">
+                            删除
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr v-if="!purchaseItemsLoading && !purchaseItems.length">
+                      <td colspan="5" class="px-4 py-6 text-center text-gray-400">暂无条目</td>
+                    </tr>
+                    <tr v-if="purchaseItemsLoading">
+                      <td colspan="5" class="px-4 py-6 text-center text-gray-400">加载中...</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="space-y-3">
+                <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">批量导入兑换码（每行一条）</Label>
+                <textarea
+                  v-model="purchaseRedeemCodesImportText"
+                  class="w-full min-h-[160px] rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-100"
+                  placeholder="CODE-AAAA-1111&#10;CODE-BBBB-2222"
+                />
+                <div class="flex gap-2">
+                  <Button type="button" variant="outline" class="h-10 px-3 border-gray-200 rounded-xl" @click="purchaseRedeemCodesImportText = ''">
+                    清空
+                  </Button>
+                  <Button type="button" class="h-10 px-3 rounded-xl bg-black hover:bg-gray-800 text-white" :disabled="purchaseRedeemCodeImporting" @click="submitPurchaseItemForm">
+                    {{ purchaseRedeemCodeImporting ? '导入中...' : '批量导入兑换码' }}
+                  </Button>
+                </div>
+              </div>
+
+              <div class="overflow-x-auto border border-gray-100 rounded-2xl">
+                <table class="min-w-full text-sm">
+                  <thead class="bg-gray-50">
+                    <tr class="text-left text-gray-500">
+                      <th class="px-4 py-3 font-semibold">ID</th>
+                      <th class="px-4 py-3 font-semibold">兑换码</th>
+                      <th class="px-4 py-3 font-semibold">提供商</th>
+                      <th class="px-4 py-3 font-semibold">状态</th>
+                      <th class="px-4 py-3 font-semibold">关联订单</th>
+                      <th class="px-4 py-3 font-semibold text-right">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="code in purchaseRedeemCodes" :key="code.id" class="border-t border-gray-100 align-top">
+                      <td class="px-4 py-3 font-mono text-gray-900">{{ code.id }}</td>
+                      <td class="px-4 py-3">
+                        <div class="font-mono text-xs text-gray-900 break-all">{{ code.code || code.codeMasked || '-' }}</div>
+                        <div v-if="code.lastError" class="mt-1 text-xs text-rose-600">{{ code.lastError }}</div>
+                      </td>
+                      <td class="px-4 py-3 font-mono text-xs text-gray-700">{{ code.provider || 'yyl' }}</td>
+                      <td class="px-4 py-3">
+                        <span class="px-2 py-1 rounded-full text-xs font-medium" :class="code.status === 'redeemed' ? 'bg-emerald-50 text-emerald-700' : code.status === 'reserved' ? 'bg-amber-50 text-amber-700' : code.status === 'invalid' ? 'bg-rose-50 text-rose-700' : code.status === 'failed' ? 'bg-orange-50 text-orange-700' : code.status === 'offline' ? 'bg-slate-100 text-slate-700' : 'bg-blue-50 text-blue-700'">
+                          {{ code.status }}
+                        </span>
+                      </td>
+                      <td class="px-4 py-3 font-mono text-xs text-gray-500">
+                        <div v-if="code.reservedOrderNo">reserved: {{ code.reservedOrderNo }}</div>
+                        <div v-if="code.usedOrderNo">used: {{ code.usedOrderNo }}</div>
+                        <div v-if="!code.reservedOrderNo && !code.usedOrderNo">-</div>
+                      </td>
+                      <td class="px-4 py-3">
+                        <div class="flex justify-end gap-2">
+                          <Button type="button" variant="outline" class="h-8 px-2 border-gray-200 rounded-lg" :disabled="code.status === 'reserved' || code.status === 'redeemed'" @click="togglePurchaseRedeemCodeStatus(code)">
+                            {{ code.status === 'offline' ? '启用' : '下线' }}
+                          </Button>
+                          <Button type="button" variant="outline" class="h-8 px-2 border-red-200 text-red-600 hover:bg-red-50 rounded-lg" :disabled="code.status === 'reserved' || code.status === 'redeemed'" @click="deletePurchaseRedeemCode(code)">
+                            删除
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr v-if="!purchaseRedeemCodesLoading && !purchaseRedeemCodes.length">
+                      <td colspan="6" class="px-4 py-6 text-center text-gray-400">暂无兑换码</td>
+                    </tr>
+                    <tr v-if="purchaseRedeemCodesLoading">
+                      <td colspan="6" class="px-4 py-6 text-center text-gray-400">加载中...</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
           </div>
         </DialogContent>
       </Dialog>

@@ -163,14 +163,14 @@ router.get('/invite-summary', authenticateToken, async (req, res) => {
   }
 })
 
-const TEAM_SEAT_COST_POINTS = Math.max(1, toInt(process.env.TEAM_SEAT_COST_POINTS, 15))
-const INVITE_UNLOCK_COST_POINTS = Math.max(1, toInt(process.env.INVITE_UNLOCK_COST_POINTS, 15))
+const getTeamSeatCostPoints = () => Math.max(1, toInt(process.env.TEAM_SEAT_COST_POINTS, 15))
+const getInviteUnlockCostPoints = () => Math.max(1, toInt(process.env.INVITE_UNLOCK_COST_POINTS, 15))
 
-const WITHDRAW_MAX_POINTS_PER_REQUEST = Math.max(0, toInt(process.env.WITHDRAW_MAX_POINTS_PER_REQUEST, 500))
-const WITHDRAW_DAILY_MAX_POINTS = Math.max(0, toInt(process.env.WITHDRAW_DAILY_MAX_POINTS, 500))
-const WITHDRAW_DAILY_MAX_REQUESTS = Math.max(0, toInt(process.env.WITHDRAW_DAILY_MAX_REQUESTS, 3))
-const WITHDRAW_MAX_PENDING = Math.max(0, toInt(process.env.WITHDRAW_MAX_PENDING, 1))
-const WITHDRAW_COOLDOWN_SECONDS = Math.max(0, toInt(process.env.WITHDRAW_COOLDOWN_SECONDS, 60))
+const getWithdrawMaxPointsPerRequest = () => Math.max(0, toInt(process.env.WITHDRAW_MAX_POINTS_PER_REQUEST, 500))
+const getWithdrawDailyMaxPoints = () => Math.max(0, toInt(process.env.WITHDRAW_DAILY_MAX_POINTS, 500))
+const getWithdrawDailyMaxRequests = () => Math.max(0, toInt(process.env.WITHDRAW_DAILY_MAX_REQUESTS, 3))
+const getWithdrawMaxPending = () => Math.max(0, toInt(process.env.WITHDRAW_MAX_PENDING, 1))
+const getWithdrawCooldownSeconds = () => Math.max(0, toInt(process.env.WITHDRAW_COOLDOWN_SECONDS, 60))
 
 const toCashCentsFromPoints = (points, withdrawSettings) => {
   const normalized = Number(points)
@@ -249,11 +249,17 @@ router.get('/points/meta', authenticateToken, async (req, res) => {
       [SEAT_TYPE_DEMOTED]: 0,
     }
     const withdrawSettings = await getPointsWithdrawSettings(db)
+    const seatCostPoints = getTeamSeatCostPoints()
+    const withdrawMaxPointsPerRequest = getWithdrawMaxPointsPerRequest()
+    const withdrawDailyMaxPoints = getWithdrawDailyMaxPoints()
+    const withdrawDailyMaxRequests = getWithdrawDailyMaxRequests()
+    const withdrawMaxPending = getWithdrawMaxPending()
+    const withdrawCooldownSeconds = getWithdrawCooldownSeconds()
 
     res.json({
       points,
       seat: {
-        costPoints: TEAM_SEAT_COST_POINTS,
+        costPoints: seatCostPoints,
         remaining,
         remainingByType,
         defaultType: SEAT_TYPE_UNDEMOTED,
@@ -266,11 +272,11 @@ router.get('/points/meta', authenticateToken, async (req, res) => {
         },
         minPoints: withdrawSettings.minPoints,
         stepPoints: withdrawSettings.stepPoints,
-        maxPointsPerRequest: WITHDRAW_MAX_POINTS_PER_REQUEST,
-        dailyMaxPoints: WITHDRAW_DAILY_MAX_POINTS,
-        dailyMaxRequests: WITHDRAW_DAILY_MAX_REQUESTS,
-        maxPending: WITHDRAW_MAX_PENDING,
-        cooldownSeconds: WITHDRAW_COOLDOWN_SECONDS,
+        maxPointsPerRequest: withdrawMaxPointsPerRequest,
+        dailyMaxPoints: withdrawDailyMaxPoints,
+        dailyMaxRequests: withdrawDailyMaxRequests,
+        maxPending: withdrawMaxPending,
+        cooldownSeconds: withdrawCooldownSeconds,
       }
     })
   } catch (error) {
@@ -284,6 +290,7 @@ router.post('/points/redeem/invite', authenticateToken, async (req, res) => {
   if (!userId) {
     return res.status(401).json({ error: 'Access denied. No user provided.' })
   }
+  const inviteUnlockCostPoints = getInviteUnlockCostPoints()
 
   try {
     const result = await withLocks([`points:redeem-invite`, `points:user:${userId}`], async () => {
@@ -304,19 +311,19 @@ router.post('/points/redeem/invite', authenticateToken, async (req, res) => {
         return { ok: false, status: 409, error: '已拥有邀请权限，无需兑换' }
       }
 
-      if (points < INVITE_UNLOCK_COST_POINTS) {
-        return { ok: false, status: 409, error: `积分不足（需要 ${INVITE_UNLOCK_COST_POINTS} 积分）` }
+      if (points < inviteUnlockCostPoints) {
+        return { ok: false, status: 409, error: `积分不足（需要 ${inviteUnlockCostPoints} 积分）` }
       }
 
       db.run(
         'UPDATE users SET points = COALESCE(points, 0) - ?, invite_enabled = 1 WHERE id = ?',
-        [INVITE_UNLOCK_COST_POINTS, userId]
+        [inviteUnlockCostPoints, userId]
       )
       safeInsertPointsLedgerEntry(db, {
         userId,
-        deltaPoints: -INVITE_UNLOCK_COST_POINTS,
+        deltaPoints: -inviteUnlockCostPoints,
         pointsBefore: points,
-        pointsAfter: points - INVITE_UNLOCK_COST_POINTS,
+        pointsAfter: points - inviteUnlockCostPoints,
         action: 'redeem_invite_unlock',
         remark: '开通邀请权限'
       })
@@ -336,7 +343,7 @@ router.post('/points/redeem/invite', authenticateToken, async (req, res) => {
       points: result.points,
       invite: {
         enabled: true,
-        costPoints: INVITE_UNLOCK_COST_POINTS,
+        costPoints: inviteUnlockCostPoints,
       }
     })
   } catch (error) {
@@ -356,6 +363,7 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
   }
 
   const requestedEmail = String(req.body?.email || '').trim()
+  const teamSeatCostPoints = getTeamSeatCostPoints()
 
   try {
     const result = await withLocks([`points:redeem-team`, `points:user:${userId}`], async () => {
@@ -377,8 +385,8 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
         return { ok: false, status: 400, error: '请输入邮箱地址' }
       }
 
-      if (points < TEAM_SEAT_COST_POINTS) {
-        return { ok: false, status: 409, error: `积分不足（需要 ${TEAM_SEAT_COST_POINTS} 积分）` }
+      if (points < teamSeatCostPoints) {
+        return { ok: false, status: 409, error: `积分不足（需要 ${teamSeatCostPoints} 积分）` }
       }
 
       const code = pickTodayCommonCode(db)
@@ -393,12 +401,12 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
         skipCodeFormatValidation: true
       })
 
-      db.run('UPDATE users SET points = COALESCE(points, 0) - ? WHERE id = ?', [TEAM_SEAT_COST_POINTS, userId])
+      db.run('UPDATE users SET points = COALESCE(points, 0) - ? WHERE id = ?', [teamSeatCostPoints, userId])
       safeInsertPointsLedgerEntry(db, {
         userId,
-        deltaPoints: -TEAM_SEAT_COST_POINTS,
+        deltaPoints: -teamSeatCostPoints,
         pointsBefore: points,
-        pointsAfter: points - TEAM_SEAT_COST_POINTS,
+        pointsAfter: points - teamSeatCostPoints,
         action: 'redeem_team_seat',
         refType: 'redemption_code',
         refId: redemption?.metadata?.codeId ?? null,
@@ -425,7 +433,7 @@ router.post('/points/redeem/team', authenticateToken, async (req, res) => {
       message: '兑换成功',
       points: result.points,
       seat: {
-        costPoints: TEAM_SEAT_COST_POINTS,
+        costPoints: teamSeatCostPoints,
         remaining: result.remainingByType?.[SEAT_TYPE_UNDEMOTED] || 0,
         remainingByType: result.remainingByType,
         defaultType: SEAT_TYPE_UNDEMOTED,
@@ -499,12 +507,17 @@ router.post('/points/withdraw', authenticateToken, async (req, res) => {
   const pointsToWithdraw = toInt(pointsText, 0)
   const method = String(req.body?.method || '').trim().toLowerCase()
   const payoutAccount = String(req.body?.payoutAccount || req.body?.account || '').trim()
+  const withdrawMaxPointsPerRequest = getWithdrawMaxPointsPerRequest()
+  const withdrawDailyMaxPoints = getWithdrawDailyMaxPoints()
+  const withdrawDailyMaxRequests = getWithdrawDailyMaxRequests()
+  const withdrawMaxPending = getWithdrawMaxPending()
+  const withdrawCooldownSeconds = getWithdrawCooldownSeconds()
 
   if (pointsToWithdraw <= 0) {
     return res.status(400).json({ error: '请输入有效的提现积分' })
   }
-  if (WITHDRAW_MAX_POINTS_PER_REQUEST > 0 && pointsToWithdraw > WITHDRAW_MAX_POINTS_PER_REQUEST) {
-    return res.status(400).json({ error: `单次最多提现 ${WITHDRAW_MAX_POINTS_PER_REQUEST} 积分` })
+  if (withdrawMaxPointsPerRequest > 0 && pointsToWithdraw > withdrawMaxPointsPerRequest) {
+    return res.status(400).json({ error: `单次最多提现 ${withdrawMaxPointsPerRequest} 积分` })
   }
   if (!['alipay', 'wechat'].includes(method)) {
     return res.status(400).json({ error: '请选择有效的提现方式' })
@@ -540,19 +553,19 @@ router.post('/points/withdraw', authenticateToken, async (req, res) => {
         return { ok: false, status: 409, error: '积分不足，无法提现' }
       }
 
-      if (WITHDRAW_MAX_PENDING > 0) {
+      if (withdrawMaxPending > 0) {
         const pending = db.exec(
           `SELECT COUNT(*) FROM points_withdrawals WHERE user_id = ? AND status = 'pending'`,
           [userId]
         )
         const pendingCount = Number(pending[0]?.values?.[0]?.[0] || 0)
-        if (pendingCount >= WITHDRAW_MAX_PENDING) {
+        if (pendingCount >= withdrawMaxPending) {
           return { ok: false, status: 429, error: '存在未处理的提现申请，请稍后再试' }
         }
       }
 
-      if (WITHDRAW_COOLDOWN_SECONDS > 0) {
-        const cooldown = `-${WITHDRAW_COOLDOWN_SECONDS} seconds`
+      if (withdrawCooldownSeconds > 0) {
+        const cooldown = `-${withdrawCooldownSeconds} seconds`
         const recent = db.exec(
           `
             SELECT COUNT(*)
@@ -568,7 +581,7 @@ router.post('/points/withdraw', authenticateToken, async (req, res) => {
         }
       }
 
-      if (WITHDRAW_DAILY_MAX_REQUESTS > 0) {
+      if (withdrawDailyMaxRequests > 0) {
         const todayCountResult = db.exec(
           `
             SELECT COUNT(*)
@@ -579,12 +592,12 @@ router.post('/points/withdraw', authenticateToken, async (req, res) => {
           [userId]
         )
         const todayCount = Number(todayCountResult[0]?.values?.[0]?.[0] || 0)
-        if (todayCount >= WITHDRAW_DAILY_MAX_REQUESTS) {
+        if (todayCount >= withdrawDailyMaxRequests) {
           return { ok: false, status: 429, error: '今日提现次数已达上限' }
         }
       }
 
-      if (WITHDRAW_DAILY_MAX_POINTS > 0) {
+      if (withdrawDailyMaxPoints > 0) {
         const todaySumResult = db.exec(
           `
             SELECT COALESCE(SUM(points), 0)
@@ -596,8 +609,8 @@ router.post('/points/withdraw', authenticateToken, async (req, res) => {
           [userId]
         )
         const todaySum = Number(todaySumResult[0]?.values?.[0]?.[0] || 0)
-        if (todaySum + pointsToWithdraw > WITHDRAW_DAILY_MAX_POINTS) {
-          return { ok: false, status: 429, error: `今日最多可提现 ${WITHDRAW_DAILY_MAX_POINTS} 积分` }
+        if (todaySum + pointsToWithdraw > withdrawDailyMaxPoints) {
+          return { ok: false, status: 429, error: `今日最多可提现 ${withdrawDailyMaxPoints} 积分` }
         }
       }
 

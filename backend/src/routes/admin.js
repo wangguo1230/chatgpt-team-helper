@@ -1,4 +1,7 @@
 import express from 'express'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { requireSuperAdmin } from '../middleware/rbac.js'
@@ -25,20 +28,34 @@ import {
   getRedemptionCodeSettings,
   REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY,
   REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN,
-  REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX
+  REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX,
+  REDEMPTION_LOW_STOCK_THRESHOLD_KEY,
+  REDEMPTION_LOW_STOCK_THRESHOLD_MIN,
+  REDEMPTION_LOW_STOCK_THRESHOLD_MAX
 } from '../utils/redemption-settings.js'
 import {
   PRODUCT_KEY_REGEX,
   getPurchaseProductByKey,
   listPurchaseProducts,
+  normalizeDeliveryMode as normalizePurchaseProductDeliveryMode,
+  normalizeProductCategory as normalizePurchaseProductCategory,
   normalizeCodeChannels,
+  normalizeFulfillmentMode as normalizePurchaseProductFulfillmentMode,
   normalizeOrderType as normalizePurchaseProductOrderType,
   normalizeProductKey,
+  PURCHASE_DELIVERY_MODE_BOTH,
+  PURCHASE_DELIVERY_MODE_EMAIL,
+  PURCHASE_DELIVERY_MODE_INLINE,
+  PURCHASE_FULFILLMENT_MODE_ITEM_POOL,
+  PURCHASE_FULFILLMENT_MODE_REDEEM_API,
+  PURCHASE_PRODUCT_CATEGORY_CODE,
+  PURCHASE_PRODUCT_CATEGORY_LDC_SHOP,
+  PURCHASE_REDEEM_PROVIDER_YYL,
   disablePurchaseProduct,
   upsertPurchaseProduct,
 } from '../services/purchase-products.js'
 import { withLocks } from '../utils/locks.js'
-import { redeemCodeInternal } from './redemption-codes.js'
+import { redeemCodeInternal, emitRedemptionLowStockAlerts } from './redemption-codes.js'
 import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 
 const router = express.Router()
@@ -82,6 +99,221 @@ const toInt = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+const ENV_CONFIG_KEY_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/
+const ENV_ASSIGNMENT_REGEX = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/
+const SENSITIVE_ENV_KEY_REGEX = /(SECRET|TOKEN|KEY|PASS|PASSWORD|PRIVATE|COOKIE|AUTH|CREDENTIAL|CERT)/i
+const adminEnvManagedKeysByPath = new Map()
+
+const resolveAdminEnvFilePath = () => {
+  const configured = String(process.env.ENV_FILE_PATH || '').trim()
+  if (configured) {
+    return path.isAbsolute(configured) ? configured : path.resolve(process.cwd(), configured)
+  }
+
+  const cwdEnv = path.resolve(process.cwd(), '.env')
+  if (fs.existsSync(cwdEnv)) return cwdEnv
+
+  const currentFile = fileURLToPath(import.meta.url)
+  return path.resolve(path.dirname(currentFile), '../../.env')
+}
+
+const normalizeEnvValue = (rawValue) => {
+  const trimmed = String(rawValue ?? '').trim()
+  if (!trimmed) return ''
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+    || (trimmed.startsWith('\'') && trimmed.endsWith('\''))
+  ) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
+const isSensitiveEnvKey = (key) => {
+  const normalized = String(key || '').trim()
+  if (!normalized) return false
+  return SENSITIVE_ENV_KEY_REGEX.test(normalized)
+}
+
+const parseEnvEntriesFromText = (content, { strict = false } = {}) => {
+  const text = String(content || '')
+  const lines = text.split(/\r?\n/)
+  const entriesByKey = new Map()
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = String(lines[index] || '')
+    if (!rawLine.trim() || /^\s*#/.test(rawLine)) continue
+    const match = rawLine.match(ENV_ASSIGNMENT_REGEX)
+    if (!match) {
+      if (strict) {
+        throw new Error(`Invalid env assignment at line ${index + 1}`)
+      }
+      continue
+    }
+    const key = String(match[1] || '').trim()
+    if (!ENV_CONFIG_KEY_REGEX.test(key)) {
+      if (strict) {
+        throw new Error(`Invalid env key "${key || '(empty)'}" at line ${index + 1}`)
+      }
+      continue
+    }
+    const value = normalizeEnvValue(match[2] || '')
+    entriesByKey.set(key, value)
+  }
+
+  return Array.from(entriesByKey.entries()).map(([key, value]) => ({ key, value }))
+}
+
+const readEnvEntriesFromFile = (envFilePath) => {
+  if (!envFilePath || !fs.existsSync(envFilePath)) return []
+  const content = fs.readFileSync(envFilePath, 'utf-8')
+  return parseEnvEntriesFromText(content)
+}
+
+const escapeEnvValue = (value) => {
+  const sanitized = String(value ?? '').replace(/\r?\n/g, '\\n')
+  if (!sanitized) return ''
+  if (/\s|#/.test(sanitized)) {
+    return `"${sanitized.replace(/"/g, '\\"')}"`
+  }
+  return sanitized
+}
+
+const serializeEnvAssignment = (key, value) => `${key}=${escapeEnvValue(value)}`
+
+const mapEnvEntriesByKey = (entries = []) => {
+  const map = new Map()
+  for (const item of entries || []) {
+    const key = String(item?.key || '').trim()
+    if (!ENV_CONFIG_KEY_REGEX.test(key)) continue
+    map.set(key, String(item?.value ?? ''))
+  }
+  return map
+}
+
+const upsertEnvEntriesToFile = (envFilePath, updates = []) => {
+  const normalizedPath = String(envFilePath || '').trim()
+  if (!normalizedPath) throw new Error('env file path is required')
+
+  const updateMap = new Map()
+  for (const item of updates || []) {
+    const key = String(item?.key || '').trim()
+    if (!ENV_CONFIG_KEY_REGEX.test(key)) continue
+    updateMap.set(key, String(item?.value ?? ''))
+  }
+  if (updateMap.size === 0) return { updatedKeys: [] }
+
+  let lines = []
+  if (fs.existsSync(normalizedPath)) {
+    lines = fs.readFileSync(normalizedPath, 'utf-8').split(/\r?\n/)
+  }
+
+  const touched = new Set()
+  const nextLines = lines.map(line => {
+    const match = String(line || '').match(ENV_ASSIGNMENT_REGEX)
+    if (!match) return line
+    const key = String(match[1] || '').trim()
+    if (!updateMap.has(key)) return line
+    touched.add(key)
+    return serializeEnvAssignment(key, updateMap.get(key))
+  })
+
+  for (const [key, value] of updateMap.entries()) {
+    if (touched.has(key)) continue
+    nextLines.push(serializeEnvAssignment(key, value))
+    touched.add(key)
+  }
+
+  const output = `${nextLines.join('\n').replace(/\n+$/g, '')}\n`
+  fs.writeFileSync(normalizedPath, output, 'utf-8')
+  return { updatedKeys: Array.from(touched) }
+}
+
+const replaceEnvEntriesInFile = (envFilePath, entries = []) => {
+  const normalizedPath = String(envFilePath || '').trim()
+  if (!normalizedPath) throw new Error('env file path is required')
+  const entryMap = mapEnvEntriesByKey(entries)
+  const lines = Array.from(entryMap.entries()).map(([key, value]) => serializeEnvAssignment(key, value))
+  const output = lines.length ? `${lines.join('\n')}\n` : ''
+  fs.writeFileSync(normalizedPath, output, 'utf-8')
+  return { updatedKeys: Array.from(entryMap.keys()) }
+}
+
+const getManagedEnvKeys = (envFilePath) => {
+  const normalizedPath = String(envFilePath || '').trim()
+  if (!normalizedPath) return new Set()
+  const existing = adminEnvManagedKeysByPath.get(normalizedPath)
+  if (existing) return existing
+  const bootstrap = new Set(
+    readEnvEntriesFromFile(normalizedPath)
+      .map(item => String(item?.key || '').trim())
+      .filter(key => ENV_CONFIG_KEY_REGEX.test(key))
+  )
+  adminEnvManagedKeysByPath.set(normalizedPath, bootstrap)
+  return bootstrap
+}
+
+const syncEnvEntriesToRuntime = (envFilePath, entries = [], { clearMissing = true } = {}) => {
+  const normalizedPath = String(envFilePath || '').trim()
+  if (!normalizedPath) {
+    return { keys: [], removedKeys: [] }
+  }
+  const managedKeys = getManagedEnvKeys(normalizedPath)
+  const nextMap = mapEnvEntriesByKey(entries)
+  const nextKeys = new Set(nextMap.keys())
+  const removedKeys = []
+
+  if (clearMissing) {
+    for (const key of managedKeys) {
+      if (nextKeys.has(key)) continue
+      if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+        delete process.env[key]
+        removedKeys.push(key)
+      }
+    }
+  }
+
+  for (const [key, value] of nextMap.entries()) {
+    process.env[key] = value
+  }
+
+  adminEnvManagedKeysByPath.set(normalizedPath, new Set(nextKeys))
+  return {
+    keys: Array.from(nextKeys),
+    removedKeys
+  }
+}
+
+const buildEnvConfigItems = ({ entries = [] } = {}) => {
+  const items = []
+  const entryMap = mapEnvEntriesByKey(entries)
+  for (const [key, fileValue] of entryMap.entries()) {
+    const runtimeValue = String(process.env[key] ?? '')
+    const inRuntime = Object.prototype.hasOwnProperty.call(process.env, key)
+    const isSensitive = isSensitiveEnvKey(key)
+    items.push({
+      key,
+      value: fileValue,
+      inRuntime,
+      synced: runtimeValue === fileValue,
+      isSensitive
+    })
+  }
+  items.sort((a, b) => a.key.localeCompare(b.key))
+  return items
+}
+
+const invalidateAdminSettingsCaches = () => {
+  invalidateSmtpSettingsCache()
+  invalidateLinuxDoSettingsCache()
+  invalidateZpaySettingsCache()
+  invalidateTurnstileSettingsCache()
+  invalidateTelegramSettingsCache()
+  invalidateFeatureFlagsCache()
+  invalidateChannelsCache()
+  invalidateAccountRecoverySettingsCache()
+}
+
 const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
 const ORDER_TYPE_ANTI_BAN = 'anti_ban'
@@ -89,11 +321,13 @@ const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORD
 
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'no-warranty' || normalized === 'nowarranty') return ORDER_TYPE_NO_WARRANTY
+  if (normalized === 'anti-ban') return ORDER_TYPE_ANTI_BAN
   return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
 }
 
-const ACCOUNT_RECOVERY_WINDOW_DAYS = Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
-const ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS = Math.min(
+const getAccountRecoveryWindowDays = () => Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
+const getAccountRecoveryRedeemMaxAttempts = () => Math.min(
   10,
   Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS, 3))
 )
@@ -289,11 +523,14 @@ router.get('/redemption-code-settings', async (req, res) => {
     const settings = getRedemptionCodeSettings(db)
     return res.json({
       settings: {
-        batchCreateMaxCount: settings.batchCreateMaxCount
+        batchCreateMaxCount: settings.batchCreateMaxCount,
+        lowStockThreshold: settings.lowStockThreshold
       },
       effective: {
         batchCreateMaxCount: settings.batchCreateMaxCount,
-        source: settings.source
+        lowStockThreshold: settings.lowStockThreshold,
+        source: settings.source,
+        sources: settings.sources
       },
       stored: settings.stored,
       env: settings.env
@@ -307,35 +544,170 @@ router.get('/redemption-code-settings', async (req, res) => {
 router.put('/redemption-code-settings', async (req, res) => {
   try {
     const payload = req.body?.settings && typeof req.body.settings === 'object' ? req.body.settings : (req.body || {})
-    if (!Object.prototype.hasOwnProperty.call(payload, 'batchCreateMaxCount')) {
+    const hasBatchCreateMaxCount = Object.prototype.hasOwnProperty.call(payload, 'batchCreateMaxCount')
+    const hasLowStockThreshold = Object.prototype.hasOwnProperty.call(payload, 'lowStockThreshold')
+    if (!hasBatchCreateMaxCount && !hasLowStockThreshold) {
       return res.status(400).json({ error: 'No settings provided' })
     }
 
-    const parsed = Number.parseInt(String(payload.batchCreateMaxCount ?? ''), 10)
-    if (!Number.isFinite(parsed) || parsed < REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN || parsed > REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX) {
-      return res.status(400).json({
-        error: `batchCreateMaxCount 必须在 ${REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN}-${REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX} 之间`
-      })
-    }
-
     const db = await getDatabase()
-    upsertSystemConfigValue(db, REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY, String(parsed))
+    if (hasBatchCreateMaxCount) {
+      const parsed = Number.parseInt(String(payload.batchCreateMaxCount ?? ''), 10)
+      if (!Number.isFinite(parsed) || parsed < REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN || parsed > REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX) {
+        return res.status(400).json({
+          error: `batchCreateMaxCount 必须在 ${REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN}-${REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX} 之间`
+        })
+      }
+      upsertSystemConfigValue(db, REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY, String(parsed))
+    }
+    if (hasLowStockThreshold) {
+      const parsed = Number.parseInt(String(payload.lowStockThreshold ?? ''), 10)
+      if (!Number.isFinite(parsed) || parsed < REDEMPTION_LOW_STOCK_THRESHOLD_MIN || parsed > REDEMPTION_LOW_STOCK_THRESHOLD_MAX) {
+        return res.status(400).json({
+          error: `lowStockThreshold 必须在 ${REDEMPTION_LOW_STOCK_THRESHOLD_MIN}-${REDEMPTION_LOW_STOCK_THRESHOLD_MAX} 之间`
+        })
+      }
+      upsertSystemConfigValue(db, REDEMPTION_LOW_STOCK_THRESHOLD_KEY, String(parsed))
+    }
     saveDatabase()
 
     const settings = getRedemptionCodeSettings(db)
     return res.json({
       settings: {
-        batchCreateMaxCount: settings.batchCreateMaxCount
+        batchCreateMaxCount: settings.batchCreateMaxCount,
+        lowStockThreshold: settings.lowStockThreshold
       },
       effective: {
         batchCreateMaxCount: settings.batchCreateMaxCount,
-        source: settings.source
+        lowStockThreshold: settings.lowStockThreshold,
+        source: settings.source,
+        sources: settings.sources
       },
       stored: settings.stored,
       env: settings.env
     })
   } catch (error) {
     console.error('Update redemption-code-settings error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/redemption-code-settings/test-low-stock-alert', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const result = await emitRedemptionLowStockAlerts(db, 'admin-low-stock-test')
+    return res.json({
+      message: result.sent ? '低库存告警邮件已发送' : '当前没有低于阈值的渠道，未发送邮件',
+      sent: Boolean(result.sent),
+      threshold: Number(result.threshold || 0),
+      lowStockChannels: Array.isArray(result.lowStockChannels) ? result.lowStockChannels : []
+    })
+  } catch (error) {
+    console.error('Test redemption low stock alert error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/env-configs', async (req, res) => {
+  try {
+    const envFilePath = resolveAdminEnvFilePath()
+    const payload = await withLocks([`admin:env-config:${envFilePath}`], async () => {
+      const entries = readEnvEntriesFromFile(envFilePath)
+      const items = buildEnvConfigItems({ entries })
+      return {
+        envFilePath,
+        exists: fs.existsSync(envFilePath),
+        count: items.length,
+        items
+      }
+    })
+    return res.json(payload)
+  } catch (error) {
+    console.error('Get env-configs error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/env-configs', async (req, res) => {
+  try {
+    let entries = []
+    let replaceAll = false
+    if (Array.isArray(req.body?.entries)) {
+      entries = req.body.entries
+      replaceAll = parseBoolean(req.body?.replaceAll, true)
+    } else if (typeof req.body?.text === 'string') {
+      entries = parseEnvEntriesFromText(req.body.text, { strict: true })
+      replaceAll = parseBoolean(req.body?.replaceAll, true)
+    } else if (req.body && typeof req.body === 'object' && req.body.key) {
+      entries = [{ key: req.body.key, value: req.body.value }]
+      replaceAll = false
+    }
+
+    if (!entries.length) {
+      return res.status(400).json({ error: 'No env entries provided' })
+    }
+
+    const envFilePath = resolveAdminEnvFilePath()
+    return await withLocks([`admin:env-config:${envFilePath}`], async () => {
+      const existingEntries = readEnvEntriesFromFile(envFilePath)
+      const normalizedEntries = []
+      for (const item of entries) {
+        const key = String(item?.key || '').trim()
+        if (!ENV_CONFIG_KEY_REGEX.test(key)) {
+          return res.status(400).json({ error: `Invalid env key: ${key || '(empty)'}` })
+        }
+
+        const value = String(item?.value ?? '')
+        normalizedEntries.push({ key, value })
+      }
+
+      const updateResult = replaceAll
+        ? replaceEnvEntriesInFile(envFilePath, normalizedEntries)
+        : upsertEnvEntriesToFile(envFilePath, normalizedEntries)
+      const latestEntries = readEnvEntriesFromFile(envFilePath)
+      const syncResult = syncEnvEntriesToRuntime(envFilePath, latestEntries, { clearMissing: true })
+      invalidateAdminSettingsCaches()
+
+      const items = buildEnvConfigItems({ entries: latestEntries })
+      return res.json({
+        message: 'ENV 配置已保存',
+        envFilePath,
+        updatedKeys: updateResult.updatedKeys || [],
+        mode: replaceAll ? 'replace' : 'upsert',
+        count: items.length,
+        syncedCount: syncResult.keys.length,
+        removedRuntimeKeys: syncResult.removedKeys,
+        items
+      })
+    })
+  } catch (error) {
+    console.error('Update env-configs error:', error)
+    const message = String(error?.message || '')
+    if (message.startsWith('Invalid env')) {
+      return res.status(400).json({ error: message })
+    }
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/env-configs/sync', async (req, res) => {
+  try {
+    const envFilePath = resolveAdminEnvFilePath()
+    return await withLocks([`admin:env-config:${envFilePath}`], async () => {
+      const entries = readEnvEntriesFromFile(envFilePath)
+      const syncResult = syncEnvEntriesToRuntime(envFilePath, entries, { clearMissing: true })
+      invalidateAdminSettingsCaches()
+
+      return res.json({
+        message: '已同步 .env 到运行时配置',
+        envFilePath,
+        count: entries.length,
+        keys: syncResult.keys,
+        removedKeys: syncResult.removedKeys
+      })
+    })
+  } catch (error) {
+    console.error('Sync env-configs error:', error)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -2018,7 +2390,7 @@ router.delete('/rbac/users/:id', async (req, res) => {
 	    const page = Math.max(1, Number(req.query.page) || 1)
 	    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
 	    const search = String(req.query.search || '').trim().toLowerCase()
-	    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+	    const days = Math.max(1, Math.min(90, toInt(req.query.days, getAccountRecoveryWindowDays())))
 	    const threshold = `-${days} days`
 
 	    const db = await getDatabase()
@@ -2155,6 +2527,7 @@ router.delete('/rbac/users/:id', async (req, res) => {
 	          AND rc.redeemed_at IS NOT NULL
 	          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
 	          AND COALESCE(
+	            NULLIF(rc.order_type, ''),
 	            NULLIF((
 	              SELECT po2.order_type
 	              FROM purchase_orders po2
@@ -2162,7 +2535,6 @@ router.delete('/rbac/users/:id', async (req, res) => {
 	              ORDER BY po2.created_at DESC
 	              LIMIT 1
 	            ), ''),
-	            NULLIF(rc.order_type, ''),
 	            'warranty'
 	          ) != 'no_warranty'
 	      ),
@@ -2415,7 +2787,7 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
     const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 20))
     const search = String(req.query.search || '').trim().toLowerCase()
     const status = String(req.query.status || 'pending').trim().toLowerCase()
-    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+    const days = Math.max(1, Math.min(90, toInt(req.query.days, getAccountRecoveryWindowDays())))
     const threshold = `-${days} days`
     const sources = normalizeAccountRecoverySources(req.query.sources)
     const sourceFilterClause =
@@ -2563,6 +2935,7 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
             AND rc.redeemed_at IS NOT NULL
             AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
             AND COALESCE(
+              NULLIF(rc.order_type, ''),
               NULLIF((
                 SELECT po2.order_type
                 FROM purchase_orders po2
@@ -2570,7 +2943,6 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
                 ORDER BY po2.created_at DESC
                 LIMIT 1
               ), ''),
-              NULLIF(rc.order_type, ''),
               'warranty'
             ) != 'no_warranty'
         ),
@@ -2701,6 +3073,7 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
             AND rc.redeemed_at IS NOT NULL
             AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
             AND COALESCE(
+              NULLIF(rc.order_type, ''),
               NULLIF((
                 SELECT po2.order_type
                 FROM purchase_orders po2
@@ -2708,7 +3081,6 @@ router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, r
                 ORDER BY po2.created_at DESC
                 LIMIT 1
               ), ''),
-              NULLIF(rc.order_type, ''),
               'warranty'
             ) != 'no_warranty'
         ),
@@ -2854,7 +3226,7 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
       return res.status(400).json({ error: 'Invalid source' })
     }
 
-    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+    const days = Math.max(1, Math.min(90, toInt(req.query.days, getAccountRecoveryWindowDays())))
     const limit = Math.min(200, Math.max(1, toInt(req.query.limit, 200)))
     const threshold = `-${days} days`
 
@@ -2990,6 +3362,7 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
           AND rc.redeemed_at IS NOT NULL
           AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
           AND COALESCE(
+            NULLIF(rc.order_type, ''),
             NULLIF((
               SELECT po2.order_type
               FROM purchase_orders po2
@@ -2997,7 +3370,6 @@ router.get('/account-recovery/one-click/preview', async (req, res) => {
               ORDER BY po2.created_at DESC
               LIMIT 1
             ), ''),
-            NULLIF(rc.order_type, ''),
             'warranty'
           ) != 'no_warranty'
       ),
@@ -3103,7 +3475,7 @@ router.post('/account-recovery/recover', async (req, res) => {
       return res.status(400).json({ error: 'originalCodeIds is too large (max 200)' })
     }
 
-    const days = ACCOUNT_RECOVERY_WINDOW_DAYS
+    const days = getAccountRecoveryWindowDays()
     const threshold = `-${days} days`
 
     const db = await getDatabase()
@@ -3122,6 +3494,7 @@ router.post('/account-recovery/recover', async (req, res) => {
               ga.id,
               ga.email,
               COALESCE(
+                NULLIF(rc.order_type, ''),
                 NULLIF((
                   SELECT po2.order_type
                   FROM purchase_orders po2
@@ -3129,7 +3502,6 @@ router.post('/account-recovery/recover', async (req, res) => {
                   ORDER BY po2.created_at DESC
                   LIMIT 1
                 ), ''),
-                NULLIF(rc.order_type, ''),
                 'warranty'
               ) AS order_type
 	            FROM redemption_codes rc
@@ -3199,6 +3571,7 @@ router.post('/account-recovery/recover', async (req, res) => {
                 )
               )
               AND COALESCE(
+                NULLIF(rc.order_type, ''),
                 NULLIF((
                   SELECT po2.order_type
                   FROM purchase_orders po2
@@ -3206,7 +3579,6 @@ router.post('/account-recovery/recover', async (req, res) => {
                   ORDER BY po2.created_at DESC
                   LIMIT 1
                 ), ''),
-                NULLIF(rc.order_type, ''),
                 'warranty'
               ) != 'no_warranty'
             LIMIT 1
@@ -3275,7 +3647,8 @@ router.post('/account-recovery/recover', async (req, res) => {
         let lastAttemptError = null
         let lastAttemptRecovery = null
 
-        for (let attempt = 1; attempt <= ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS; attempt += 1) {
+        const recoveryRedeemMaxAttempts = getAccountRecoveryRedeemMaxAttempts()
+        for (let attempt = 1; attempt <= recoveryRedeemMaxAttempts; attempt += 1) {
           const selectedRecovery = selectRecoveryCode(db, {
             minExpireMs: requireExpireCoverDeadline ? orderDeadlineMs : Date.now(),
             capacityLimit: 6,
@@ -3326,7 +3699,7 @@ router.post('/account-recovery/recover', async (req, res) => {
             }
           } catch (error) {
             lastAttemptError = error
-            const shouldRetry = attempt < ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS && shouldRetryAccountRecoveryRedeem(error)
+            const shouldRetry = attempt < recoveryRedeemMaxAttempts && shouldRetryAccountRecoveryRedeem(error)
             if (shouldRetry) continue
 
             const statusCode = typeof error?.statusCode === 'number'
@@ -3576,9 +3949,42 @@ const validateProductKey = (value) => {
   return normalized && PRODUCT_KEY_REGEX.test(normalized) ? normalized : ''
 }
 
-const validateChannelList = async (db, rawChannels) => {
+const PURCHASE_PRODUCT_CATEGORY_SET = new Set([PURCHASE_PRODUCT_CATEGORY_CODE, PURCHASE_PRODUCT_CATEGORY_LDC_SHOP])
+const PURCHASE_DELIVERY_MODE_SET = new Set([PURCHASE_DELIVERY_MODE_INLINE, PURCHASE_DELIVERY_MODE_EMAIL, PURCHASE_DELIVERY_MODE_BOTH])
+const PURCHASE_FULFILLMENT_MODE_SET = new Set([PURCHASE_FULFILLMENT_MODE_ITEM_POOL, PURCHASE_FULFILLMENT_MODE_REDEEM_API])
+const PURCHASE_REDEEM_PROVIDER_SET = new Set([PURCHASE_REDEEM_PROVIDER_YYL])
+const PURCHASE_ITEM_STATUS_AVAILABLE = 'available'
+const PURCHASE_ITEM_STATUS_RESERVED = 'reserved'
+const PURCHASE_ITEM_STATUS_SOLD = 'sold'
+const PURCHASE_ITEM_STATUS_OFFLINE = 'offline'
+const PURCHASE_ITEM_STATUS_SET = new Set([
+  PURCHASE_ITEM_STATUS_AVAILABLE,
+  PURCHASE_ITEM_STATUS_RESERVED,
+  PURCHASE_ITEM_STATUS_SOLD,
+  PURCHASE_ITEM_STATUS_OFFLINE
+])
+const LDC_SHOP_REDEEM_CODE_STATUS_SET = new Set(['available', 'reserved', 'redeemed', 'invalid', 'failed', 'offline'])
+
+const normalizePurchaseItemStatus = (value, fallback = PURCHASE_ITEM_STATUS_AVAILABLE) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return PURCHASE_ITEM_STATUS_SET.has(normalized) ? normalized : fallback
+}
+
+const normalizePurchaseRedeemProvider = (value, fallback = PURCHASE_REDEEM_PROVIDER_YYL) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return fallback
+  return PURCHASE_REDEEM_PROVIDER_SET.has(normalized) ? normalized : fallback
+}
+
+const isSupportedPurchaseRedeemProvider = (value) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return Boolean(normalized) && PURCHASE_REDEEM_PROVIDER_SET.has(normalized)
+}
+
+const validateChannelList = async (db, rawChannels, { required = true } = {}) => {
   const { list } = normalizeCodeChannels(rawChannels)
   if (!list.length) {
+    if (!required) return { ok: true, channels: [] }
     return { ok: false, error: '请选择至少 1 个渠道', channels: [] }
   }
   if (list.length > 3) {
@@ -3608,7 +4014,9 @@ const validateChannelList = async (db, rawChannels) => {
 router.get('/purchase-products', async (req, res) => {
   try {
     const db = await getDatabase()
-    const products = await listPurchaseProducts(db, { activeOnly: false })
+    const rawCategory = String(req.query?.category || '').trim().toLowerCase()
+    const category = rawCategory && PURCHASE_PRODUCT_CATEGORY_SET.has(rawCategory) ? rawCategory : ''
+    const products = await listPurchaseProducts(db, { activeOnly: false, category })
     return res.json({ products })
   } catch (error) {
     console.error('[Admin] get purchase-products error:', error)
@@ -3634,17 +4042,50 @@ router.post('/purchase-products', async (req, res) => {
       return res.status(400).json({ error: 'amount 不合法（必须为大于 0 的金额）' })
     }
 
+    const rawCategory = String(raw.category ?? raw.productCategory ?? raw.product_category ?? '').trim().toLowerCase()
+    const category = normalizePurchaseProductCategory(rawCategory || PURCHASE_PRODUCT_CATEGORY_CODE, PURCHASE_PRODUCT_CATEGORY_CODE)
+    if (rawCategory && category !== rawCategory) {
+      return res.status(400).json({ error: 'category 不合法（仅允许 code/ldc_shop）' })
+    }
+
+    const rawDeliveryMode = String(raw.deliveryMode ?? raw.delivery_mode ?? '').trim().toLowerCase()
+    const deliveryMode = normalizePurchaseProductDeliveryMode(rawDeliveryMode || PURCHASE_DELIVERY_MODE_EMAIL, PURCHASE_DELIVERY_MODE_EMAIL)
+    if (rawDeliveryMode && deliveryMode !== rawDeliveryMode) {
+      return res.status(400).json({ error: 'deliveryMode 不合法（仅允许 inline/email/both）' })
+    }
+
+    const rawFulfillmentMode = String(raw.fulfillmentMode ?? raw.fulfillment_mode ?? '').trim().toLowerCase()
+    const defaultFulfillmentMode = category === PURCHASE_PRODUCT_CATEGORY_LDC_SHOP
+      ? PURCHASE_FULFILLMENT_MODE_ITEM_POOL
+      : PURCHASE_FULFILLMENT_MODE_ITEM_POOL
+    const fulfillmentMode = normalizePurchaseProductFulfillmentMode(rawFulfillmentMode || defaultFulfillmentMode, defaultFulfillmentMode)
+    if (rawFulfillmentMode && !PURCHASE_FULFILLMENT_MODE_SET.has(rawFulfillmentMode)) {
+      return res.status(400).json({ error: 'fulfillmentMode 不合法（仅允许 item_pool/redeem_api）' })
+    }
+    if (category === PURCHASE_PRODUCT_CATEGORY_CODE && fulfillmentMode !== PURCHASE_FULFILLMENT_MODE_ITEM_POOL) {
+      return res.status(400).json({ error: 'code 类商品仅支持 item_pool 交付来源' })
+    }
+    const redeemProvider = fulfillmentMode === PURCHASE_FULFILLMENT_MODE_REDEEM_API
+      ? normalizePurchaseRedeemProvider(raw.redeemProvider ?? raw.redeem_provider, PURCHASE_REDEEM_PROVIDER_YYL)
+      : ''
+    if (fulfillmentMode === PURCHASE_FULFILLMENT_MODE_REDEEM_API && (raw.redeemProvider !== undefined || raw.redeem_provider !== undefined)) {
+      const rawRedeemProvider = String(raw.redeemProvider ?? raw.redeem_provider ?? '').trim().toLowerCase()
+      if (rawRedeemProvider && !isSupportedPurchaseRedeemProvider(rawRedeemProvider)) {
+        return res.status(400).json({ error: `redeemProvider 不合法（仅允许 ${Array.from(PURCHASE_REDEEM_PROVIDER_SET).join('/')}）` })
+      }
+    }
+
     const serviceDays = Number(raw.serviceDays ?? raw.service_days)
     if (!Number.isFinite(serviceDays) || serviceDays < 1) {
       return res.status(400).json({ error: 'serviceDays 不合法（必须 >= 1）' })
     }
 
     const rawOrderType = String(raw.orderType ?? raw.order_type ?? '').trim().toLowerCase()
-    if (!rawOrderType) {
+    if (!rawOrderType && category === PURCHASE_PRODUCT_CATEGORY_CODE) {
       return res.status(400).json({ error: '请选择订单类型（orderType）' })
     }
-    const orderType = normalizePurchaseProductOrderType(rawOrderType)
-    if (orderType !== rawOrderType) {
+    const orderType = rawOrderType ? normalizePurchaseProductOrderType(rawOrderType) : ORDER_TYPE_WARRANTY
+    if (rawOrderType && orderType !== rawOrderType) {
       return res.status(400).json({ error: 'orderType 不合法（仅允许 warranty/no_warranty/anti_ban）' })
     }
 
@@ -3654,7 +4095,9 @@ router.post('/purchase-products', async (req, res) => {
       return res.status(409).json({ error: '商品已存在' })
     }
 
-    const channelValidation = await validateChannelList(db, raw.codeChannels ?? raw.code_channels)
+    const channelValidation = await validateChannelList(db, raw.codeChannels ?? raw.code_channels, {
+      required: category === PURCHASE_PRODUCT_CATEGORY_CODE
+    })
     if (!channelValidation.ok) {
       return res.status(400).json({ error: channelValidation.error })
     }
@@ -3671,6 +4114,10 @@ router.post('/purchase-products', async (req, res) => {
       codeChannels: channelValidation.channels.join(','),
       isActive,
       sortOrder,
+      category,
+      deliveryMode,
+      fulfillmentMode,
+      redeemProvider,
     })
 
     return res.status(201).json({ product })
@@ -3713,6 +4160,55 @@ router.patch('/purchase-products/:productKey', async (req, res) => {
       return res.status(400).json({ error: 'serviceDays 不合法（必须 >= 1）' })
     }
 
+    let nextCategory = normalizePurchaseProductCategory(existing.category, PURCHASE_PRODUCT_CATEGORY_CODE)
+    if (raw.category !== undefined || raw.productCategory !== undefined || raw.product_category !== undefined) {
+      const rawCategory = String(raw.category ?? raw.productCategory ?? raw.product_category ?? '').trim().toLowerCase()
+      if (!rawCategory) return res.status(400).json({ error: 'category 不能为空' })
+      const normalizedCategory = normalizePurchaseProductCategory(rawCategory, '')
+      if (!normalizedCategory) return res.status(400).json({ error: 'category 不合法（仅允许 code/ldc_shop）' })
+      nextCategory = normalizedCategory
+    }
+
+    let nextDeliveryMode = normalizePurchaseProductDeliveryMode(existing.deliveryMode, PURCHASE_DELIVERY_MODE_EMAIL)
+    if (raw.deliveryMode !== undefined || raw.delivery_mode !== undefined) {
+      const rawDeliveryMode = String(raw.deliveryMode ?? raw.delivery_mode ?? '').trim().toLowerCase()
+      if (!rawDeliveryMode) return res.status(400).json({ error: 'deliveryMode 不能为空' })
+      const normalizedDeliveryMode = normalizePurchaseProductDeliveryMode(rawDeliveryMode, '')
+      if (!normalizedDeliveryMode) return res.status(400).json({ error: 'deliveryMode 不合法（仅允许 inline/email/both）' })
+      nextDeliveryMode = normalizedDeliveryMode
+    }
+
+    let nextFulfillmentMode = normalizePurchaseProductFulfillmentMode(
+      existing.fulfillmentMode,
+      PURCHASE_FULFILLMENT_MODE_ITEM_POOL
+    )
+    if (raw.fulfillmentMode !== undefined || raw.fulfillment_mode !== undefined) {
+      const rawFulfillmentMode = String(raw.fulfillmentMode ?? raw.fulfillment_mode ?? '').trim().toLowerCase()
+      if (!rawFulfillmentMode) return res.status(400).json({ error: 'fulfillmentMode 不能为空' })
+      const normalizedFulfillmentMode = normalizePurchaseProductFulfillmentMode(rawFulfillmentMode, '')
+      if (!normalizedFulfillmentMode) return res.status(400).json({ error: 'fulfillmentMode 不合法（仅允许 item_pool/redeem_api）' })
+      nextFulfillmentMode = normalizedFulfillmentMode
+    }
+    if (nextCategory === PURCHASE_PRODUCT_CATEGORY_CODE && nextFulfillmentMode !== PURCHASE_FULFILLMENT_MODE_ITEM_POOL) {
+      return res.status(400).json({ error: 'code 类商品仅支持 item_pool 交付来源' })
+    }
+
+    let nextRedeemProvider = nextFulfillmentMode === PURCHASE_FULFILLMENT_MODE_REDEEM_API
+      ? normalizePurchaseRedeemProvider(existing.redeemProvider, PURCHASE_REDEEM_PROVIDER_YYL)
+      : ''
+    if (raw.redeemProvider !== undefined || raw.redeem_provider !== undefined) {
+      const rawRedeemProvider = String(raw.redeemProvider ?? raw.redeem_provider ?? '').trim().toLowerCase()
+      if (nextFulfillmentMode === PURCHASE_FULFILLMENT_MODE_REDEEM_API && rawRedeemProvider && !isSupportedPurchaseRedeemProvider(rawRedeemProvider)) {
+        return res.status(400).json({ error: `redeemProvider 不合法（仅允许 ${Array.from(PURCHASE_REDEEM_PROVIDER_SET).join('/')}）` })
+      }
+      nextRedeemProvider = nextFulfillmentMode === PURCHASE_FULFILLMENT_MODE_REDEEM_API
+        ? normalizePurchaseRedeemProvider(raw.redeemProvider ?? raw.redeem_provider, PURCHASE_REDEEM_PROVIDER_YYL)
+        : ''
+    }
+    if (nextFulfillmentMode !== PURCHASE_FULFILLMENT_MODE_REDEEM_API) {
+      nextRedeemProvider = ''
+    }
+
     let nextOrderType = existing.orderType
     if (raw.orderType !== undefined || raw.order_type !== undefined) {
       const rawOrderType = String(raw.orderType ?? raw.order_type ?? '').trim().toLowerCase()
@@ -3724,13 +4220,19 @@ router.patch('/purchase-products/:productKey', async (req, res) => {
       nextOrderType = normalized
     }
 
-    let nextCodeChannels = existing.codeChannels
-    if (raw.codeChannels !== undefined || raw.code_channels !== undefined) {
-      const channelValidation = await validateChannelList(db, raw.codeChannels ?? raw.code_channels)
+    let nextCodeChannels = nextCategory === PURCHASE_PRODUCT_CATEGORY_CODE ? String(existing.codeChannels || '').trim() : ''
+    if (raw.codeChannels !== undefined || raw.code_channels !== undefined || nextCategory !== PURCHASE_PRODUCT_CATEGORY_CODE) {
+      const channelValidation = await validateChannelList(db, raw.codeChannels ?? raw.code_channels, {
+        required: nextCategory === PURCHASE_PRODUCT_CATEGORY_CODE
+      })
       if (!channelValidation.ok) {
         return res.status(400).json({ error: channelValidation.error })
       }
       nextCodeChannels = channelValidation.channels.join(',')
+    }
+
+    if (nextCategory === PURCHASE_PRODUCT_CATEGORY_CODE && !nextCodeChannels) {
+      return res.status(400).json({ error: 'codeChannels 不能为空（code 类商品至少需要 1 个渠道）' })
     }
 
     const nextIsActive = raw.isActive !== undefined || raw.is_active !== undefined
@@ -3749,6 +4251,10 @@ router.patch('/purchase-products/:productKey', async (req, res) => {
       codeChannels: nextCodeChannels,
       isActive: nextIsActive,
       sortOrder: nextSortOrder,
+      category: nextCategory,
+      deliveryMode: nextDeliveryMode,
+      fulfillmentMode: nextFulfillmentMode,
+      redeemProvider: nextRedeemProvider,
     })
 
     return res.json({ product })
@@ -3771,6 +4277,15 @@ router.delete('/purchase-products/:productKey', async (req, res) => {
       return res.status(404).json({ error: '商品不存在' })
     }
 
+    db.run('DELETE FROM purchase_product_items WHERE product_key = ? AND status IN (?, ?)', [
+      productKey,
+      PURCHASE_ITEM_STATUS_AVAILABLE,
+      PURCHASE_ITEM_STATUS_OFFLINE
+    ])
+    db.run(
+      `DELETE FROM ldc_shop_redeem_codes WHERE product_key = ? AND status IN ('available', 'offline', 'invalid', 'failed')`,
+      [productKey]
+    )
     db.run('DELETE FROM purchase_products WHERE product_key = ?', [productKey])
     saveDatabase()
     return res.json({ ok: true })
@@ -3779,5 +4294,536 @@ router.delete('/purchase-products/:productKey', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
+
+const buildPurchaseItemPreview = (content, explicitPreview = '') => {
+  const previewRaw = String(explicitPreview || '').trim()
+  if (previewRaw) return previewRaw.slice(0, 180)
+  const normalized = String(content || '').replace(/\r\n/g, '\n').trim()
+  if (!normalized) return ''
+  const firstLine = normalized.split('\n').find(line => String(line || '').trim()) || normalized
+  return firstLine.slice(0, 180)
+}
+
+const ensureLdcShopProduct = async (db, productKey) => {
+  const product = await getPurchaseProductByKey(db, productKey)
+  if (!product) return { ok: false, status: 404, error: '商品不存在' }
+  if (normalizePurchaseProductCategory(product.category, PURCHASE_PRODUCT_CATEGORY_CODE) !== PURCHASE_PRODUCT_CATEGORY_LDC_SHOP) {
+    return { ok: false, status: 400, error: '该商品不是 LDC 小店商品' }
+  }
+  return { ok: true, product }
+}
+
+const ensureLdcShopRedeemApiProduct = async (db, productKey) => {
+  const check = await ensureLdcShopProduct(db, productKey)
+  if (!check.ok) return check
+  const fulfillmentMode = normalizePurchaseProductFulfillmentMode(
+    check.product?.fulfillmentMode,
+    PURCHASE_FULFILLMENT_MODE_ITEM_POOL
+  )
+  if (fulfillmentMode !== PURCHASE_FULFILLMENT_MODE_REDEEM_API) {
+    return { ok: false, status: 400, error: '该商品未启用兑换码 API 发卡模式' }
+  }
+  return check
+}
+
+const ensureLdcShopItemPoolProduct = async (db, productKey) => {
+  const check = await ensureLdcShopProduct(db, productKey)
+  if (!check.ok) return check
+  const fulfillmentMode = normalizePurchaseProductFulfillmentMode(
+    check.product?.fulfillmentMode,
+    PURCHASE_FULFILLMENT_MODE_ITEM_POOL
+  )
+  if (fulfillmentMode !== PURCHASE_FULFILLMENT_MODE_ITEM_POOL) {
+    return { ok: false, status: 400, error: '该商品未启用条目池交付模式' }
+  }
+  return check
+}
+
+router.get('/purchase-products/:productKey/items', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopItemPoolProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 50))
+    const offset = (page - 1) * pageSize
+    const includeContent = parseBoolean(req.query.includeContent, false)
+
+    const countResult = db.exec('SELECT COUNT(*) FROM purchase_product_items WHERE product_key = ?', [productKey])
+    const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+
+    const statusRows = db.exec(
+      `
+        SELECT status, COUNT(*)
+        FROM purchase_product_items
+        WHERE product_key = ?
+        GROUP BY status
+      `,
+      [productKey]
+    )[0]?.values || []
+    const statusCount = statusRows.reduce((acc, row) => {
+      const key = String(row?.[0] || '').trim() || PURCHASE_ITEM_STATUS_AVAILABLE
+      acc[key] = Number(row?.[1] || 0)
+      return acc
+    }, {})
+
+    const rows = db.exec(
+      `
+        SELECT id, content, preview_text, status, reserved_order_no, sold_order_no, reserved_at, sold_at, created_at, updated_at
+        FROM purchase_product_items
+        WHERE product_key = ?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [productKey, pageSize, offset]
+    )[0]?.values || []
+
+    const items = rows.map(row => {
+      const content = String(row?.[1] || '')
+      const previewText = buildPurchaseItemPreview(content, row?.[2] ? String(row[2]) : '')
+      return {
+        id: Number(row?.[0]),
+        productKey,
+        previewText,
+        status: normalizePurchaseItemStatus(row?.[3], PURCHASE_ITEM_STATUS_AVAILABLE),
+        reservedOrderNo: row?.[4] ? String(row[4]) : null,
+        soldOrderNo: row?.[5] ? String(row[5]) : null,
+        reservedAt: row?.[6] || null,
+        soldAt: row?.[7] || null,
+        createdAt: row?.[8] || null,
+        updatedAt: row?.[9] || null,
+        ...(includeContent ? { content } : {})
+      }
+    })
+
+    return res.json({
+      items,
+      pagination: { page, pageSize, total },
+      statusCount
+    })
+  } catch (error) {
+    console.error('[Admin] list purchase-product items error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/purchase-products/:productKey/items', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopItemPoolProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const raw = req.body || {}
+    const content = String(raw.content || '').trim()
+    if (!content) return res.status(400).json({ error: 'content 不能为空' })
+
+    const status = normalizePurchaseItemStatus(raw.status, PURCHASE_ITEM_STATUS_AVAILABLE)
+    if (![PURCHASE_ITEM_STATUS_AVAILABLE, PURCHASE_ITEM_STATUS_OFFLINE].includes(status)) {
+      return res.status(400).json({ error: 'status 仅允许 available/offline' })
+    }
+
+    const previewText = buildPurchaseItemPreview(content, raw.previewText ?? raw.preview_text)
+
+    db.run(
+      `
+        INSERT INTO purchase_product_items (
+          product_key, content, preview_text, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+      `,
+      [productKey, content, previewText || null, status]
+    )
+
+    const createdRow = db.exec(
+      `
+        SELECT id, content, preview_text, status, created_at, updated_at
+        FROM purchase_product_items
+        WHERE rowid = last_insert_rowid()
+        LIMIT 1
+      `
+    )[0]?.values?.[0]
+
+    saveDatabase()
+    return res.status(201).json({
+      item: {
+        id: Number(createdRow?.[0]),
+        productKey,
+        content: createdRow?.[1] ? String(createdRow[1]) : content,
+        previewText: buildPurchaseItemPreview(createdRow?.[1] || content, createdRow?.[2] || previewText),
+        status: normalizePurchaseItemStatus(createdRow?.[3], status),
+        createdAt: createdRow?.[4] || null,
+        updatedAt: createdRow?.[5] || null
+      }
+    })
+  } catch (error) {
+    console.error('[Admin] create purchase-product item error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.patch('/purchase-products/:productKey/items/:itemId', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+    const itemId = Number.parseInt(String(req.params.itemId), 10)
+    if (!Number.isFinite(itemId) || itemId <= 0) return res.status(400).json({ error: 'itemId 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopItemPoolProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const existing = db.exec(
+      `
+        SELECT id, content, preview_text, status, reserved_order_no, sold_order_no, created_at, updated_at
+        FROM purchase_product_items
+        WHERE id = ? AND product_key = ?
+        LIMIT 1
+      `,
+      [itemId, productKey]
+    )[0]?.values?.[0]
+    if (!existing) return res.status(404).json({ error: '条目不存在' })
+
+    const currentStatus = normalizePurchaseItemStatus(existing[3], PURCHASE_ITEM_STATUS_AVAILABLE)
+    if (currentStatus === PURCHASE_ITEM_STATUS_RESERVED || currentStatus === PURCHASE_ITEM_STATUS_SOLD) {
+      return res.status(409).json({ error: '已被占用或已售出的条目不可编辑' })
+    }
+
+    const raw = req.body || {}
+    const content = raw.content !== undefined ? String(raw.content || '').trim() : String(existing[1] || '')
+    if (!content) return res.status(400).json({ error: 'content 不能为空' })
+
+    const nextStatus = raw.status !== undefined
+      ? normalizePurchaseItemStatus(raw.status, '')
+      : currentStatus
+    if (!nextStatus || ![PURCHASE_ITEM_STATUS_AVAILABLE, PURCHASE_ITEM_STATUS_OFFLINE].includes(nextStatus)) {
+      return res.status(400).json({ error: 'status 仅允许 available/offline' })
+    }
+
+    const previewText = buildPurchaseItemPreview(content, raw.previewText ?? raw.preview_text ?? existing[2])
+
+    db.run(
+      `
+        UPDATE purchase_product_items
+        SET content = ?,
+            preview_text = ?,
+            status = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [content, previewText || null, nextStatus, itemId]
+    )
+
+    const updated = db.exec(
+      `
+        SELECT id, content, preview_text, status, reserved_order_no, sold_order_no, created_at, updated_at
+        FROM purchase_product_items
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [itemId]
+    )[0]?.values?.[0]
+
+    saveDatabase()
+    return res.json({
+      item: {
+        id: Number(updated?.[0]),
+        productKey,
+        content: updated?.[1] ? String(updated[1]) : content,
+        previewText: buildPurchaseItemPreview(updated?.[1] || content, updated?.[2] || previewText),
+        status: normalizePurchaseItemStatus(updated?.[3], nextStatus),
+        reservedOrderNo: updated?.[4] ? String(updated[4]) : null,
+        soldOrderNo: updated?.[5] ? String(updated[5]) : null,
+        createdAt: updated?.[6] || null,
+        updatedAt: updated?.[7] || null
+      }
+    })
+  } catch (error) {
+    console.error('[Admin] update purchase-product item error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.delete('/purchase-products/:productKey/items/:itemId', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+    const itemId = Number.parseInt(String(req.params.itemId), 10)
+    if (!Number.isFinite(itemId) || itemId <= 0) return res.status(400).json({ error: 'itemId 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopItemPoolProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const existing = db.exec(
+      'SELECT id, status FROM purchase_product_items WHERE id = ? AND product_key = ? LIMIT 1',
+      [itemId, productKey]
+    )[0]?.values?.[0]
+    if (!existing) return res.status(404).json({ error: '条目不存在' })
+
+    const status = normalizePurchaseItemStatus(existing[1], PURCHASE_ITEM_STATUS_AVAILABLE)
+    if (status === PURCHASE_ITEM_STATUS_RESERVED || status === PURCHASE_ITEM_STATUS_SOLD) {
+      return res.status(409).json({ error: '已被占用或已售出的条目不可删除' })
+    }
+
+    db.run('DELETE FROM purchase_product_items WHERE id = ?', [itemId])
+    saveDatabase()
+    return res.json({ ok: true })
+  } catch (error) {
+    console.error('[Admin] delete purchase-product item error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+const parseRedeemCodeLines = (rawText) => {
+  const input = String(rawText ?? '')
+  const lines = input
+    .split(/\r?\n/)
+    .map(line => String(line || '').trim())
+    .filter(Boolean)
+  const deduped = []
+  const seen = new Set()
+  for (const code of lines) {
+    if (seen.has(code)) continue
+    seen.add(code)
+    deduped.push(code)
+  }
+  return deduped
+}
+
+router.get('/purchase-products/:productKey/redeem-codes', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopRedeemApiProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(300, Math.max(1, Number(req.query.pageSize) || 100))
+    const offset = (page - 1) * pageSize
+    const includeCode = parseBoolean(req.query.includeCode, true)
+
+    const total = Number(
+      db.exec('SELECT COUNT(*) FROM ldc_shop_redeem_codes WHERE product_key = ?', [productKey])[0]?.values?.[0]?.[0] || 0
+    )
+    const statusRows = db.exec(
+      `
+        SELECT status, COUNT(*)
+        FROM ldc_shop_redeem_codes
+        WHERE product_key = ?
+        GROUP BY status
+      `,
+      [productKey]
+    )[0]?.values || []
+    const statusCount = statusRows.reduce((acc, row) => {
+      const key = String(row?.[0] || '').trim() || 'available'
+      acc[key] = Number(row?.[1] || 0)
+      return acc
+    }, {})
+
+    const rows = db.exec(
+      `
+        SELECT id, redeem_code, provider, status, reserved_order_no, used_order_no, last_error,
+               attempt_count, last_attempt_at, created_at, updated_at
+        FROM ldc_shop_redeem_codes
+        WHERE product_key = ?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [productKey, pageSize, offset]
+    )[0]?.values || []
+
+    const codes = rows.map(row => ({
+      id: Number(row?.[0]),
+      productKey,
+      code: includeCode ? String(row?.[1] || '') : '',
+      codeMasked: (() => {
+        const code = String(row?.[1] || '')
+        if (!code) return ''
+        if (code.length <= 5) return `${code.slice(0, 1)}***`
+        return `${code.slice(0, 4)}***${code.slice(-2)}`
+      })(),
+      provider: normalizePurchaseRedeemProvider(row?.[2], PURCHASE_REDEEM_PROVIDER_YYL),
+      status: String(row?.[3] || 'available'),
+      reservedOrderNo: row?.[4] ? String(row[4]) : null,
+      usedOrderNo: row?.[5] ? String(row[5]) : null,
+      lastError: row?.[6] ? String(row[6]) : null,
+      attemptCount: Number(row?.[7] || 0),
+      lastAttemptAt: row?.[8] || null,
+      createdAt: row?.[9] || null,
+      updatedAt: row?.[10] || null
+    }))
+
+    return res.json({
+      codes,
+      pagination: { page, pageSize, total },
+      statusCount
+    })
+  } catch (error) {
+    console.error('[Admin] list purchase-product redeem-codes error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/purchase-products/:productKey/redeem-codes/import', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopRedeemApiProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const raw = req.body || {}
+    const codes = parseRedeemCodeLines(raw.codesText ?? raw.codes_text ?? raw.codes ?? '')
+    if (!codes.length) return res.status(400).json({ error: '请至少输入 1 条兑换码（每行一条）' })
+    if (codes.length > 1000) return res.status(400).json({ error: '单次最多导入 1000 条兑换码' })
+
+    const productProvider = normalizePurchaseRedeemProvider(check.product?.redeemProvider, PURCHASE_REDEEM_PROVIDER_YYL)
+    const rawProvider = String(raw.provider ?? '').trim().toLowerCase()
+    if (rawProvider && !isSupportedPurchaseRedeemProvider(rawProvider)) {
+      return res.status(400).json({ error: `provider 不合法（仅允许 ${Array.from(PURCHASE_REDEEM_PROVIDER_SET).join('/')}）` })
+    }
+    const provider = normalizePurchaseRedeemProvider(rawProvider, productProvider)
+    if (provider !== productProvider) {
+      return res.status(400).json({ error: `provider 必须与商品配置一致（${productProvider}）` })
+    }
+    const added = []
+    const skipped = []
+
+    for (const code of codes) {
+      const exists = db.exec('SELECT id FROM ldc_shop_redeem_codes WHERE redeem_code = ? LIMIT 1', [code])[0]?.values?.[0]
+      if (exists) {
+        skipped.push(code)
+        continue
+      }
+      db.run(
+        `
+          INSERT INTO ldc_shop_redeem_codes (
+            product_key, redeem_code, provider, status, created_at, updated_at
+          ) VALUES (?, ?, ?, 'available', DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+        `,
+        [productKey, code, provider]
+      )
+      added.push(code)
+    }
+
+    saveDatabase()
+    return res.status(201).json({
+      added: added.length,
+      skipped: skipped.length,
+      provider,
+      total: Number(db.exec('SELECT COUNT(*) FROM ldc_shop_redeem_codes WHERE product_key = ?', [productKey])[0]?.values?.[0]?.[0] || 0)
+    })
+  } catch (error) {
+    console.error('[Admin] import purchase-product redeem-codes error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.patch('/purchase-products/:productKey/redeem-codes/:codeId', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+    const codeId = Number.parseInt(String(req.params.codeId), 10)
+    if (!Number.isFinite(codeId) || codeId <= 0) return res.status(400).json({ error: 'codeId 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopRedeemApiProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const row = db.exec(
+      `
+        SELECT id, status
+        FROM ldc_shop_redeem_codes
+        WHERE id = ? AND product_key = ?
+        LIMIT 1
+      `,
+      [codeId, productKey]
+    )[0]?.values?.[0]
+    if (!row) return res.status(404).json({ error: '兑换码不存在' })
+
+    const currentStatus = String(row?.[1] || '').trim().toLowerCase()
+    if (!LDC_SHOP_REDEEM_CODE_STATUS_SET.has(currentStatus)) {
+      return res.status(400).json({ error: '当前兑换码状态异常' })
+    }
+    if (currentStatus === 'reserved' || currentStatus === 'redeemed') {
+      return res.status(409).json({ error: '已被占用或已使用的兑换码不可修改状态' })
+    }
+
+    const nextStatus = String(req.body?.status || '').trim().toLowerCase()
+    if (!['available', 'offline'].includes(nextStatus)) {
+      return res.status(400).json({ error: 'status 仅允许 available/offline' })
+    }
+
+    db.run(
+      `
+        UPDATE ldc_shop_redeem_codes
+        SET status = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [nextStatus, codeId]
+    )
+    saveDatabase()
+    return res.json({ ok: true })
+  } catch (error) {
+    console.error('[Admin] update purchase-product redeem-code error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.delete('/purchase-products/:productKey/redeem-codes/:codeId', async (req, res) => {
+  try {
+    const productKey = validateProductKey(req.params.productKey)
+    if (!productKey) return res.status(400).json({ error: 'productKey 不合法' })
+    const codeId = Number.parseInt(String(req.params.codeId), 10)
+    if (!Number.isFinite(codeId) || codeId <= 0) return res.status(400).json({ error: 'codeId 不合法' })
+
+    const db = await getDatabase()
+    const check = await ensureLdcShopRedeemApiProduct(db, productKey)
+    if (!check.ok) return res.status(check.status).json({ error: check.error })
+
+    const row = db.exec(
+      `
+        SELECT status
+        FROM ldc_shop_redeem_codes
+        WHERE id = ? AND product_key = ?
+        LIMIT 1
+      `,
+      [codeId, productKey]
+    )[0]?.values?.[0]
+    if (!row) return res.status(404).json({ error: '兑换码不存在' })
+
+    const status = String(row?.[0] || '').trim().toLowerCase()
+    if (status === 'reserved' || status === 'redeemed') {
+      return res.status(409).json({ error: '已被占用或已使用的兑换码不可删除' })
+    }
+
+    db.run('DELETE FROM ldc_shop_redeem_codes WHERE id = ?', [codeId])
+    saveDatabase()
+    return res.json({ ok: true })
+  } catch (error) {
+    console.error('[Admin] delete purchase-product redeem-code error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 供单元测试使用，避免重复实现 ENV 解析/同步逻辑。
+export const __adminEnvTestUtils = {
+  parseEnvEntriesFromText,
+  upsertEnvEntriesToFile,
+  replaceEnvEntriesInFile,
+  syncEnvEntriesToRuntime,
+  mapEnvEntriesByKey,
+  buildEnvConfigItems
+}
 
 export default router

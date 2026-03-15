@@ -5,8 +5,18 @@ export const REDEMPTION_BATCH_CREATE_MAX_COUNT_ENV = 'REDEMPTION_BATCH_CREATE_MA
 export const REDEMPTION_BATCH_CREATE_MAX_COUNT_MIN = 1
 export const REDEMPTION_BATCH_CREATE_MAX_COUNT_MAX = 1000
 export const REDEMPTION_BATCH_CREATE_MAX_COUNT_DEFAULT = 5
+export const REDEMPTION_LOW_STOCK_THRESHOLD_KEY = 'redemption_low_stock_threshold'
+export const REDEMPTION_LOW_STOCK_THRESHOLD_ENV = 'REDEMPTION_LOW_STOCK_THRESHOLD'
+export const REDEMPTION_LOW_STOCK_THRESHOLD_MIN = 0
+export const REDEMPTION_LOW_STOCK_THRESHOLD_MAX = 100000
+export const REDEMPTION_LOW_STOCK_THRESHOLD_DEFAULT = 0
 
 const parseCount = (value) => {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const parseThreshold = (value) => {
   const parsed = Number.parseInt(String(value ?? '').trim(), 10)
   return Number.isFinite(parsed) ? parsed : null
 }
@@ -18,9 +28,23 @@ const clampCount = (value) => {
   return value
 }
 
+const clampThreshold = (value) => {
+  if (!Number.isFinite(value)) return null
+  if (value < REDEMPTION_LOW_STOCK_THRESHOLD_MIN) return null
+  if (value > REDEMPTION_LOW_STOCK_THRESHOLD_MAX) return null
+  return value
+}
+
 export const normalizeRedemptionBatchCreateMaxCount = (value, fallback = REDEMPTION_BATCH_CREATE_MAX_COUNT_DEFAULT) => {
   const parsed = parseCount(value)
   const normalized = clampCount(parsed)
+  if (normalized == null) return fallback
+  return normalized
+}
+
+export const normalizeRedemptionLowStockThreshold = (value, fallback = REDEMPTION_LOW_STOCK_THRESHOLD_DEFAULT) => {
+  const parsed = parseThreshold(value)
+  const normalized = clampThreshold(parsed)
   if (normalized == null) return fallback
   return normalized
 }
@@ -32,33 +56,44 @@ export const getRedemptionBatchCreateMaxCountFromEnv = () => {
   )
 }
 
+export const getRedemptionLowStockThresholdFromEnv = () => {
+  return normalizeRedemptionLowStockThreshold(
+    process.env[REDEMPTION_LOW_STOCK_THRESHOLD_ENV],
+    REDEMPTION_LOW_STOCK_THRESHOLD_DEFAULT
+  )
+}
+
 export const getRedemptionCodeSettings = (database) => {
   const envBatchCreateMaxCount = getRedemptionBatchCreateMaxCountFromEnv()
+  const envLowStockThreshold = getRedemptionLowStockThresholdFromEnv()
   const storedRaw = getSystemConfigValue(database, REDEMPTION_BATCH_CREATE_MAX_COUNT_KEY)
+  const storedThresholdRaw = getSystemConfigValue(database, REDEMPTION_LOW_STOCK_THRESHOLD_KEY)
   const storedParsed = clampCount(parseCount(storedRaw))
-
-  if (storedParsed != null) {
-    return {
-      batchCreateMaxCount: storedParsed,
-      source: 'db',
-      stored: {
-        batchCreateMaxCount: storedParsed
-      },
-      env: {
-        batchCreateMaxCount: envBatchCreateMaxCount
-      }
-    }
-  }
+  const storedThresholdParsed = clampThreshold(parseThreshold(storedThresholdRaw))
+  const batchSource = storedParsed != null
+    ? 'db'
+    : (process.env[REDEMPTION_BATCH_CREATE_MAX_COUNT_ENV] ? 'env' : 'default')
+  const thresholdSource = storedThresholdParsed != null
+    ? 'db'
+    : (process.env[REDEMPTION_LOW_STOCK_THRESHOLD_ENV] ? 'env' : 'default')
+  const resolvedBatchCreateMaxCount = storedParsed != null ? storedParsed : envBatchCreateMaxCount
+  const resolvedLowStockThreshold = storedThresholdParsed != null ? storedThresholdParsed : envLowStockThreshold
 
   return {
-    batchCreateMaxCount: envBatchCreateMaxCount,
-    source: process.env[REDEMPTION_BATCH_CREATE_MAX_COUNT_ENV] ? 'env' : 'default',
+    batchCreateMaxCount: resolvedBatchCreateMaxCount,
+    lowStockThreshold: resolvedLowStockThreshold,
+    source: batchSource,
+    sources: {
+      batchCreateMaxCount: batchSource,
+      lowStockThreshold: thresholdSource
+    },
     stored: {
-      batchCreateMaxCount: null
+      batchCreateMaxCount: storedParsed,
+      lowStockThreshold: storedThresholdParsed
     },
     env: {
-      batchCreateMaxCount: envBatchCreateMaxCount
+      batchCreateMaxCount: envBatchCreateMaxCount,
+      lowStockThreshold: envLowStockThreshold
     }
   }
 }
-

@@ -7,10 +7,6 @@ const DEFAULT_ACTIVE_HOURS = [8, 9, 10, 11, 12, 13, 14]
 const MAX_LOOKAHEAD_HOURS = 48
 const RESERVED_BY = 'auto-scheduler'
 
-const configuredHours = parseActiveHours(process.env.WAITING_ROOM_AUTO_BOARDING_HOURS)
-const activeHours = configuredHours.length ? configuredHours : DEFAULT_ACTIVE_HOURS
-const ACTIVE_HOUR_SET = new Set(activeHours)
-
 let schedulerTimer = null
 let jobInProgress = false
 
@@ -58,8 +54,21 @@ function formatLocalTime(date) {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
-function getNextScheduledTime(from = new Date()) {
-  if (!ACTIVE_HOUR_SET.size) {
+function isSchedulerEnabled() {
+  return parseBool(process.env.WAITING_ROOM_AUTO_BOARDING_ENABLED, true)
+}
+
+function getActiveHours() {
+  const configuredHours = parseActiveHours(process.env.WAITING_ROOM_AUTO_BOARDING_HOURS)
+  return configuredHours.length ? configuredHours : DEFAULT_ACTIVE_HOURS
+}
+
+function getActiveHourSet() {
+  return new Set(getActiveHours())
+}
+
+function getNextScheduledTime(from = new Date(), activeHourSet = getActiveHourSet()) {
+  if (!activeHourSet.size) {
     return null
   }
 
@@ -71,7 +80,7 @@ function getNextScheduledTime(from = new Date()) {
   }
 
   for (let i = 0; i < MAX_LOOKAHEAD_HOURS; i++) {
-    if (ACTIVE_HOUR_SET.has(next.getHours()) && next.getTime() >= from.getTime()) {
+    if (activeHourSet.has(next.getHours()) && next.getTime() >= from.getTime()) {
       return next
     }
     next.setHours(next.getHours() + 1)
@@ -405,13 +414,19 @@ async function redeemReservedCode(db, entry, code) {
 }
 
 async function runAutoBoardingJob(trigger = 'scheduler') {
+  if (trigger === 'scheduler' && !isSchedulerEnabled()) {
+    console.log(`${LABEL} 调度触发时检测到任务已禁用，跳过执行`)
+    return
+  }
+
   if (jobInProgress) {
     console.log(`${LABEL} 上一次任务尚未完成，跳过本次触发 (${trigger})`)
     return
   }
 
   const now = new Date()
-  if (!ACTIVE_HOUR_SET.has(now.getHours())) {
+  const activeHourSet = getActiveHourSet()
+  if (!activeHourSet.has(now.getHours())) {
     console.log(`${LABEL} 当前时间 ${formatLocalTime(now)} 不在设定时段，跳过执行`)
     return
   }
@@ -500,7 +515,13 @@ async function runAutoBoardingJob(trigger = 'scheduler') {
 }
 
 function scheduleNextRun() {
-  const nextRun = getNextScheduledTime()
+  if (!isSchedulerEnabled()) {
+    console.log(`${LABEL} 自动上车任务已禁用 (WAITING_ROOM_AUTO_BOARDING_ENABLED=false)`)
+    return
+  }
+
+  const activeHourSet = getActiveHourSet()
+  const nextRun = getNextScheduledTime(new Date(), activeHourSet)
   if (!nextRun) {
     console.warn(`${LABEL} 无法计算下次运行时间，自动任务已停止`)
     return
@@ -523,12 +544,13 @@ function scheduleNextRun() {
 }
 
 export function startWaitingRoomAutoBoardingScheduler() {
-  if (!parseBool(process.env.WAITING_ROOM_AUTO_BOARDING_ENABLED, true)) {
+  if (!isSchedulerEnabled()) {
     console.log(`${LABEL} 自动上车任务已禁用 (WAITING_ROOM_AUTO_BOARDING_ENABLED=false)`)
     return
   }
 
-  if (!ACTIVE_HOUR_SET.size) {
+  const activeHourSet = getActiveHourSet()
+  if (!activeHourSet.size) {
     console.warn(`${LABEL} 未配置有效的执行时段，任务不会启动`)
     return
   }
@@ -539,7 +561,7 @@ export function startWaitingRoomAutoBoardingScheduler() {
   }
 
   console.log(
-    `${LABEL} 定时任务已启动，将在以下整点执行：${Array.from(ACTIVE_HOUR_SET).sort((a, b) => a - b).join(', ')}`
+    `${LABEL} 定时任务已启动，将在以下整点执行：${Array.from(activeHourSet).sort((a, b) => a - b).join(', ')}`
   )
   scheduleNextRun()
 }

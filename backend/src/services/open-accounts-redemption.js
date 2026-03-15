@@ -1,4 +1,11 @@
-import { redeemCodeInternal, RedemptionError } from '../routes/redemption-codes.js'
+import {
+  redeemCodeInternal,
+  RedemptionError,
+  createRedemptionAlertCollector,
+  collectRedemptionLowStockAlerts,
+  flushRedemptionAlertCollector
+} from '../routes/redemption-codes.js'
+import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 
 const DEFAULT_OPEN_ACCOUNTS_CHANNELS = ['linux-do']
 const OPEN_ACCOUNTS_ALLOWED_CHANNELS = new Set(['common', 'linux-do'])
@@ -149,6 +156,21 @@ export const ensureOpenAccountsOrderCode = (db, { orderNo, accountEmail, email }
 
 export const releaseOpenAccountsOrderCode = (db, orderNo) => {
   if (!db || !orderNo) return { released: 0 }
+
+  const pendingCountResult = db.exec(
+    `
+      SELECT COUNT(*)
+      FROM redemption_codes
+      WHERE reserved_for_order_no = ?
+        AND is_redeemed = 0
+    `,
+    [orderNo]
+  )
+  const pendingCount = Number(pendingCountResult?.[0]?.values?.[0]?.[0] || 0)
+  if (pendingCount <= 0) {
+    return { released: 0 }
+  }
+
   db.run(
     `
       UPDATE redemption_codes
@@ -172,29 +194,44 @@ export const releaseOpenAccountsOrderCode = (db, orderNo) => {
     `,
     [orderNo]
   )
-  return { released: 1 }
+  return { released: pendingCount }
 }
 
-export const redeemOpenAccountsOrderCode = async (db, { orderNo, uid, email, accountEmail, capacityLimit = 5, orderType }) => {
+export const redeemOpenAccountsOrderCode = async (db, { orderNo, uid, email, accountEmail, capacityLimit = null }) => {
   const codeInfo = ensureOpenAccountsOrderCode(db, { orderNo, accountEmail, email })
   if (!codeInfo?.code) {
     return { ok: false, error: 'no_code' }
   }
+  const alertCollector = createRedemptionAlertCollector('open-accounts-board', {
+    scopeChannels: getOpenAccountsCodeChannels()
+  })
+
+  const requestedCapacity = Number.parseInt(String(capacityLimit ?? '').trim(), 10)
+  const resolvedCapacityLimit = Number.isFinite(requestedCapacity) && requestedCapacity > 0
+    ? requestedCapacity
+    : getOpenAccountsCapacityLimit(db)
 
   try {
     const redemption = await redeemCodeInternal({
       email,
       code: codeInfo.code,
       channel: codeInfo.channel || 'common',
-      orderType,
       redeemerUid: uid,
-      capacityLimit
+      capacityLimit: resolvedCapacityLimit,
+      alertCollector
     })
+    await collectRedemptionLowStockAlerts(db, alertCollector)
     return { ok: true, redemption, code: codeInfo }
   } catch (error) {
     if (error instanceof RedemptionError) {
       return { ok: false, error: error.message, statusCode: error.statusCode || 400 }
     }
     return { ok: false, error: error?.message || 'redeem_failed', statusCode: 500 }
+  } finally {
+    try {
+      await flushRedemptionAlertCollector(alertCollector)
+    } catch (alertError) {
+      console.warn('[OpenAccountsRedemption] 汇总告警发送失败', alertError?.message || alertError)
+    }
   }
 }

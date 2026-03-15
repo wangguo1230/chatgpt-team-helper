@@ -31,6 +31,13 @@ const buildSmtpConfig = (settings) => {
   }
 }
 
+const escapeHtml = (value) => String(value || '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;')
+
 export async function sendAdminAlertEmail({ subject, text, html } = {}) {
   const settings = await getSmtpSettings()
   const smtpConfig = buildSmtpConfig(settings)
@@ -75,6 +82,9 @@ function buildOpenAccountsSweeperBody(summary) {
     maxJoined,
     scanCreatedWithinDays,
     scannedCount,
+    securityCheckedCount,
+    securityBlockedCount,
+    offlinedCodesCount,
     totalKicked,
     results = [],
     failures = []
@@ -89,7 +99,9 @@ function buildOpenAccountsSweeperBody(summary) {
       const joined = item.joined ?? '未知'
       const kicked = Number(item.kicked || 0)
       const didKick = Boolean(item.didKick) || kicked > 0
-      return `<tr><td>${emailPrefix}</td><td style="text-align:right;">${joined}</td><td style="text-align:center;">${didKick ? '是' : '否'}</td><td style="text-align:right;">${kicked}</td></tr>`
+      const securityStatus = String(item.securityStatus || '')
+      const offlinedCodes = Number(item.offlinedCodes || 0)
+      return `<tr><td>${emailPrefix}</td><td style="text-align:right;">${joined}</td><td style="text-align:center;">${didKick ? '是' : '否'}</td><td style="text-align:right;">${kicked}</td><td style="text-align:center;">${securityStatus || '-'}</td><td style="text-align:right;">${offlinedCodes}</td></tr>`
     })
     .join('')
 
@@ -103,10 +115,11 @@ function buildOpenAccountsSweeperBody(summary) {
   const htmlParts = [
     `<p>开放账号超员扫描已完成。</p>`,
     `<p>扫描账号数：${scannedCount ?? 0}，阈值：joined &gt; ${maxJoined ?? ''}，本次踢出：${totalKicked ?? 0}</p>`,
+    `<p>安全检测：${securityCheckedCount ?? 0}，不可用账号：${securityBlockedCount ?? 0}，下架兑换码：${offlinedCodesCount ?? 0}</p>`,
     ...(Number(scanCreatedWithinDays) > 0 ? [`<p>扫描范围：最近 ${scanCreatedWithinDays} 天创建的开放账号</p>`] : []),
     '<table style="border-collapse:collapse;width:100%;">',
-    '<thead><tr><th style="text-align:left;border-bottom:1px solid #ccc;">邮箱前缀</th><th style="text-align:right;border-bottom:1px solid #ccc;">当前人数</th><th style="text-align:center;border-bottom:1px solid #ccc;">是否踢出</th><th style="text-align:right;border-bottom:1px solid #ccc;">踢出人数</th></tr></thead>',
-    `<tbody>${rows || '<tr><td colspan="4">无</td></tr>'}</tbody>`,
+    '<thead><tr><th style="text-align:left;border-bottom:1px solid #ccc;">邮箱前缀</th><th style="text-align:right;border-bottom:1px solid #ccc;">当前人数</th><th style="text-align:center;border-bottom:1px solid #ccc;">是否踢出</th><th style="text-align:right;border-bottom:1px solid #ccc;">踢出人数</th><th style="text-align:center;border-bottom:1px solid #ccc;">安全检测</th><th style="text-align:right;border-bottom:1px solid #ccc;">下架兑换码</th></tr></thead>',
+    `<tbody>${rows || '<tr><td colspan="6">无</td></tr>'}</tbody>`,
     '</table>'
   ]
 
@@ -130,7 +143,9 @@ function buildOpenAccountsSweeperBody(summary) {
             const joined = item.joined ?? '未知'
             const kicked = Number(item.kicked || 0)
             const didKick = Boolean(item.didKick) || kicked > 0
-            return `- ${emailPrefix}: 当前人数=${joined} 是否踢出=${didKick ? '是' : '否'} 踢出人数=${kicked}`
+            const securityStatus = String(item.securityStatus || '')
+            const offlinedCodes = Number(item.offlinedCodes || 0)
+            return `- ${emailPrefix}: 当前人数=${joined} 是否踢出=${didKick ? '是' : '否'} 踢出人数=${kicked} 安全检测=${securityStatus || '-'} 下架兑换码=${offlinedCodes}`
           })
           .join('\n')
       : '无'
@@ -150,7 +165,7 @@ function buildOpenAccountsSweeperBody(summary) {
 
   return {
     html: htmlParts.join('\n'),
-    text: `开放账号超员扫描已完成。\n扫描账号数：${scannedCount ?? 0}，阈值：${maxJoined ?? ''}，本次踢出：${totalKicked ?? 0}${Number(scanCreatedWithinDays) > 0 ? `\n扫描范围：最近 ${scanCreatedWithinDays} 天创建的开放账号` : ''}\n\n${textRows}${textFailures}${textTime}`
+    text: `开放账号超员扫描已完成。\n扫描账号数：${scannedCount ?? 0}，阈值：${maxJoined ?? ''}，本次踢出：${totalKicked ?? 0}\n安全检测：${securityCheckedCount ?? 0}，不可用账号：${securityBlockedCount ?? 0}，下架兑换码：${offlinedCodesCount ?? 0}${Number(scanCreatedWithinDays) > 0 ? `\n扫描范围：最近 ${scanCreatedWithinDays} 天创建的开放账号` : ''}\n\n${textRows}${textFailures}${textTime}`
   }
 }
 
@@ -184,6 +199,194 @@ export async function sendOpenAccountsSweeperReportEmail(summary) {
 
   console.log('[OpenAccountsSweeper] 扫描报告邮件已发送')
   return true
+}
+
+const buildRedemptionFlowSummaryBody = (summary) => {
+  const {
+    source = 'unknown',
+    threshold = 0,
+    pendingAuthorizationOrderCount = 0,
+    lowStockChannels = [],
+    bannedAccounts = [],
+    triggeredAt = new Date()
+  } = summary || {}
+
+  const triggerText = triggeredAt instanceof Date ? triggeredAt.toLocaleString() : String(triggeredAt || '')
+
+  const lowStockHtml = (lowStockChannels || []).length > 0
+    ? `<ul>${lowStockChannels
+        .map(item => {
+          const name = String(item.channelName || item.channel || 'unknown')
+          const available = Number(item.availableCount || 0)
+          return `<li>${name}（${item.channel}）：${available}</li>`
+        })
+        .join('')}</ul>`
+    : '<p>无</p>'
+
+  const bannedHtml = (bannedAccounts || []).length > 0
+    ? `<ul>${bannedAccounts
+        .map(item => {
+          const email = String(item.accountEmail || 'unknown')
+          const id = Number(item.accountId || 0)
+          const deleted = Number(item.deletedUnusedCodeCount || 0)
+          const reason = String(item.reason || '')
+          return `<li>${email} (ID=${id})，下架兑换码=${deleted}${reason ? `，原因：${reason}` : ''}</li>`
+        })
+        .join('')}</ul>`
+    : '<p>无</p>'
+
+  const lowStockText = (lowStockChannels || []).length > 0
+    ? lowStockChannels
+        .map(item => `- ${item.channelName || item.channel}（${item.channel}）：${Number(item.availableCount || 0)}`)
+        .join('\n')
+    : '无'
+
+  const bannedText = (bannedAccounts || []).length > 0
+    ? bannedAccounts
+        .map(item => `- ${item.accountEmail || 'unknown'} (ID=${Number(item.accountId || 0)}) 下架兑换码=${Number(item.deletedUnusedCodeCount || 0)}${item.reason ? ` 原因=${item.reason}` : ''}`)
+        .join('\n')
+    : '无'
+
+  return {
+    html: [
+      '<p>兑换链路告警汇总</p>',
+      `<p>触发来源：${source}</p>`,
+      `<p>触发时间：${triggerText}</p>`,
+      `<p>低库存阈值：${threshold}</p>`,
+      `<p>待授权订单数（open_accounts_board）：${Number(pendingAuthorizationOrderCount || 0)}</p>`,
+      '<h4>低库存渠道</h4>',
+      lowStockHtml,
+      '<h4>本次封号账号</h4>',
+      bannedHtml
+    ].join('\n'),
+    text: [
+      '兑换链路告警汇总',
+      `触发来源：${source}`,
+      `触发时间：${triggerText}`,
+      `低库存阈值：${threshold}`,
+      `待授权订单数（open_accounts_board）：${Number(pendingAuthorizationOrderCount || 0)}`,
+      '',
+      '低库存渠道：',
+      lowStockText,
+      '',
+      '本次封号账号：',
+      bannedText
+    ].join('\n')
+  }
+}
+
+export async function sendRedemptionFlowSummaryEmail(summary = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[RedemptionAlert] SMTP 配置不完整，跳过发送汇总告警')
+    return false
+  }
+
+  const recipients = parseRecipients(settings?.adminAlertEmail)
+  if (recipients.length === 0) {
+    console.warn('[RedemptionAlert] ADMIN_ALERT_EMAIL 未配置，跳过发送汇总告警')
+    return false
+  }
+
+  const transporter = nodemailer.createTransport(smtpConfig)
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const subject = process.env.REDEMPTION_ALERT_EMAIL_SUBJECT || '兑换链路汇总告警'
+  const { html, text } = buildRedemptionFlowSummaryBody(summary)
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipients.join(','),
+      subject,
+      text,
+      html
+    })
+    console.log('[RedemptionAlert] 汇总告警邮件已发送')
+    return true
+  } catch (error) {
+    console.warn('[RedemptionAlert] 汇总告警邮件发送失败', error?.message || error)
+    return false
+  }
+}
+
+export async function sendRedemptionOwnerNotificationEmail(payload = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[RedemptionNotify] SMTP 配置不完整，跳过发送账号通知邮件')
+    return false
+  }
+
+  const recipient = String(payload?.to || '').trim()
+  if (!recipient) {
+    console.warn('[RedemptionNotify] 缺少收件邮箱，跳过发送账号通知邮件')
+    return false
+  }
+
+  const code = String(payload?.code || '').trim()
+  const channelName = String(payload?.channelName || payload?.channel || '').trim() || 'unknown'
+  const channel = String(payload?.channel || '').trim() || 'unknown'
+  const accountEmail = String(payload?.accountEmail || '').trim()
+  const accountId = Number(payload?.accountId || 0) || null
+  const redeemerEmail = String(payload?.redeemerEmail || '').trim()
+  const redeemerUid = String(payload?.redeemerUid || '').trim()
+  const inviteStatus = String(payload?.inviteStatus || '').trim() || '未知'
+  const userCount = Number(payload?.userCount || 0)
+  const inviteCountRaw = payload?.inviteCount
+  const inviteCount = Number.isFinite(Number(inviteCountRaw)) ? Number(inviteCountRaw) : null
+  const subject = String(process.env.REDEMPTION_OWNER_NOTIFY_SUBJECT || '兑换码使用通知').trim() || '兑换码使用通知'
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const transporter = nodemailer.createTransport(smtpConfig)
+
+  const text = [
+    '您的账号兑换码已被使用，详情如下：',
+    accountId ? `账号ID：${accountId}` : null,
+    accountEmail ? `账号邮箱：${accountEmail}` : null,
+    code ? `兑换码：${code}` : null,
+    `渠道：${channelName} (${channel})`,
+    redeemerEmail ? `兑换邮箱：${redeemerEmail}` : null,
+    redeemerUid ? `兑换UID：${redeemerUid}` : null,
+    `邀请状态：${inviteStatus}`,
+    `当前用户数：${userCount}`,
+    inviteCount != null ? `当前邀请数：${inviteCount}` : null,
+    `通知时间：${new Date().toLocaleString()}`
+  ].filter(Boolean).join('\n')
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.6;">
+      <h2 style="margin: 0 0 12px;">兑换码使用通知</h2>
+      <p style="margin: 0 0 8px;">您的账号兑换码已被使用，详情如下：</p>
+      ${accountId ? `<p style="margin: 0 0 6px;">账号ID：<strong>${accountId}</strong></p>` : ''}
+      ${accountEmail ? `<p style="margin: 0 0 6px;">账号邮箱：${escapeHtml(accountEmail)}</p>` : ''}
+      ${code ? `<p style="margin: 0 0 6px;">兑换码：<strong>${escapeHtml(code)}</strong></p>` : ''}
+      <p style="margin: 0 0 6px;">渠道：${escapeHtml(channelName)} (${escapeHtml(channel)})</p>
+      ${redeemerEmail ? `<p style="margin: 0 0 6px;">兑换邮箱：${escapeHtml(redeemerEmail)}</p>` : ''}
+      ${redeemerUid ? `<p style="margin: 0 0 6px;">兑换UID：${escapeHtml(redeemerUid)}</p>` : ''}
+      <p style="margin: 0 0 6px;">邀请状态：${escapeHtml(inviteStatus)}</p>
+      <p style="margin: 0 0 6px;">当前用户数：${userCount}${inviteCount != null ? `，当前邀请数：${inviteCount}` : ''}</p>
+      <p style="margin: 0;">通知时间：${escapeHtml(new Date().toLocaleString())}</p>
+    </div>
+  `
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipient,
+      subject,
+      text,
+      html
+    })
+    console.log('[RedemptionNotify] 账号通知邮件已发送', {
+      to: recipient,
+      accountId,
+      code
+    })
+    return true
+  } catch (error) {
+    console.warn('[RedemptionNotify] 发送账号通知邮件失败', error?.message || error)
+    return false
+  }
 }
 
 export async function sendPurchaseOrderEmail(order) {
@@ -234,6 +437,66 @@ export async function sendPurchaseOrderEmail(order) {
     return true
   } catch (error) {
     console.warn('[Purchase] send order email failed', error?.message || error)
+    return false
+  }
+}
+
+export async function sendLdcShopDeliveryEmail({ to, orderNo, productName, content }) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[LdcShop] SMTP 配置不完整，跳过发送交付邮件')
+    return false
+  }
+
+  const recipient = String(to || '').trim()
+  if (!recipient) {
+    console.warn('[LdcShop] 缺少收件邮箱，跳过发送交付邮件')
+    return false
+  }
+
+  const bodyContent = String(content || '').trim()
+  if (!bodyContent) {
+    console.warn('[LdcShop] 缺少交付内容，跳过发送交付邮件')
+    return false
+  }
+
+  const transporter = nodemailer.createTransport(smtpConfig)
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const subject = String(process.env.LDC_SHOP_EMAIL_SUBJECT || 'LDC 商品交付通知').trim() || 'LDC 商品交付通知'
+
+  const normalizedOrderNo = String(orderNo || '').trim()
+  const normalizedProductName = String(productName || '').trim()
+  const text = [
+    '您的 LDC 商品已交付，请妥善保管以下信息：',
+    normalizedOrderNo ? `订单号：${normalizedOrderNo}` : null,
+    normalizedProductName ? `商品：${normalizedProductName}` : null,
+    '',
+    bodyContent
+  ].filter(Boolean).join('\n')
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.6;">
+      <h2 style="margin: 0 0 12px;">LDC 商品交付通知</h2>
+      ${normalizedOrderNo ? `<p style="margin: 0 0 6px;">订单号：<strong>${escapeHtml(normalizedOrderNo)}</strong></p>` : ''}
+      ${normalizedProductName ? `<p style="margin: 0 0 12px;">商品：${escapeHtml(normalizedProductName)}</p>` : ''}
+      <p style="margin: 0 0 6px;">交付内容：</p>
+      <pre style="margin: 0; white-space: pre-wrap; word-break: break-word; background: #f5f7fa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px;">${escapeHtml(bodyContent)}</pre>
+    </div>
+  `
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipient,
+      subject,
+      text,
+      html
+    })
+    console.log('[LdcShop] delivery email sent', { orderNo: normalizedOrderNo || null })
+    return true
+  } catch (error) {
+    console.warn('[LdcShop] send delivery email failed', error?.message || error)
     return false
   }
 }

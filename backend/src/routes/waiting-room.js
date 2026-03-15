@@ -15,9 +15,9 @@ const toInt = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
-const WAITING_ROOM_CAPACITY = Math.max(0, toInt(process.env.WAITING_ROOM_MAX_SIZE, 500))
-const WAITING_ROOM_MIN_TRUST_LEVEL = Math.max(0, toInt(process.env.WAITING_ROOM_MIN_TRUST_LEVEL, 1))
-const WAITING_ROOM_REJOIN_COOLDOWN_DAYS = Math.max(0, toInt(process.env.WAITING_ROOM_REJOIN_COOLDOWN_DAYS, 30))
+const getWaitingRoomCapacity = () => Math.max(0, toInt(process.env.WAITING_ROOM_MAX_SIZE, 500))
+const getWaitingRoomMinTrustLevel = () => Math.max(0, toInt(process.env.WAITING_ROOM_MIN_TRUST_LEVEL, 1))
+const getWaitingRoomRejoinCooldownDays = () => Math.max(0, toInt(process.env.WAITING_ROOM_REJOIN_COOLDOWN_DAYS, 30))
 const ENTRY_FIELDS = `
   id,
   linuxdo_uid,
@@ -39,14 +39,19 @@ const ENTRY_FIELDS = `
 
 const VALID_STATUSES = new Set(['waiting', 'boarded', 'left'])
 
-const getWaitingRoomConfig = () => ({
-  capacity: WAITING_ROOM_CAPACITY,
-  minTrustLevel: WAITING_ROOM_MIN_TRUST_LEVEL,
-  cooldownDays: WAITING_ROOM_REJOIN_COOLDOWN_DAYS,
-  enabled: WAITING_ROOM_CAPACITY > 0,
-})
+const getWaitingRoomConfig = () => {
+  const capacity = getWaitingRoomCapacity()
+  const minTrustLevel = getWaitingRoomMinTrustLevel()
+  const cooldownDays = getWaitingRoomRejoinCooldownDays()
+  return {
+    capacity,
+    minTrustLevel,
+    cooldownDays,
+    enabled: capacity > 0,
+  }
+}
 
-const isWaitingRoomEnabled = () => WAITING_ROOM_CAPACITY > 0
+const isWaitingRoomEnabled = () => getWaitingRoomCapacity() > 0
 
 const getClientIp = (req) => {
   const cfConnectingIp = req.headers['cf-connecting-ip']
@@ -102,11 +107,11 @@ const getScalar = result => {
   return result[0].values[0][0] || 0
 }
 
-const calculateCooldownEndsAt = (boardedAt) => {
-  if (!boardedAt || !WAITING_ROOM_REJOIN_COOLDOWN_DAYS) return null
+const calculateCooldownEndsAt = (boardedAt, cooldownDays = getWaitingRoomRejoinCooldownDays()) => {
+  if (!boardedAt || !cooldownDays) return null
   const boardedDate = new Date(String(boardedAt).replace(' ', 'T'))
   if (Number.isNaN(boardedDate.getTime())) return null
-  const cooldownMs = WAITING_ROOM_REJOIN_COOLDOWN_DAYS * 24 * 60 * 60 * 1000
+  const cooldownMs = cooldownDays * 24 * 60 * 60 * 1000
   return new Date(boardedDate.getTime() + cooldownMs).toISOString()
 }
 
@@ -127,8 +132,9 @@ const getCooldownResetAt = (db, linuxDoUid) => {
 }
 
 const getCooldownInfo = (db, linuxDoUid) => {
-  if (!WAITING_ROOM_REJOIN_COOLDOWN_DAYS) {
-    return { lastBoardedAt: null, lastBoardedEmail: null, cooldownEndsAt: null, isInCooldown: false, resetAt: null }
+  const cooldownDays = getWaitingRoomRejoinCooldownDays()
+  if (!cooldownDays) {
+    return { lastBoardedAt: null, lastBoardedEmail: null, cooldownEndsAt: null, isInCooldown: false, resetAt: null, cooldownDays }
   }
 
   const result = db.exec(
@@ -141,26 +147,26 @@ const getCooldownInfo = (db, linuxDoUid) => {
     [linuxDoUid]
   )
   if (!result.length || !result[0].values.length) {
-    return { lastBoardedAt: null, lastBoardedEmail: null, cooldownEndsAt: null, isInCooldown: false, resetAt: null }
+    return { lastBoardedAt: null, lastBoardedEmail: null, cooldownEndsAt: null, isInCooldown: false, resetAt: null, cooldownDays }
   }
   const lastBoardedAt = result[0].values[0][0]
   const lastBoardedEmail = result[0].values[0][1] || null
-  const cooldownEndsAt = calculateCooldownEndsAt(lastBoardedAt)
+  const cooldownEndsAt = calculateCooldownEndsAt(lastBoardedAt, cooldownDays)
   const resetAt = getCooldownResetAt(db, linuxDoUid)
 
   if (resetAt && lastBoardedAt) {
     const resetDate = new Date(String(resetAt).replace(' ', 'T'))
     const boardedDate = new Date(String(lastBoardedAt).replace(' ', 'T'))
     if (!Number.isNaN(resetDate.getTime()) && !Number.isNaN(boardedDate.getTime()) && resetDate.getTime() >= boardedDate.getTime()) {
-      return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt: null, isInCooldown: false, resetAt }
+      return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt: null, isInCooldown: false, resetAt, cooldownDays }
     }
   }
 
   if (!cooldownEndsAt) {
-    return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt: null, isInCooldown: false, resetAt }
+    return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt: null, isInCooldown: false, resetAt, cooldownDays }
   }
   const isInCooldown = Date.now() < new Date(cooldownEndsAt).getTime()
-  return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt, isInCooldown, resetAt }
+  return { lastBoardedAt, lastBoardedEmail, cooldownEndsAt, isInCooldown, resetAt, cooldownDays }
 }
 
 const buildQueueSnapshot = (db, linuxDoUid) => {
@@ -414,7 +420,7 @@ router.post('/join', authenticateLinuxDoSession, async (req, res) => {
       const cooldownInfo = getCooldownInfo(db, normalizedUid)
       if (cooldownInfo.isInCooldown) {
         return res.status(403).json({
-          error: `您已完成上车，请等待 ${WAITING_ROOM_REJOIN_COOLDOWN_DAYS} 天后再加入候车室`,
+          error: `您已完成上车，请等待 ${cooldownInfo.cooldownDays} 天后再加入候车室`,
           cooldownEndsAt: cooldownInfo.cooldownEndsAt
         })
       }

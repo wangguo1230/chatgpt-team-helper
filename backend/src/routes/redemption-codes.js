@@ -4,7 +4,14 @@ import { authenticateToken } from '../middleware/auth.js'
 import { requireMenu } from '../middleware/rbac.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { verifyLinuxDoSessionToken } from '../middleware/linuxdo-session.js'
-import { fetchAccountUsersList, syncAccountInviteCount, syncAccountUserCount, inviteAccountUser } from '../services/account-sync.js'
+import {
+  fetchAccountUsersList,
+  syncAccountInviteCount,
+  syncAccountUserCount,
+  inviteAccountUser,
+  markAccountAsBannedAndCleanup
+} from '../services/account-sync.js'
+import { sendRedemptionFlowSummaryEmail, sendRedemptionOwnerNotificationEmail } from '../services/email-service.js'
 import {
   getXhsConfig,
   getXhsOrderByNumber,
@@ -32,6 +39,13 @@ import { getChannels, normalizeChannelKey } from '../utils/channels.js'
 import { resolveOrderDeadlineMs, selectRecoveryCode } from '../services/account-recovery.js'
 import { getAccountRecoverySettings } from '../utils/account-recovery-settings.js'
 import { getRedemptionCodeSettings } from '../utils/redemption-settings.js'
+import {
+  getOpenAccountsCapacityLimit,
+  getOpenAccountsCapacityLimitFromEnv,
+  OPEN_ACCOUNTS_CAPACITY_LIMIT_KEY,
+  OPEN_ACCOUNTS_CAPACITY_LIMIT_MAX,
+  OPEN_ACCOUNTS_CAPACITY_LIMIT_MIN
+} from '../utils/open-accounts-capacity-settings.js'
 
 const router = express.Router()
 
@@ -51,29 +65,31 @@ const parseBoolean = (value, fallback) => {
   return fallback
 }
 const HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS = 30
-const ACCOUNT_RECOVERY_WINDOW_DAYS = Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
-const ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS = Math.min(
+const getAccountRecoveryWindowDays = () => Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
+const getAccountRecoveryRedeemMaxAttempts = () => Math.min(
   10,
   Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS, 3))
 )
-const ACCOUNT_RECOVERY_ACCESS_CACHE_TTL_MS = Math.max(
+const getAccountRecoveryAccessCacheTtlMs = () => Math.max(
   0,
   toInt(process.env.ACCOUNT_RECOVERY_ACCESS_CACHE_TTL_MS, 60_000)
 )
 const ACCOUNT_RECOVERY_ACCESS_CACHE_MAX_SIZE = 2000
 const accountRecoveryAccessCache = new Map()
 const getAccountRecoveryAccessCache = (accountId) => {
-  if (!accountId || ACCOUNT_RECOVERY_ACCESS_CACHE_TTL_MS <= 0) return null
+  const ttlMs = getAccountRecoveryAccessCacheTtlMs()
+  if (!accountId || ttlMs <= 0) return null
   const entry = accountRecoveryAccessCache.get(accountId)
   if (!entry) return null
-  if (Date.now() - entry.checkedAt > ACCOUNT_RECOVERY_ACCESS_CACHE_TTL_MS) {
+  if (Date.now() - entry.checkedAt > ttlMs) {
     accountRecoveryAccessCache.delete(accountId)
     return null
   }
   return entry
 }
 const setAccountRecoveryAccessCache = (accountId, entry) => {
-  if (!accountId || ACCOUNT_RECOVERY_ACCESS_CACHE_TTL_MS <= 0 || !entry) return
+  const ttlMs = getAccountRecoveryAccessCacheTtlMs()
+  if (!accountId || ttlMs <= 0 || !entry) return
   if (accountRecoveryAccessCache.size > ACCOUNT_RECOVERY_ACCESS_CACHE_MAX_SIZE) {
     const firstKey = accountRecoveryAccessCache.keys().next().value
     if (firstKey != null) accountRecoveryAccessCache.delete(firstKey)
@@ -86,20 +102,12 @@ const ORDER_TYPE_ANTI_BAN = 'anti_ban'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
 const normalizeOrderType = (value) => {
   const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'no-warranty' || normalized === 'nowarranty') return ORDER_TYPE_NO_WARRANTY
+  if (normalized === 'anti-ban') return ORDER_TYPE_ANTI_BAN
   return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
 }
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
 const isAntiBanOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_ANTI_BAN
-
-const parseAmountNumber = (value) => {
-  if (value === undefined || value === null) return null
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null
-  const normalized = String(value).trim()
-  if (!normalized) return null
-  const cleaned = normalized.replace(/[^\d.-]/g, '')
-  const parsed = Number(cleaned)
-  return Number.isFinite(parsed) ? parsed : null
-}
 
 const pad2 = (value) => String(value).padStart(2, '0')
 const addDays = (date, days) => {
@@ -138,10 +146,11 @@ const normalizeStrictToday = (value) => {
   return true
 }
 
-const STRICT_TODAY_DEFAULT = normalizeStrictToday(process.env.REDEEM_ORDER_STRICT_TODAY_DEFAULT)
+const getStrictTodayDefault = () => normalizeStrictToday(process.env.REDEEM_ORDER_STRICT_TODAY_DEFAULT)
 const resolveStrictTodayEnabled = (value) => {
-  if (value === undefined || value === null) return STRICT_TODAY_DEFAULT
-  if (typeof value === 'string' && !value.trim()) return STRICT_TODAY_DEFAULT
+  const strictTodayDefault = getStrictTodayDefault()
+  if (value === undefined || value === null) return strictTodayDefault
+  if (typeof value === 'string' && !value.trim()) return strictTodayDefault
   return normalizeStrictToday(value)
 }
 
@@ -172,20 +181,49 @@ const parseExpireAtToMs = (value) => {
   return Number.isNaN(parsed) ? null : parsed
 }
 
-const resolveXianyuOrderTypeFromActualPaid = (actualPaid) => {
-  const paid = parseAmountNumber(actualPaid)
-  if (paid == null) return ORDER_TYPE_WARRANTY
-  // 兼容两种单位：
-  // - 直接是元：5 / 15
-  // - 被同步成“分”：500 / 1500
-  const asYuan = paid
-  const asCentToYuan = paid / 100
-  const tierDistance = (value) => Math.min(Math.abs(value - 5), Math.abs(value - 15))
-  const normalized = tierDistance(asCentToYuan) < tierDistance(asYuan) ? asCentToYuan : asYuan
-
-  // 约定：< 10 元按“无质保（5元档）”，>= 10 元按“质保（15元档）”
-  return normalized < 10 ? ORDER_TYPE_NO_WARRANTY : ORDER_TYPE_WARRANTY
+const getOpenAccountsCapacityLimitSqlExpr = () => {
+  const capacityFallback = getOpenAccountsCapacityLimitFromEnv()
+  return `
+    COALESCE(
+      (
+        SELECT CAST(TRIM(sc.config_value) AS INTEGER)
+        FROM system_config sc
+        WHERE sc.config_key = '${OPEN_ACCOUNTS_CAPACITY_LIMIT_KEY}'
+          AND TRIM(sc.config_value) != ''
+          AND TRIM(sc.config_value) NOT GLOB '*[^0-9]*'
+          AND CAST(TRIM(sc.config_value) AS INTEGER) BETWEEN ${OPEN_ACCOUNTS_CAPACITY_LIMIT_MIN} AND ${OPEN_ACCOUNTS_CAPACITY_LIMIT_MAX}
+        LIMIT 1
+      ),
+      ${capacityFallback}
+    )
+  `
 }
+
+const getAccountRedeemableSql = () => `
+  COALESCE(ga.is_open, 0) = 1
+  AND COALESCE(ga.is_banned, 0) = 0
+  AND ga.token IS NOT NULL
+  AND trim(ga.token) != ''
+  AND ga.chatgpt_account_id IS NOT NULL
+  AND trim(ga.chatgpt_account_id) != ''
+  AND ga.expire_at IS NOT NULL
+  AND trim(ga.expire_at) != ''
+  AND trim(ga.expire_at) >= ?
+  AND COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0) < ${getOpenAccountsCapacityLimitSqlExpr()}
+`
+
+const getCodeAccountRedeemableExistsSql = () => `
+  (
+    rc.account_email IS NULL
+    OR trim(rc.account_email) = ''
+    OR EXISTS (
+      SELECT 1
+      FROM gpt_accounts ga
+      WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+        AND ${getAccountRedeemableSql()}
+    )
+  )
+`
 
 const resolveChannelNameFromRegistry = (channelsByKey, channelKey) => {
   if (!channelsByKey || !channelKey) return ''
@@ -229,6 +267,200 @@ const mapCodeRow = (row, channelsByKey) => {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const CODE_REGEX = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/
 const OUT_OF_STOCK_MESSAGE = '暂无可用兑换码，请联系管理员补货'
+const getRedemptionLowStockThresholdFromEnv = () => Math.max(0, toInt(process.env.REDEMPTION_LOW_STOCK_THRESHOLD, 0))
+const getRedeemLazyRetryMaxAttempts = () => Math.max(1, toInt(process.env.REDEEM_LAZY_RETRY_MAX_ATTEMPTS, 8))
+const REDEEM_ACCOUNT_UNAVAILABLE_ERROR_CODE = 'ACCOUNT_UNAVAILABLE'
+
+const normalizeAlertScopeChannels = (channels) => {
+  if (!Array.isArray(channels)) return []
+  const deduped = []
+  const seen = new Set()
+  for (const raw of channels) {
+    const normalized = normalizeChannel(raw, '')
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    deduped.push(normalized)
+  }
+  return deduped
+}
+
+export const createRedemptionAlertCollector = (source = 'redeem', options = {}) => ({
+  source,
+  triggeredAt: new Date(),
+  lowStockChannels: [],
+  lowStockCollected: false,
+  pendingAuthorizationOrderCount: 0,
+  pendingAuthorizationCollected: false,
+  threshold: getRedemptionLowStockThresholdFromEnv(),
+  bannedAccountsById: new Map(),
+  scopeChannels: normalizeAlertScopeChannels(options?.scopeChannels)
+})
+
+const recordBannedAccountAlert = (collector, payload) => {
+  if (!collector || !payload) return
+  const accountId = Number(payload.accountId || 0)
+  const key = Number.isFinite(accountId) && accountId > 0 ? accountId : `email:${String(payload.accountEmail || '').trim().toLowerCase()}`
+  collector.bannedAccountsById.set(key, {
+    accountId: Number(payload.accountId || 0),
+    accountEmail: String(payload.accountEmail || ''),
+    deletedUnusedCodeCount: Number(payload.deletedUnusedCodeCount || 0),
+    reason: String(payload.reason || '').trim()
+  })
+}
+
+const shouldMarkAccountUnavailable = (error) => {
+  if (isAccountAccessFailure(error)) return true
+  const message = String(error?.message || '').trim().toLowerCase()
+  return message.includes('account_deactivated') || message.includes('token 已过期') || message.includes('token已过期')
+}
+
+const isLazyRetryableAccountError = (error) => {
+  return error instanceof RedemptionError && String(error?.payload?.errorCode || '') === REDEEM_ACCOUNT_UNAVAILABLE_ERROR_CODE
+}
+
+const buildExcludeCodeClause = (excludeCodeIds = [], alias = 'rc') => {
+  const ids = (excludeCodeIds || [])
+    .map(id => Number(id))
+    .filter(id => Number.isFinite(id) && id > 0)
+  if (ids.length === 0) {
+    return { clause: '', params: [] }
+  }
+  return {
+    clause: ` AND ${alias}.id NOT IN (${ids.map(() => '?').join(',')})`,
+    params: ids
+  }
+}
+
+const collectPendingAuthorizationOrderCount = (db, collector) => {
+  if (!db || !collector || collector.pendingAuthorizationCollected) return
+  collector.pendingAuthorizationCollected = true
+  try {
+    const result = db.exec(
+      `
+        SELECT COUNT(*)
+        FROM credit_orders
+        WHERE scene = 'open_accounts_board'
+          AND status IN ('created', 'pending_payment')
+      `
+    )
+    collector.pendingAuthorizationOrderCount = Number(result?.[0]?.values?.[0]?.[0] || 0)
+  } catch {
+    // 兼容旧测试/历史表结构：缺少 credit_orders 时默认 0。
+    collector.pendingAuthorizationOrderCount = 0
+  }
+}
+
+const collectLowStockAlerts = async (db, collector) => {
+  if (!collector || collector.lowStockCollected) return
+  collector.lowStockCollected = true
+  collectPendingAuthorizationOrderCount(db, collector)
+  try {
+    const settings = getRedemptionCodeSettings(db)
+    const resolvedThreshold = Number(settings?.lowStockThreshold)
+    if (Number.isFinite(resolvedThreshold) && resolvedThreshold >= 0) {
+      collector.threshold = resolvedThreshold
+    }
+  } catch {
+    // Ignore settings load failures and fallback to collector threshold.
+  }
+  if (collector.threshold <= 0) return
+
+  const { list: channels = [] } = await getChannels(db)
+  const scoped = normalizeAlertScopeChannels(collector.scopeChannels)
+  const activeChannels = channels
+    .filter(channel => channel?.isActive)
+    .filter(channel => scoped.length === 0 || scoped.includes(normalizeChannel(channel?.key, 'common')))
+  if (activeChannels.length === 0) return
+
+  const nowComparable = formatExpireAtComparable(new Date())
+  if (!nowComparable) return
+
+  const stockResult = db.exec(
+    `
+      SELECT COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') AS channel_key, COUNT(*) AS available_count
+      FROM redemption_codes rc
+      WHERE rc.is_redeemed = 0
+        AND (rc.reserved_for_uid IS NULL OR trim(rc.reserved_for_uid) = '')
+        AND (rc.reserved_for_order_no IS NULL OR trim(rc.reserved_for_order_no) = '')
+        AND COALESCE(rc.reserved_for_entry_id, 0) = 0
+        AND (
+          (
+            (rc.account_email IS NULL OR trim(rc.account_email) = '')
+            AND EXISTS (
+              SELECT 1
+              FROM gpt_accounts ga
+              WHERE ${getAccountRedeemableSql()}
+              LIMIT 1
+            )
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM gpt_accounts ga
+            WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+              AND ${getAccountRedeemableSql()}
+          )
+        )
+      GROUP BY COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common')
+    `,
+    [nowComparable, nowComparable]
+  )
+  const stockMap = new Map()
+  for (const row of stockResult?.[0]?.values || []) {
+    const key = normalizeChannel(row[0], 'common')
+    stockMap.set(key, Number(row[1] || 0))
+  }
+
+  collector.lowStockChannels = activeChannels
+    .map(channel => {
+      const key = normalizeChannel(channel.key, 'common')
+      const availableCount = Number(stockMap.get(key) || 0)
+      return {
+        channel: key,
+        channelName: String(channel.name || '').trim() || key,
+        availableCount
+      }
+    })
+    .filter(item => item.availableCount < collector.threshold)
+}
+
+export const collectRedemptionLowStockAlerts = collectLowStockAlerts
+
+export const flushRedemptionAlertCollector = async (collector) => {
+  if (!collector) return
+  const bannedAccounts = Array.from(collector.bannedAccountsById.values())
+  const lowStockChannels = collector.lowStockChannels || []
+  if (bannedAccounts.length === 0 && lowStockChannels.length === 0) return
+
+  await sendRedemptionFlowSummaryEmail({
+    source: collector.source,
+    threshold: collector.threshold,
+    pendingAuthorizationOrderCount: Number(collector.pendingAuthorizationOrderCount || 0),
+    lowStockChannels,
+    bannedAccounts,
+    triggeredAt: collector.triggeredAt
+  })
+}
+
+export const emitRedemptionLowStockAlerts = async (db, source = 'redeem') => {
+  if (!db) return { threshold: 0, lowStockChannels: [], sent: false }
+  const collector = createRedemptionAlertCollector(source)
+  await collectLowStockAlerts(db, collector)
+  const lowStockChannels = collector.lowStockChannels || []
+  if (lowStockChannels.length === 0) {
+    return {
+      threshold: collector.threshold,
+      lowStockChannels,
+      sent: false
+    }
+  }
+  await flushRedemptionAlertCollector(collector)
+  return {
+    threshold: collector.threshold,
+    lowStockChannels,
+    sent: true
+  }
+}
+
 const extractEmailFromRedeemedBy = (redeemedBy) => {
   const raw = String(redeemedBy ?? '').trim()
   if (!raw) return ''
@@ -268,13 +500,36 @@ const buildRecoveryWindowEndsAt = (redeemedAt) => {
   if (!redeemedAt) return null
   const redeemedTime = new Date(redeemedAt).getTime()
   if (Number.isNaN(redeemedTime)) return null
-  const windowMs = ACCOUNT_RECOVERY_WINDOW_DAYS * 24 * 60 * 60 * 1000
+  const windowMs = getAccountRecoveryWindowDays() * 24 * 60 * 60 * 1000
   return new Date(redeemedTime + windowMs).toISOString()
 }
 
 const isAccountAccessFailure = (error) => {
   const status = Number(error?.status ?? error?.statusCode ?? error?.response?.status)
   return status === 400 || status === 401 || status === 403 || status === 404
+}
+
+const banAccountForRedemptionFlow = async ({
+  db,
+  accountId,
+  accountEmail,
+  reason,
+  alertCollector
+}) => {
+  if (!db || !Number.isFinite(Number(accountId)) || Number(accountId) <= 0) return null
+  const shouldSendImmediateAlert = !alertCollector
+  const result = await withLocks([`acct:${accountId}`], async () => {
+    return markAccountAsBannedAndCleanup(db, accountId, reason, { sendAlertEmail: shouldSendImmediateAlert })
+  })
+
+  const payload = {
+    accountId: Number(accountId),
+    accountEmail: String(result?.accountEmail || accountEmail || ''),
+    deletedUnusedCodeCount: Number(result?.deletedUnusedCodeCount || 0),
+    reason
+  }
+  recordBannedAccountAlert(alertCollector, payload)
+  return payload
 }
 
 const shouldRetryAccountRecoveryRedeem = (error) => {
@@ -332,12 +587,12 @@ export async function redeemCodeInternal({
   email,
   code,
   channel = 'common',
-  orderType,
   redeemerUid,
-  capacityLimit = 6,
+  capacityLimit = null,
   skipCodeFormatValidation = false,
   allowCommonChannelFallback = false,
   allowNonOpenAccount = false,
+  alertCollector = null,
 }) {
   const normalizedEmail = (email || '').trim()
   if (!normalizedEmail) {
@@ -359,6 +614,7 @@ export async function redeemCodeInternal({
 
   const requestedChannel = normalizeChannel(channel, 'common')
   const normalizedRedeemerUid = redeemerUid != null ? String(redeemerUid).trim() : ''
+  const suppressAlertEmail = Boolean(alertCollector)
 
   const db = await getDatabase()
   const { byKey: channelsByKey } = await getChannels(db)
@@ -400,7 +656,6 @@ export async function redeemCodeInternal({
   const reservedForEntryId = codeRecord.reservedForEntryId
   const reservedForOrderNo = codeRecord.reservedForOrderNo ? String(codeRecord.reservedForOrderNo).trim() : ''
   const reservedForOrderEmail = codeRecord.reservedForOrderEmail ? normalizeEmail(codeRecord.reservedForOrderEmail) : ''
-  let resolvedOrderType = normalizeOrderType(orderType || codeRecord.orderType)
   const redeemerIdentifier = requestedChannelConfig.redeemMode === 'linux-do' && normalizedRedeemerUid
     ? `UID:${normalizedRedeemerUid} | Email:${normalizedEmail}`
     : normalizedEmail
@@ -425,7 +680,7 @@ export async function redeemCodeInternal({
   if (reservedForOrderNo) {
     const orderResult = db.exec(
       `
-        SELECT status, email, refunded_at, order_type
+        SELECT status, email, refunded_at
         FROM purchase_orders
         WHERE order_no = ?
         LIMIT 1
@@ -438,10 +693,6 @@ export async function redeemCodeInternal({
       const orderStatus = String(orderRow[0] || '')
       const orderEmail = normalizeEmail(orderRow[1])
       const refundedAt = orderRow[2]
-      const orderTypeFromOrder = orderRow[3]
-      if (orderTypeFromOrder != null && String(orderTypeFromOrder).trim()) {
-        resolvedOrderType = normalizeOrderType(orderTypeFromOrder)
-      }
 
       if (refundedAt || orderStatus === 'refunded') {
         throw new RedemptionError(403, '该订单已退款，兑换码已失效')
@@ -498,7 +749,12 @@ export async function redeemCodeInternal({
 
   let accountResult
 
-  const maxSeats = Math.max(1, Number(capacityLimit) || 5)
+  const configuredCapacity = getOpenAccountsCapacityLimit(db)
+  const requestedCapacity = Number.parseInt(String(capacityLimit ?? '').trim(), 10)
+  const resolvedCapacity = Number.isFinite(requestedCapacity) && requestedCapacity > 0
+    ? requestedCapacity
+    : configuredCapacity
+  const maxSeats = Math.max(1, resolvedCapacity)
   const nowMs = Date.now()
   const accountCandidatesLimit = 50
   const isAccountUsable = (row) => {
@@ -597,22 +853,46 @@ export async function redeemCodeInternal({
   const accountToken = account[2]
   const currentUserCount = account[3] || 0
   const chatgptAccountId = account[4]
-  const oaiDeviceId = account[5]
-  const accountData = {
-    token: accountToken,
-    chatgpt_account_id: chatgptAccountId,
-    oai_device_id: oaiDeviceId
+
+  if (chatgptAccountId && accountToken) {
+    try {
+      await fetchAccountUsersList(accountId, {
+        userListParams: { offset: 0, limit: 1, query: '' },
+        suppressAlertEmail
+      })
+    } catch (error) {
+      if (shouldMarkAccountUnavailable(error)) {
+        const reason = `兑换前账号校验失败：${error?.message || '未知错误'}`
+        const banInfo = await banAccountForRedemptionFlow({
+          db,
+          accountId,
+          accountEmail,
+          reason,
+          alertCollector
+        })
+        throw new RedemptionError(503, '该兑换码绑定账号不可用或已过期，请联系管理员', {
+          errorCode: REDEEM_ACCOUNT_UNAVAILABLE_ERROR_CODE,
+          accountId,
+          accountEmail: banInfo?.accountEmail || accountEmail,
+          reason
+        })
+      }
+      console.warn('[Redemption] 账号状态预检查失败，忽略并继续兑换', {
+        accountId,
+        message: error?.message || String(error)
+      })
+    }
   }
 
   try {
+    // 兑换时仅写入使用信息，不覆盖创建时的 order_type/service_days。
     const updates = [
       'is_redeemed = 1',
       "redeemed_at = DATETIME('now', 'localtime')",
       'redeemed_by = ?',
-      'order_type = ?',
       "updated_at = DATETIME('now', 'localtime')",
     ]
-    const updateParams = [redeemerIdentifier, resolvedOrderType]
+    const updateParams = [redeemerIdentifier]
 
     if (fallbackFromCommonChannelAllowed && codeChannel !== requestedChannel) {
       const requestedChannelName = String(requestedChannelConfig?.name || '').trim() || requestedChannel
@@ -672,10 +952,47 @@ export async function redeemCodeInternal({
 
   if (chatgptAccountId && accountToken) {
     try {
-      const inviteResp = await inviteAccountUser(accountId, normalizedEmail)
+      const inviteResp = await inviteAccountUser(accountId, normalizedEmail, { suppressAlertEmail })
       inviteResult = { success: true, response: inviteResp.invite }
       console.log(`成功邀请用户 ${normalizedEmail} 加入账号 ${chatgptAccountId}`)
     } catch (error) {
+      if (shouldMarkAccountUnavailable(error)) {
+        const reason = `兑换邀请失败：${error?.message || '未知错误'}`
+        try {
+          db.run(
+            `
+              UPDATE redemption_codes
+              SET is_redeemed = 0,
+                  redeemed_at = NULL,
+                  redeemed_by = NULL,
+                  updated_at = DATETIME('now', 'localtime')
+              WHERE id = ?
+            `,
+            [codeId]
+          )
+          saveDatabase()
+        } catch (rollbackError) {
+          console.warn('[Redemption] 回滚兑换码状态失败', {
+            codeId,
+            accountId,
+            message: rollbackError?.message || String(rollbackError)
+          })
+        }
+
+        const banInfo = await banAccountForRedemptionFlow({
+          db,
+          accountId,
+          accountEmail,
+          reason,
+          alertCollector
+        })
+        throw new RedemptionError(503, '该兑换码绑定账号不可用或已过期，请联系管理员', {
+          errorCode: REDEEM_ACCOUNT_UNAVAILABLE_ERROR_CODE,
+          accountId,
+          accountEmail: banInfo?.accountEmail || accountEmail,
+          reason
+        })
+      }
       inviteResult = { success: false, error: error.message || '邀请失败' }
       console.error(`邀请用户 ${normalizedEmail} 失败:`, error.message)
     }
@@ -683,7 +1000,8 @@ export async function redeemCodeInternal({
     if (inviteResult.success) {
       try {
         const userSync = await syncAccountUserCount(accountId, {
-          userListParams: { offset: 0, limit: 1, query: '' }
+          userListParams: { offset: 0, limit: 1, query: '' },
+          suppressAlertEmail
         })
         syncedAccount = userSync.account
         if (typeof userSync.syncedUserCount === 'number') {
@@ -695,7 +1013,8 @@ export async function redeemCodeInternal({
 
       try {
         const inviteSync = await syncAccountInviteCount(accountId, {
-          inviteListParams: { offset: 0, limit: 1, query: '' }
+          inviteListParams: { offset: 0, limit: 1, query: '' },
+          suppressAlertEmail
         })
         syncedAccount = inviteSync.account || syncedAccount
         if (typeof inviteSync.inviteCount === 'number') {
@@ -720,6 +1039,39 @@ export async function redeemCodeInternal({
       ? syncedInviteCount
       : null
 
+  let ownerNotifyStatus = '未发送'
+  let ownerNotifyMessage = '缺少账号邮箱，跳过通知'
+  if (accountEmail) {
+    try {
+      const ownerMailSent = await sendRedemptionOwnerNotificationEmail({
+        to: accountEmail,
+        accountId,
+        accountEmail,
+        code: sanitizedCode,
+        channel: requestedChannel,
+        channelName: codeRecord.channelName || requestedChannelConfig?.name || requestedChannel,
+        redeemerEmail: normalizedEmail,
+        redeemerUid: normalizedRedeemerUid,
+        inviteStatus: inviteResult.success ? '邀请已发送' : '邀请未发送（需要手动添加）',
+        userCount: resolvedUserCount,
+        inviteCount: resolvedInviteCount
+      })
+      ownerNotifyStatus = ownerMailSent ? '已发送' : '发送失败'
+      ownerNotifyMessage = ownerMailSent
+        ? '已通知兑换码所属账号邮箱'
+        : 'SMTP 未配置或发送失败'
+    } catch (error) {
+      ownerNotifyStatus = '发送失败'
+      ownerNotifyMessage = error?.message || '发送失败'
+      console.warn('[Redemption] 账号通知邮件发送异常', {
+        accountId,
+        accountEmail,
+        code: sanitizedCode,
+        message: ownerNotifyMessage
+      })
+    }
+  }
+
   return {
     data: {
       accountEmail: accountEmail,
@@ -727,7 +1079,9 @@ export async function redeemCodeInternal({
       inviteStatus: inviteResult.success ? '邀请已发送' : '邀请未发送（需要手动添加）',
       inviteDetails: inviteResult.success ? inviteResult.response : inviteResult.error,
       message: `您已成功加入 GPT team账号${inviteResult.success ? '，邀请邮件已发送至您的邮箱' : '，请联系管理员手动添加'}`,
-      inviteCount: resolvedInviteCount
+      inviteCount: resolvedInviteCount,
+      ownerNotifyStatus,
+      ownerNotifyMessage
     },
     metadata: {
       codeId,
@@ -967,6 +1321,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
     if (!accountEmail) {
       return res.status(400).json({ error: '必须指定所属账号邮箱' })
     }
+    const normalizedAccountEmail = normalizeEmail(accountEmail)
 
     const rawOrderType = orderType == null ? '' : String(orderType).trim().toLowerCase()
     const resolvedOrderType = rawOrderType ? normalizeOrderType(rawOrderType) : ORDER_TYPE_WARRANTY
@@ -974,8 +1329,13 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       return res.status(400).json({ error: 'orderType 不合法（仅支持 warranty/no_warranty/anti_ban）' })
     }
 
+    const hasServiceDaysInput = serviceDays !== undefined && serviceDays !== null && String(serviceDays).trim() !== ''
+    if (resolvedOrderType === ORDER_TYPE_WARRANTY && !hasServiceDaysInput) {
+      return res.status(400).json({ error: 'warranty 订单必须设置 serviceDays（1-3650）' })
+    }
+
     let resolvedServiceDays = null
-    if (resolvedOrderType !== ORDER_TYPE_NO_WARRANTY && serviceDays !== undefined && serviceDays !== null && String(serviceDays).trim() !== '') {
+    if (resolvedOrderType !== ORDER_TYPE_NO_WARRANTY && hasServiceDaysInput) {
       const parsedServiceDays = Number.parseInt(String(serviceDays), 10)
       if (!Number.isFinite(parsedServiceDays) || parsedServiceDays < 1 || parsedServiceDays > 3650) {
         return res.status(400).json({ error: 'serviceDays 不合法（必须为 1-3650 的整数）' })
@@ -983,20 +1343,32 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       resolvedServiceDays = parsedServiceDays
     }
 
-    const { byKey: channelsByKey } = await getChannels(db)
+    const { byKey: channelsByKey } = await getChannels(db, { forceRefresh: true })
 
     // 检查账号是否存在并获取当前人数
     const accountResult = db.exec(`
-      SELECT id, email, user_count, expire_at FROM gpt_accounts WHERE email = ?
-    `, [accountEmail])
+      SELECT
+        id,
+        email,
+        COALESCE(user_count, 0) AS user_count,
+        COALESCE(invite_count, 0) AS invite_count,
+        expire_at
+      FROM gpt_accounts
+      WHERE lower(trim(email)) = ?
+      LIMIT 1
+    `, [normalizedAccountEmail])
 
     if (accountResult.length === 0 || accountResult[0].values.length === 0) {
       return res.status(404).json({ error: '指定的账号不存在' })
     }
 
     const accountRow = accountResult[0].values[0]
-    const currentUserCount = accountRow[2] || 0
-    const expireAt = accountRow[3]
+    const accountRecordEmail = String(accountRow[1] || normalizedAccountEmail)
+    const currentUserCount = Number(accountRow[2] || 0)
+    const inviteCount = Number(accountRow[3] || 0)
+    const currentOccupiedSeats = currentUserCount + inviteCount
+    const expireAt = accountRow[4]
+    const capacityLimit = getOpenAccountsCapacityLimit(db)
 
     if (expireAt) {
       const expireMs = parseExpireAtToMs(expireAt)
@@ -1005,33 +1377,34 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
       }
     }
 
-    // 如果账号已满员（5人），不能创建兑换码
-    if (currentUserCount >= 5) {
+    if (currentOccupiedSeats >= capacityLimit) {
       return res.status(400).json({
-        error: '该账号已满员（5人），无法创建兑换码',
-        currentUserCount: currentUserCount
+        error: `该账号已满员（${capacityLimit}人），无法创建兑换码`,
+        currentUserCount,
+        inviteCount,
+        capacityLimit
       })
     }
 
     // 获取该账号未使用的兑换码数量
     const unusedCodesResult = db.exec(`
       SELECT COUNT(*) as count FROM redemption_codes
-      WHERE account_email = ? AND is_redeemed = 0
-    `, [accountEmail])
+      WHERE lower(trim(account_email)) = ? AND is_redeemed = 0
+    `, [normalizedAccountEmail])
 
     const unusedCodesCount = unusedCodesResult[0]?.values[0]?.[0] || 0
 
-    // 计算实际可以生成的数量
-    // 可创建数量 = 总容量(5) - 当前人数 - 未使用的兑换码数
-    const totalCapacity = 5
-    const availableSlots = totalCapacity - currentUserCount - unusedCodesCount
+    // 可创建数量 = 总容量 - 已占用名额(用户+邀请) - 未使用兑换码
+    const availableSlots = capacityLimit - currentOccupiedSeats - unusedCodesCount
 
     if (availableSlots <= 0) {
       return res.status(400).json({
         error: '该账号已无可用名额（当前人数 + 未使用兑换码数已达上限）',
-        currentUserCount: currentUserCount,
-        unusedCodesCount: unusedCodesCount,
+        currentUserCount,
+        inviteCount,
+        unusedCodesCount,
         allCodesCount: unusedCodesCount, // 兼容旧前端字段
+        capacityLimit,
         availableSlots: 0
       })
     }
@@ -1040,7 +1413,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
 
     // 如果请求数量超过可用名额，给出详细提示
     if (requestedCount > availableSlots) {
-      console.log(`请求生成${requestedCount}个兑换码，但账号只有${availableSlots}个可用名额（当前${currentUserCount}人，已有${unusedCodesCount}个未使用兑换码），将只生成${actualCount}个`)
+      console.log(`请求生成${requestedCount}个兑换码，但账号只有${availableSlots}个可用名额（容量${capacityLimit}，已占用${currentOccupiedSeats}，已有${unusedCodesCount}个未使用兑换码），将只生成${actualCount}个`)
     }
 
     const normalizedChannel = normalizeChannel(channel, 'common')
@@ -1063,7 +1436,7 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
         try {
           db.run(
             `INSERT INTO redemption_codes (code, account_email, channel, channel_name, order_type, service_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-            [code, accountEmail, normalizedChannel, resolvedChannelName, resolvedOrderType, resolvedServiceDays]
+            [code, normalizedAccountEmail, normalizedChannel, resolvedChannelName, resolvedOrderType, resolvedServiceDays]
           )
           createdCodes.push(code)
           success = true
@@ -1085,6 +1458,22 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
 
     saveDatabase()
 
+    if (createdCodes.length === 0) {
+      return res.status(201).json({
+        message: `未成功创建兑换码（账号 ${accountRecordEmail}）`,
+        codes: [],
+        failed: failedCodes.length,
+        currentUserCount,
+        inviteCount,
+        capacityLimit,
+        occupiedSeats: currentOccupiedSeats,
+        unusedCodesCount,
+        allCodesCount: unusedCodesCount, // 兼容旧前端字段
+        availableSlots,
+        info: '兑换码生成连续冲突，请重试'
+      })
+    }
+
     // 获取新创建的兑换码
     const result = db.exec(`
       SELECT id, code, is_redeemed, redeemed_at, redeemed_by,
@@ -1099,14 +1488,17 @@ router.post('/batch', authenticateToken, requireMenu('redemption_codes'), async 
     const codes = result[0]?.values.map(row => mapCodeRow(row, channelsByKey)) || []
 
     res.status(201).json({
-      message: `成功为账号 ${accountEmail} 创建 ${createdCodes.length} 个兑换码`,
+      message: `成功为账号 ${accountRecordEmail} 创建 ${createdCodes.length} 个兑换码`,
       codes,
       failed: failedCodes.length,
-      currentUserCount: currentUserCount,
+      currentUserCount,
+      inviteCount,
+      capacityLimit,
+      occupiedSeats: currentOccupiedSeats,
       unusedCodesCount: unusedCodesCount + createdCodes.length,
       allCodesCount: unusedCodesCount + createdCodes.length, // 兼容旧前端字段
       availableSlots: availableSlots - createdCodes.length,
-      info: requestedCount > availableSlots ? `由于账号可用名额限制（当前${currentUserCount}人 + ${unusedCodesCount}个未使用兑换码），只生成了${actualCount}个兑换码` : undefined
+      info: requestedCount > availableSlots ? `由于账号可用名额限制（容量${capacityLimit}，已占用${currentOccupiedSeats}，未使用兑换码${unusedCodesCount}），只生成了${actualCount}个兑换码` : undefined
     })
   } catch (error) {
     console.error('批量创建兑换码错误:', error)
@@ -1210,15 +1602,25 @@ router.post('/batch-delete', authenticateToken, requireMenu('redemption_codes'),
 
 // 管理后台兑换（需要认证）
 router.post('/admin/redeem', authenticateToken, requireMenu('redemption_codes'), async (req, res) => {
+  const alertCollector = createRedemptionAlertCollector('admin-redeem')
   try {
     const { code, email, channel, redeemerUid, orderType, order_type: orderTypeLegacy } = req.body || {}
+    if (orderType !== undefined || orderTypeLegacy !== undefined) {
+      return res.status(400).json({
+        error: 'orderType 参数已弃用',
+        message: '兑换时不允许传 orderType，系统将以兑换码创建时配置为准'
+      })
+    }
+
     const result = await redeemCodeInternal({
       code,
       email,
       channel,
       redeemerUid,
-      orderType: orderType ?? orderTypeLegacy
+      alertCollector
     })
+    const db = await getDatabase()
+    await collectLowStockAlerts(db, alertCollector)
     res.json({
       message: '兑换成功',
       data: result.data
@@ -1236,13 +1638,27 @@ router.post('/admin/redeem', authenticateToken, requireMenu('redemption_codes'),
       error: '内部服务器错误',
       message: '服务器错误，请稍后重试'
     })
+  } finally {
+    try {
+      await flushRedemptionAlertCollector(alertCollector)
+    } catch (mailError) {
+      console.warn('[Redemption] 汇总告警发送失败', mailError?.message || mailError)
+    }
   }
 })
 
 // 兑换接口（无需认证）
 router.post('/redeem', async (req, res) => {
+  const alertCollector = createRedemptionAlertCollector('public-redeem')
   try {
     const { code, email, channel, orderType, order_type: orderTypeLegacy } = req.body || {}
+    if (orderType !== undefined || orderTypeLegacy !== undefined) {
+      return res.status(400).json({
+        error: 'orderType 参数已弃用',
+        message: '兑换时不允许传 orderType，系统将以兑换码创建时配置为准'
+      })
+    }
+
     const normalizedChannel = normalizeChannel(channel, 'common')
 
     let redeemerUid = req.body?.redeemerUid
@@ -1260,9 +1676,11 @@ router.post('/redeem', async (req, res) => {
       email,
       channel: normalizedChannel,
       redeemerUid,
-      orderType: orderType ?? orderTypeLegacy,
-      allowCommonChannelFallback: true
+      allowCommonChannelFallback: true,
+      alertCollector
     })
+    const db = await getDatabase()
+    await collectLowStockAlerts(db, alertCollector)
     res.json({
       message: '兑换成功',
       data: result.data
@@ -1280,6 +1698,12 @@ router.post('/redeem', async (req, res) => {
       error: '内部服务器错误',
       message: '服务器错误，请稍后重试'
     })
+  } finally {
+    try {
+      await flushRedemptionAlertCollector(alertCollector)
+    } catch (mailError) {
+      console.warn('[Redemption] 汇总告警发送失败', mailError?.message || mailError)
+    }
   }
 })
 
@@ -1299,7 +1723,8 @@ router.post('/recover', async (req, res) => {
       const db = await getDatabase()
       const emailPattern = `%email:${normalizedEmail}%`
 
-      const threshold = `-${ACCOUNT_RECOVERY_WINDOW_DAYS} days`
+      const accountRecoveryWindowDays = getAccountRecoveryWindowDays()
+      const threshold = `-${accountRecoveryWindowDays} days`
       const candidatesResult = db.exec(
         `
           WITH candidates AS (
@@ -1310,6 +1735,7 @@ router.post('/recover', async (req, res) => {
               rc.account_email AS original_account_email,
               rc.channel AS original_channel,
               COALESCE(
+                NULLIF(rc.order_type, ''),
                 NULLIF((
                   SELECT po2.order_type
                   FROM purchase_orders po2
@@ -1317,7 +1743,6 @@ router.post('/recover', async (req, res) => {
                   ORDER BY po2.created_at DESC
                   LIMIT 1
                 ), ''),
-                NULLIF(rc.order_type, ''),
                 'warranty'
               ) AS order_type,
               (
@@ -1401,8 +1826,8 @@ router.post('/recover', async (req, res) => {
       const candidateRows = candidatesResult[0]?.values || []
       if (candidateRows.length === 0) {
         return res.status(404).json({
-          error: `${ACCOUNT_RECOVERY_WINDOW_DAYS}天内不存在订单，请联系客服`,
-          message: `${ACCOUNT_RECOVERY_WINDOW_DAYS}天内不存在订单，请联系客服`,
+          error: `${accountRecoveryWindowDays}天内不存在订单，请联系客服`,
+          message: `${accountRecoveryWindowDays}天内不存在订单，请联系客服`,
           code: 'NO_RECENT_ORDER'
         })
       }
@@ -1672,6 +2097,7 @@ router.post('/recover', async (req, res) => {
         // - 账号 expire_at 需未过期；在系统设置开启“过期覆盖订单截止日”时，还要求覆盖订单截止日
         // - 兑换码创建时间窗口由系统设置控制（默认近 7 天；可选强制仅当天）
         const recoverySettings = await getAccountRecoverySettings(db)
+        const recoveryCapacityLimit = getOpenAccountsCapacityLimit(db)
         const codeCreatedWithinDays = Math.max(1, toInt(recoverySettings?.effective?.codeCreatedWithinDays, 7))
         const requireExpireCoverDeadline = Boolean(recoverySettings?.effective?.requireExpireCoverDeadline)
         const skipCodeFormatValidation = false
@@ -1679,10 +2105,11 @@ router.post('/recover', async (req, res) => {
         let lastAttemptError = null
         let lastAttemptRecovery = null
 
-        for (let attempt = 1; attempt <= ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS; attempt += 1) {
+        const recoveryRedeemMaxAttempts = getAccountRecoveryRedeemMaxAttempts()
+        for (let attempt = 1; attempt <= recoveryRedeemMaxAttempts; attempt += 1) {
           const selectedRecovery = selectRecoveryCode(db, {
             minExpireMs: requireExpireCoverDeadline ? orderDeadlineMs : Date.now(),
-            capacityLimit: 6,
+            capacityLimit: recoveryCapacityLimit,
             preferNonToday: requireExpireCoverDeadline,
             preferLatestExpire: !requireExpireCoverDeadline,
             limit: 200,
@@ -1736,7 +2163,7 @@ router.post('/recover', async (req, res) => {
             })
           } catch (error) {
             lastAttemptError = error
-            const shouldRetry = attempt < ACCOUNT_RECOVERY_REDEEM_MAX_ATTEMPTS && shouldRetryAccountRecoveryRedeem(error)
+            const shouldRetry = attempt < recoveryRedeemMaxAttempts && shouldRetryAccountRecoveryRedeem(error)
             if (shouldRetry) continue
 
             const statusCode = error instanceof RedemptionError ? error.statusCode || 400 : 500
@@ -1888,6 +2315,7 @@ router.post('/xhs/check-order', requireFeatureEnabled('xhs'), async (req, res) =
 })
 
 router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) => {
+  const alertCollector = createRedemptionAlertCollector('xhs-redeem-order')
   try {
     const { email, orderNumber, strictToday } = req.body || {}
     const trimmedEmail = (email || '').trim()
@@ -1908,265 +2336,269 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
     }
 
     await withLocks([`xhs-redeem`, `xhs-order:${normalizedOrderNumber}`], async () => {
-	      const orderRecord = await getXhsOrderByNumber(normalizedOrderNumber)
-	      if (!orderRecord) {
-	        return res.status(404).json({ error: '未找到对应订单，请稍后再试' })
-	      }
+      const orderRecord = await getXhsOrderByNumber(normalizedOrderNumber)
+      if (!orderRecord) {
+        return res.status(404).json({ error: '未找到对应订单，请稍后再试' })
+      }
 
-	      if (orderRecord.isUsed) {
-	        return res.status(400).json({ error: '该订单已完成兑换' })
-	      }
+      if (orderRecord.isUsed) {
+        return res.status(400).json({ error: '该订单已完成兑换' })
+      }
 
-	      if (String(orderRecord.orderStatus || '').trim() === '已关闭') {
-	        return res.status(403).json({ error: '该订单已完成售后退款（已关闭），无法进行核销' })
-	      }
+      if (String(orderRecord.orderStatus || '').trim() === '已关闭') {
+        return res.status(403).json({ error: '该订单已完成售后退款（已关闭），无法进行核销' })
+      }
 
-	      const db = await getDatabase()
-        const { byKey: channelsByKey } = await getChannels(db)
-        const allowCommonFallback = Boolean(channelsByKey.get('xhs')?.allowCommonFallback)
-	      const now = new Date()
-	      const fallbackToYesterdayEnabled = !strictTodayEnabled && now.getHours() >= 0 && now.getHours() < 8
-        const minAccountExpireAt = formatExpireAtComparable(addDays(now, HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS))
+      const db = await getDatabase()
+      const { byKey: channelsByKey } = await getChannels(db)
+      const allowCommonFallback = Boolean(channelsByKey.get('xhs')?.allowCommonFallback)
+      const now = new Date()
+      const fallbackToYesterdayEnabled = !strictTodayEnabled && now.getHours() >= 0 && now.getHours() < 8
+      const minAccountExpireAt = formatExpireAtComparable(addDays(now, HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS))
 
-		      const availableCodeResult = db.exec(
-		        `
-		          SELECT rc.id, rc.code, rc.created_at
-		          FROM redemption_codes rc
-		          WHERE lower(trim(rc.channel)) = 'xhs'
-		            AND rc.is_redeemed = 0
-		            AND DATE(rc.created_at) = DATE('now', 'localtime')
+      const selectChannelCode = (excludeCodeIds = []) => {
+        const exclude = buildExcludeCodeClause(excludeCodeIds, 'rc')
+        const todayResult = db.exec(
+          `
+            SELECT rc.id, rc.code, rc.created_at
+            FROM redemption_codes rc
+            WHERE lower(trim(rc.channel)) = 'xhs'
+              AND rc.is_redeemed = 0
+              AND DATE(rc.created_at) = DATE('now', 'localtime')
+              AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+              AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+              AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+              AND (
+                rc.account_email IS NULL
+                OR trim(rc.account_email) = ''
+                OR EXISTS (
+                  SELECT 1
+                  FROM gpt_accounts ga
+                  WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+                )
+              )
+              ${exclude.clause}
+            ORDER BY rc.created_at ASC
+            LIMIT 1
+          `,
+          [...exclude.params]
+        )
+        let codeRow = todayResult?.[0]?.values?.[0] || null
+        if (codeRow) return codeRow
+
+        if (fallbackToYesterdayEnabled) {
+          const yesterdayResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              JOIN gpt_accounts ga
+                ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+              WHERE lower(trim(rc.channel)) = 'xhs'
+                AND rc.is_redeemed = 0
+                AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                 AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                 AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                 AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-		            AND (
-		              rc.account_email IS NULL
+                AND ga.expire_at IS NOT NULL
+                AND trim(ga.expire_at) != ''
+                AND trim(ga.expire_at) >= ?
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [minAccountExpireAt, ...exclude.params]
+          )
+          codeRow = yesterdayResult?.[0]?.values?.[0] || null
+          if (codeRow) return codeRow
+        }
+
+        if (!strictTodayEnabled) {
+          const anyDateResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              JOIN gpt_accounts ga
+                ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+              WHERE lower(trim(rc.channel)) = 'xhs'
+                AND rc.is_redeemed = 0
+                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                AND ga.expire_at IS NOT NULL
+                AND trim(ga.expire_at) != ''
+                AND trim(ga.expire_at) >= ?
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [minAccountExpireAt, ...exclude.params]
+          )
+          codeRow = anyDateResult?.[0]?.values?.[0] || null
+        }
+
+        return codeRow
+      }
+
+      const selectCommonCode = async (excludeCodeIds = []) => {
+        if (!allowCommonFallback) return null
+        const exclude = buildExcludeCodeClause(excludeCodeIds, 'rc')
+        return withLocks(['redemption-codes:pool:common'], async () => {
+          const todayResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
+                AND rc.is_redeemed = 0
+                AND DATE(rc.created_at) = DATE('now', 'localtime')
+                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                AND (
+                  rc.account_email IS NULL
                   OR trim(rc.account_email) = ''
-			              OR EXISTS (
-			                SELECT 1
-			                FROM gpt_accounts ga
-		                  WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-		              )
-		            )
-		          ORDER BY rc.created_at ASC
-		          LIMIT 1
-	        `
-	      )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM gpt_accounts ga
+                    WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+                  )
+                )
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [...exclude.params]
+          )
+          let codeRow = todayResult?.[0]?.values?.[0] || null
+          if (codeRow) return codeRow
 
-      let selectedCodeRow = availableCodeResult?.[0]?.values?.[0] || null
-
-      if (!selectedCodeRow && fallbackToYesterdayEnabled) {
-		        const fallbackCodeResult = db.exec(
-		          `
-		            SELECT rc.id, rc.code, rc.created_at
-		            FROM redemption_codes rc
+          if (fallbackToYesterdayEnabled) {
+            const yesterdayResult = db.exec(
+              `
+                SELECT rc.id, rc.code, rc.created_at
+                FROM redemption_codes rc
                 JOIN gpt_accounts ga
                   ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-		            WHERE lower(trim(rc.channel)) = 'xhs'
-		              AND rc.is_redeemed = 0
-		              AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
+                WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
+                  AND rc.is_redeemed = 0
+                  AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                   AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
                   AND ga.expire_at IS NOT NULL
                   AND trim(ga.expire_at) != ''
                   AND trim(ga.expire_at) >= ?
-		            ORDER BY rc.created_at ASC
-	            LIMIT 1
-	          `,
-            [minAccountExpireAt]
-	        )
-	        selectedCodeRow = fallbackCodeResult?.[0]?.values?.[0] || null
-	      }
+                  ${exclude.clause}
+                ORDER BY rc.created_at ASC
+                LIMIT 1
+              `,
+              [minAccountExpireAt, ...exclude.params]
+            )
+            codeRow = yesterdayResult?.[0]?.values?.[0] || null
+            if (codeRow) return codeRow
+          }
 
-      if (!selectedCodeRow && !strictTodayEnabled) {
-        const anyDateCodeResult = db.exec(
-          `
-            SELECT rc.id, rc.code, rc.created_at
-            FROM redemption_codes rc
-            JOIN gpt_accounts ga
-              ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-            WHERE lower(trim(rc.channel)) = 'xhs'
-              AND rc.is_redeemed = 0
-              AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-              AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-              AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-              AND ga.expire_at IS NOT NULL
-              AND trim(ga.expire_at) != ''
-              AND trim(ga.expire_at) >= ?
-            ORDER BY rc.created_at ASC
-            LIMIT 1
-          `,
-          [minAccountExpireAt]
-        )
-        selectedCodeRow = anyDateCodeResult?.[0]?.values?.[0] || null
-      }
-
-        if (!selectedCodeRow && allowCommonFallback) {
-          const commonFallback = await withLocks(['redemption-codes:pool:common'], async () => {
-            const commonCodeResult = db.exec(
+          if (!strictTodayEnabled) {
+            const anyDateResult = db.exec(
               `
                 SELECT rc.id, rc.code, rc.created_at
                 FROM redemption_codes rc
+                JOIN gpt_accounts ga
+                  ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                 WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                   AND rc.is_redeemed = 0
-                  AND DATE(rc.created_at) = DATE('now', 'localtime')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                   AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                  AND (
-                    rc.account_email IS NULL
-                    OR trim(rc.account_email) = ''
-	                  OR EXISTS (
-	                      SELECT 1
-	                      FROM gpt_accounts ga
-	                      WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-	                    )
-	                  )
-	                ORDER BY rc.created_at ASC
+                  AND ga.expire_at IS NOT NULL
+                  AND trim(ga.expire_at) != ''
+                  AND trim(ga.expire_at) >= ?
+                  ${exclude.clause}
+                ORDER BY rc.created_at ASC
                 LIMIT 1
-              `
+              `,
+              [minAccountExpireAt, ...exclude.params]
             )
-            let commonCodeRow = commonCodeResult?.[0]?.values?.[0] || null
-
-            if (!commonCodeRow && fallbackToYesterdayEnabled) {
-              const commonYesterdayResult = db.exec(
-                `
-                  SELECT rc.id, rc.code, rc.created_at
-                  FROM redemption_codes rc
-                  JOIN gpt_accounts ga
-                    ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-                  WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
-                    AND rc.is_redeemed = 0
-                    AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
-                    AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-                    AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-                    AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                    AND ga.expire_at IS NOT NULL
-                    AND trim(ga.expire_at) != ''
-                    AND trim(ga.expire_at) >= ?
-	                  ORDER BY rc.created_at ASC
-                  LIMIT 1
-                `,
-                [minAccountExpireAt]
-              )
-              commonCodeRow = commonYesterdayResult?.[0]?.values?.[0] || null
-            }
-
-            if (!commonCodeRow && !strictTodayEnabled) {
-              const commonAnyDateResult = db.exec(
-                `
-                  SELECT rc.id, rc.code, rc.created_at
-                  FROM redemption_codes rc
-                  JOIN gpt_accounts ga
-                    ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-                  WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
-                    AND rc.is_redeemed = 0
-                    AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-                    AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-                    AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                    AND ga.expire_at IS NOT NULL
-                    AND trim(ga.expire_at) != ''
-                    AND trim(ga.expire_at) >= ?
-                    ORDER BY rc.created_at ASC
-                  LIMIT 1
-                `,
-                [minAccountExpireAt]
-              )
-              commonCodeRow = commonAnyDateResult?.[0]?.values?.[0] || null
-            }
-
-            if (!commonCodeRow) return null
-
-            const selectedCodeId = commonCodeRow[0]
-            const selectedCode = commonCodeRow[1]
-
-            const redemptionResult = await redeemCodeInternal({
-              code: selectedCode,
-              email: normalizedEmail,
-              channel: 'xhs',
-              skipCodeFormatValidation: true,
-              allowCommonChannelFallback: true
-            })
-
-            await markXhsOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
-
-            return { selectedCodeId, selectedCode, redemptionResult }
-          })
-
-          if (commonFallback) {
-            return res.json({
-              message: '兑换成功',
-              data: commonFallback.redemptionResult.data,
-              order: {
-                ...orderRecord,
-                status: 'redeemed',
-                isUsed: true,
-                userEmail: normalizedEmail,
-                assignedCodeId: commonFallback.selectedCodeId,
-                assignedCode: commonFallback.selectedCode,
-              }
-            })
+            codeRow = anyDateResult?.[0]?.values?.[0] || null
           }
+
+          return codeRow
+        })
+      }
+
+      const lazyRetryMaxAttempts = getRedeemLazyRetryMaxAttempts()
+      const triedCodeIds = new Set()
+      for (let attempt = 1; attempt <= lazyRetryMaxAttempts; attempt += 1) {
+        const excludeIds = Array.from(triedCodeIds)
+        const selectedCodeRow = selectChannelCode(excludeIds) || (await selectCommonCode(excludeIds))
+        if (!selectedCodeRow) break
+
+        const selectedCodeId = Number(selectedCodeRow[0])
+        const selectedCode = String(selectedCodeRow[1] || '')
+        if (!selectedCodeId || !selectedCode) break
+        triedCodeIds.add(selectedCodeId)
+
+        try {
+          const redemptionResult = await redeemCodeInternal({
+            code: selectedCode,
+            email: normalizedEmail,
+            channel: 'xhs',
+            skipCodeFormatValidation: true,
+            allowCommonChannelFallback: true,
+            alertCollector
+          })
+          await markXhsOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
+          await collectLowStockAlerts(db, alertCollector)
+
+          return res.json({
+            message: '兑换成功',
+            data: redemptionResult.data,
+            order: {
+              ...orderRecord,
+              status: 'redeemed',
+              isUsed: true,
+              userEmail: normalizedEmail,
+              assignedCodeId: selectedCodeId,
+              assignedCode: selectedCode,
+            }
+          })
+        } catch (error) {
+          if (isLazyRetryableAccountError(error)) {
+            continue
+          }
+          throw error
         }
+      }
 
-      if (!selectedCodeRow) {
-	        const statsResult = db.exec(
-	          `
-	            SELECT
-	              COUNT(*) as all_total,
-	              SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
-	              SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total,
-	              SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
-	            FROM redemption_codes rc
-	            WHERE lower(trim(rc.channel)) = 'xhs'
-	              AND (
-	                rc.account_email IS NULL
-                  OR trim(rc.account_email) = ''
-		                OR EXISTS (
-		                  SELECT 1
-		                  FROM gpt_accounts ga
-		                  WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-		                )
-		              )
-		          `
-		        )
-        const statsRow = statsResult?.[0]?.values?.[0] || []
-        const allTotal = Number(statsRow[0] || 0)
-        const todayTotal = Number(statsRow[2] || 0)
-        const todayUnused = Number(statsRow[3] || 0)
+      const statsResult = db.exec(
+        `
+          SELECT
+            COUNT(*) as all_total,
+            SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
+            SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total,
+            SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
+          FROM redemption_codes rc
+          WHERE lower(trim(rc.channel)) = 'xhs'
+            AND (
+              rc.account_email IS NULL
+              OR trim(rc.account_email) = ''
+              OR EXISTS (
+                SELECT 1
+                FROM gpt_accounts ga
+                WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+              )
+            )
+        `
+      )
+      const statsRow = statsResult?.[0]?.values?.[0] || []
+      const allTotal = Number(statsRow[0] || 0)
+      const todayTotal = Number(statsRow[2] || 0)
+      const todayUnused = Number(statsRow[3] || 0)
 
-	        const errorCode = allTotal === 0
-	          ? 'xhs_codes_not_configured'
-	          : (todayTotal <= 0 ? 'xhs_no_today_codes' : (todayUnused <= 0 ? 'xhs_today_codes_exhausted' : 'xhs_codes_unavailable'))
+      const errorCode = allTotal === 0
+        ? 'xhs_codes_not_configured'
+        : (todayTotal <= 0 ? 'xhs_no_today_codes' : (todayUnused <= 0 ? 'xhs_today_codes_exhausted' : 'xhs_codes_unavailable'))
 
-	        return res.status(503).json({ error: OUT_OF_STOCK_MESSAGE, errorCode })
-	      }
-
-      const selectedCodeId = selectedCodeRow[0]
-      const selectedCode = selectedCodeRow[1]
-
-      const redemptionResult = await redeemCodeInternal({
-        code: selectedCode,
-        email: normalizedEmail,
-        channel: 'xhs',
-        skipCodeFormatValidation: true,
-        allowCommonChannelFallback: true
-      })
-
-      await markXhsOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
-
-      return res.json({
-        message: '兑换成功',
-        data: redemptionResult.data,
-        order: {
-          ...orderRecord,
-          status: 'redeemed',
-          isUsed: true,
-          userEmail: normalizedEmail,
-          assignedCodeId: selectedCodeId,
-          assignedCode: selectedCode,
-        }
-      })
+      return res.status(503).json({ error: OUT_OF_STOCK_MESSAGE, errorCode })
     })
   } catch (error) {
     if (error instanceof RedemptionError) {
@@ -2178,6 +2610,12 @@ router.post('/xhs/redeem-order', requireFeatureEnabled('xhs'), async (req, res) 
     }
     console.error('[XHS Redeem] 兑换错误:', error)
     res.status(500).json({ error: '服务器错误，请稍后重试' })
+  } finally {
+    try {
+      await flushRedemptionAlertCollector(alertCollector)
+    } catch (mailError) {
+      console.warn('[XHS Redeem] 汇总告警发送失败', mailError?.message || mailError)
+    }
   }
 })
 
@@ -2263,6 +2701,7 @@ router.post('/xianyu/check-order', requireFeatureEnabled('xianyu'), async (req, 
 })
 
 router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req, res) => {
+  const alertCollector = createRedemptionAlertCollector('xianyu-redeem-order')
   try {
     const { email, orderId, strictToday } = req.body || {}
     const trimmedEmail = (email || '').trim()
@@ -2296,255 +2735,237 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
         return res.status(403).json({ error: '该订单已关闭，无法进行核销' })
       }
 
-	      const db = await getDatabase()
-        const { byKey: channelsByKey } = await getChannels(db)
-        const allowCommonFallback = Boolean(channelsByKey.get('xianyu')?.allowCommonFallback)
-	      const now = new Date()
-	      const fallbackToYesterdayEnabled = !strictTodayEnabled && now.getHours() >= 0 && now.getHours() < 8
-        const minAccountExpireAt = formatExpireAtComparable(addDays(now, HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS))
-	      const resolvedOrderType = resolveXianyuOrderTypeFromActualPaid(orderRecord.actualPaid)
+      const db = await getDatabase()
+      const { byKey: channelsByKey } = await getChannels(db)
+      const allowCommonFallback = Boolean(channelsByKey.get('xianyu')?.allowCommonFallback)
+      const now = new Date()
+      const fallbackToYesterdayEnabled = !strictTodayEnabled && now.getHours() >= 0 && now.getHours() < 8
+      const minAccountExpireAt = formatExpireAtComparable(addDays(now, HISTORY_CODE_MIN_ACCOUNT_REMAINING_DAYS))
 
-		      const availableCodeResult = db.exec(
-		        `
-		          SELECT rc.id, rc.code, rc.created_at
-	          FROM redemption_codes rc
-	          WHERE lower(trim(rc.channel)) = 'xianyu'
-	            AND rc.is_redeemed = 0
-	            AND DATE(rc.created_at) = DATE('now', 'localtime')
-              AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-              AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-              AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-	            AND (
-	              rc.account_email IS NULL
-                OR trim(rc.account_email) = ''
-		              OR EXISTS (
-		                SELECT 1
-	                FROM gpt_accounts ga
-	                WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-	              )
-	            )
-	          ORDER BY rc.created_at ASC
-	          LIMIT 1
-	        `
-      )
-
-      let selectedCodeRow = availableCodeResult?.[0]?.values?.[0] || null
-
-	      if (!selectedCodeRow && fallbackToYesterdayEnabled) {
-	        const fallbackCodeResult = db.exec(
-	          `
-	            SELECT rc.id, rc.code, rc.created_at
-	            FROM redemption_codes rc
-              JOIN gpt_accounts ga
-                ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-	            WHERE lower(trim(rc.channel)) = 'xianyu'
-	              AND rc.is_redeemed = 0
-	              AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
-                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                AND ga.expire_at IS NOT NULL
-                AND trim(ga.expire_at) != ''
-                AND trim(ga.expire_at) >= ?
-	            ORDER BY rc.created_at ASC
-            LIMIT 1
-          `,
-          [minAccountExpireAt]
-        )
-	        selectedCodeRow = fallbackCodeResult?.[0]?.values?.[0] || null
-	      }
-
-      if (!selectedCodeRow && !strictTodayEnabled) {
-        const anyDateCodeResult = db.exec(
+      const selectChannelCode = (excludeCodeIds = []) => {
+        const exclude = buildExcludeCodeClause(excludeCodeIds, 'rc')
+        const todayResult = db.exec(
           `
             SELECT rc.id, rc.code, rc.created_at
             FROM redemption_codes rc
-            JOIN gpt_accounts ga
-              ON lower(trim(ga.email)) = lower(trim(rc.account_email))
             WHERE lower(trim(rc.channel)) = 'xianyu'
               AND rc.is_redeemed = 0
+              AND DATE(rc.created_at) = DATE('now', 'localtime')
               AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
               AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
               AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-              AND ga.expire_at IS NOT NULL
-              AND trim(ga.expire_at) != ''
-              AND trim(ga.expire_at) >= ?
+              AND ${getCodeAccountRedeemableExistsSql()}
+              ${exclude.clause}
             ORDER BY rc.created_at ASC
             LIMIT 1
           `,
-          [minAccountExpireAt]
+          [minAccountExpireAt, ...exclude.params]
         )
-        selectedCodeRow = anyDateCodeResult?.[0]?.values?.[0] || null
+        let codeRow = todayResult?.[0]?.values?.[0] || null
+        if (codeRow) return codeRow
+
+        if (fallbackToYesterdayEnabled) {
+          const yesterdayResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              JOIN gpt_accounts ga
+                ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+              WHERE lower(trim(rc.channel)) = 'xianyu'
+                AND rc.is_redeemed = 0
+                AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
+                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                AND ${getAccountRedeemableSql()}
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [minAccountExpireAt, ...exclude.params]
+          )
+          codeRow = yesterdayResult?.[0]?.values?.[0] || null
+          if (codeRow) return codeRow
+        }
+
+        if (!strictTodayEnabled) {
+          const anyDateResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              JOIN gpt_accounts ga
+                ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+              WHERE lower(trim(rc.channel)) = 'xianyu'
+                AND rc.is_redeemed = 0
+                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                AND ${getAccountRedeemableSql()}
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [minAccountExpireAt, ...exclude.params]
+          )
+          codeRow = anyDateResult?.[0]?.values?.[0] || null
+        }
+
+        return codeRow
       }
 
-        if (!selectedCodeRow && allowCommonFallback) {
-          const commonFallback = await withLocks(['redemption-codes:pool:common'], async () => {
-            const commonCodeResult = db.exec(
+      const selectCommonCode = async (excludeCodeIds = []) => {
+        if (!allowCommonFallback) return null
+        const exclude = buildExcludeCodeClause(excludeCodeIds, 'rc')
+        return withLocks(['redemption-codes:pool:common'], async () => {
+          const todayResult = db.exec(
+            `
+              SELECT rc.id, rc.code, rc.created_at
+              FROM redemption_codes rc
+              WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
+                AND rc.is_redeemed = 0
+                AND DATE(rc.created_at) = DATE('now', 'localtime')
+                AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                AND ${getCodeAccountRedeemableExistsSql()}
+                ${exclude.clause}
+              ORDER BY rc.created_at ASC
+              LIMIT 1
+            `,
+            [minAccountExpireAt, ...exclude.params]
+          )
+          let codeRow = todayResult?.[0]?.values?.[0] || null
+          if (codeRow) return codeRow
+
+          if (fallbackToYesterdayEnabled) {
+            const yesterdayResult = db.exec(
               `
                 SELECT rc.id, rc.code, rc.created_at
                 FROM redemption_codes rc
+                JOIN gpt_accounts ga
+                  ON lower(trim(ga.email)) = lower(trim(rc.account_email))
                 WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
                   AND rc.is_redeemed = 0
-                  AND DATE(rc.created_at) = DATE('now', 'localtime')
+                  AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
                   AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                   AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                   AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                  AND (
-                    rc.account_email IS NULL
-                    OR trim(rc.account_email) = ''
-	                  OR EXISTS (
-	                      SELECT 1
-	                      FROM gpt_accounts ga
-	                      WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-	                    )
-	                  )
-	                ORDER BY rc.created_at ASC
+                  AND ${getAccountRedeemableSql()}
+                  ${exclude.clause}
+                ORDER BY rc.created_at ASC
                 LIMIT 1
-              `
+              `,
+              [minAccountExpireAt, ...exclude.params]
             )
-            let commonCodeRow = commonCodeResult?.[0]?.values?.[0] || null
-
-            if (!commonCodeRow && fallbackToYesterdayEnabled) {
-              const commonYesterdayResult = db.exec(
-                `
-                  SELECT rc.id, rc.code, rc.created_at
-                  FROM redemption_codes rc
-                  JOIN gpt_accounts ga
-                    ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-                  WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
-                    AND rc.is_redeemed = 0
-                    AND DATE(rc.created_at) = DATE('now', 'localtime', '-1 day')
-                    AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-                    AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-                    AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                    AND ga.expire_at IS NOT NULL
-                    AND trim(ga.expire_at) != ''
-                    AND trim(ga.expire_at) >= ?
-	                  ORDER BY rc.created_at ASC
-                  LIMIT 1
-                `,
-                [minAccountExpireAt]
-              )
-              commonCodeRow = commonYesterdayResult?.[0]?.values?.[0] || null
-            }
-
-            if (!commonCodeRow && !strictTodayEnabled) {
-              const commonAnyDateResult = db.exec(
-                `
-                  SELECT rc.id, rc.code, rc.created_at
-                  FROM redemption_codes rc
-                  JOIN gpt_accounts ga
-                    ON lower(trim(ga.email)) = lower(trim(rc.account_email))
-                  WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
-                    AND rc.is_redeemed = 0
-                    AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
-                    AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-                    AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                    AND ga.expire_at IS NOT NULL
-                    AND trim(ga.expire_at) != ''
-                    AND trim(ga.expire_at) >= ?
-                    ORDER BY rc.created_at ASC
-                  LIMIT 1
-                `,
-                [minAccountExpireAt]
-              )
-              commonCodeRow = commonAnyDateResult?.[0]?.values?.[0] || null
-            }
-
-            if (!commonCodeRow) return null
-
-            const selectedCodeId = commonCodeRow[0]
-            const selectedCode = commonCodeRow[1]
-
-            const redemptionResult = await redeemCodeInternal({
-              code: selectedCode,
-              email: normalizedEmail,
-              channel: 'xianyu',
-              orderType: resolvedOrderType,
-              skipCodeFormatValidation: true,
-              allowCommonChannelFallback: true
-            })
-
-            await markXianyuOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
-
-            return { selectedCodeId, selectedCode, redemptionResult }
-          })
-
-          if (commonFallback) {
-            return res.json({
-              message: '兑换成功',
-              data: commonFallback.redemptionResult.data,
-              order: {
-                ...orderRecord,
-                status: 'redeemed',
-                isUsed: true,
-                userEmail: normalizedEmail,
-                assignedCodeId: commonFallback.selectedCodeId,
-                assignedCode: commonFallback.selectedCode,
-              }
-            })
+            codeRow = yesterdayResult?.[0]?.values?.[0] || null
+            if (codeRow) return codeRow
           }
+
+          if (!strictTodayEnabled) {
+            const anyDateResult = db.exec(
+              `
+                SELECT rc.id, rc.code, rc.created_at
+                FROM redemption_codes rc
+                JOIN gpt_accounts ga
+                  ON lower(trim(ga.email)) = lower(trim(rc.account_email))
+                WHERE COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = 'common'
+                  AND rc.is_redeemed = 0
+                  AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+                  AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+                  AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+                  AND ${getAccountRedeemableSql()}
+                  ${exclude.clause}
+                ORDER BY rc.created_at ASC
+                LIMIT 1
+              `,
+              [minAccountExpireAt, ...exclude.params]
+            )
+            codeRow = anyDateResult?.[0]?.values?.[0] || null
+          }
+
+          return codeRow
+        })
+      }
+
+      const lazyRetryMaxAttempts = getRedeemLazyRetryMaxAttempts()
+      const triedCodeIds = new Set()
+      for (let attempt = 1; attempt <= lazyRetryMaxAttempts; attempt += 1) {
+        const excludeIds = Array.from(triedCodeIds)
+        const selectedCodeRow = selectChannelCode(excludeIds) || (await selectCommonCode(excludeIds))
+        if (!selectedCodeRow) break
+
+        const selectedCodeId = Number(selectedCodeRow[0])
+        const selectedCode = String(selectedCodeRow[1] || '')
+        if (!selectedCodeId || !selectedCode) break
+        triedCodeIds.add(selectedCodeId)
+
+        try {
+          const redemptionResult = await redeemCodeInternal({
+            code: selectedCode,
+            email: normalizedEmail,
+            channel: 'xianyu',
+            skipCodeFormatValidation: true,
+            allowCommonChannelFallback: true,
+            alertCollector
+          })
+          await markXianyuOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
+          await collectLowStockAlerts(db, alertCollector)
+
+          return res.json({
+            message: '兑换成功',
+            data: redemptionResult.data,
+            order: {
+              ...orderRecord,
+              status: 'redeemed',
+              isUsed: true,
+              userEmail: normalizedEmail,
+              assignedCodeId: selectedCodeId,
+              assignedCode: selectedCode,
+            }
+          })
+        } catch (error) {
+          if (isLazyRetryableAccountError(error)) {
+            continue
+          }
+          throw error
         }
+      }
 
-	      if (!selectedCodeRow) {
-	        const statsResult = db.exec(
-	          `
-	            SELECT
-              COUNT(*) as all_total,
-              SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
-              SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total,
-              SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
-            FROM redemption_codes rc
-            WHERE lower(trim(rc.channel)) = 'xianyu'
-              AND (
-                rc.account_email IS NULL
-                OR trim(rc.account_email) = ''
-	                OR EXISTS (
-	                  SELECT 1
-	                  FROM gpt_accounts ga
-	                  WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
-	                )
-	              )
-	          `
-		        )
-        const statsRow = statsResult?.[0]?.values?.[0] || []
-        const allTotal = Number(statsRow[0] || 0)
-        const todayTotal = Number(statsRow[2] || 0)
-        const todayUnused = Number(statsRow[3] || 0)
+      const rawStatsResult = db.exec(
+        `
+          SELECT
+            COUNT(*) as all_total,
+            SUM(CASE WHEN DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_total
+          FROM redemption_codes rc
+          WHERE lower(trim(rc.channel)) = 'xianyu'
+        `
+      )
+      const rawStatsRow = rawStatsResult?.[0]?.values?.[0] || []
+      const allTotal = Number(rawStatsRow[0] || 0)
+      const todayTotal = Number(rawStatsRow[1] || 0)
 
-	        const errorCode = allTotal === 0
-	          ? 'xianyu_codes_not_configured'
-	          : (todayTotal <= 0 ? 'xianyu_no_today_codes' : (todayUnused <= 0 ? 'xianyu_today_codes_exhausted' : 'xianyu_codes_unavailable'))
+      const eligibleStatsResult = db.exec(
+        `
+          SELECT
+            SUM(CASE WHEN is_redeemed = 0 THEN 1 ELSE 0 END) as all_unused,
+            SUM(CASE WHEN is_redeemed = 0 AND DATE(created_at) = DATE('now', 'localtime') THEN 1 ELSE 0 END) as today_unused
+          FROM redemption_codes rc
+          WHERE lower(trim(rc.channel)) = 'xianyu'
+            AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
+            AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+            AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+            AND ${getCodeAccountRedeemableExistsSql()}
+        `,
+        [minAccountExpireAt]
+      )
+      const eligibleStatsRow = eligibleStatsResult?.[0]?.values?.[0] || []
+      const todayUnused = Number(eligibleStatsRow[1] || 0)
 
-	        return res.status(503).json({ error: OUT_OF_STOCK_MESSAGE, errorCode })
-	      }
+      const errorCode = allTotal === 0
+        ? 'xianyu_codes_not_configured'
+        : (todayTotal <= 0 ? 'xianyu_no_today_codes' : (todayUnused <= 0 ? 'xianyu_today_codes_exhausted' : 'xianyu_codes_unavailable'))
 
-      const selectedCodeId = selectedCodeRow[0]
-      const selectedCode = selectedCodeRow[1]
-
-	      const redemptionResult = await redeemCodeInternal({
-	        code: selectedCode,
-	        email: normalizedEmail,
-	        channel: 'xianyu',
-	        orderType: resolvedOrderType,
-	        skipCodeFormatValidation: true,
-          allowCommonChannelFallback: true
-	      })
-
-      await markXianyuOrderRedeemed(orderRecord.id, selectedCodeId, selectedCode, normalizedEmail)
-
-      return res.json({
-        message: '兑换成功',
-        data: redemptionResult.data,
-        order: {
-          ...orderRecord,
-          status: 'redeemed',
-          isUsed: true,
-          userEmail: normalizedEmail,
-          assignedCodeId: selectedCodeId,
-          assignedCode: selectedCode,
-        }
-      })
+      return res.status(503).json({ error: OUT_OF_STOCK_MESSAGE, errorCode })
     })
   } catch (error) {
     if (error instanceof RedemptionError) {
@@ -2556,6 +2977,12 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
     }
     console.error('[Xianyu Redeem] 兑换错误:', error)
     res.status(500).json({ error: '服务器错误，请稍后重试' })
+  } finally {
+    try {
+      await flushRedemptionAlertCollector(alertCollector)
+    } catch (mailError) {
+      console.warn('[Xianyu Redeem] 汇总告警发送失败', mailError?.message || mailError)
+    }
   }
 })
 

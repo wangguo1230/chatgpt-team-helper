@@ -371,9 +371,17 @@ export interface GptAccount {
   /** @deprecated 降级账号概念已移除；该字段仅保留用于兼容历史客户端。 */
   isDemoted?: boolean
   isBanned?: boolean
+  bannedAt?: string | null
+  bannedDays?: number | null
   chatgptAccountId?: string
   oaiDeviceId?: string
   expireAt?: string | null
+  quickInviteEligible?: boolean
+  quickInviteReason?: string | null
+  quickInviteOccupancy?: number
+  quickInviteCapacityLimit?: number
+  directInviteCodeTotal?: number
+  directInviteCodeAvailable?: number
   createdAt: string
   updatedAt: string
 }
@@ -445,9 +453,35 @@ export interface SyncUserCountResponse {
   users: ChatgptAccountUsersResponse
 }
 
+export interface SyncZeroJoinedBatchItem {
+  id: number
+  email: string
+  status: 'synced' | 'failed'
+  syncedUserCount: number | null
+  inviteCount: number | null
+  error: string | null
+}
+
+export interface SyncZeroJoinedBatchResponse {
+  message: string
+  targetCount: number
+  syncedCount: number
+  failedCount: number
+  items: SyncZeroJoinedBatchItem[]
+}
+
 export interface InviteUserResponse {
   message: string
   invite: any
+}
+
+export interface DirectInviteUserResponse extends InviteUserResponse {
+  accountId: number
+  accountEmail: string
+  inviteCount?: number | null
+  autoSelected?: boolean
+  consumedCodeId?: number | null
+  consumedCode?: string | null
 }
 
 export interface DeleteInviteResponse {
@@ -511,6 +545,9 @@ export interface Channel {
  * @deprecated `anti_ban` 已下线；保留仅用于兼容历史订单/兑换码数据。
  */
 export type PurchaseOrderType = 'warranty' | 'no_warranty' | 'anti_ban'
+export type PurchaseProductCategory = 'code' | 'ldc_shop'
+export type PurchaseDeliveryMode = 'inline' | 'email' | 'both'
+export type PurchaseFulfillmentMode = 'item_pool' | 'redeem_api'
 
 export interface RedemptionCode {
   id: number
@@ -588,8 +625,84 @@ export interface PurchaseProduct {
   codeChannels: string
   isActive: boolean
   sortOrder: number
+  category?: PurchaseProductCategory
+  deliveryMode?: PurchaseDeliveryMode
+  fulfillmentMode?: PurchaseFulfillmentMode
+  redeemProvider?: string
   createdAt?: string | null
   updatedAt?: string | null
+}
+
+export interface PurchaseProductRedeemCode {
+  id: number
+  productKey: string
+  code?: string
+  codeMasked: string
+  provider: string
+  status: 'available' | 'reserved' | 'redeemed' | 'invalid' | 'failed' | 'offline'
+  reservedOrderNo?: string | null
+  usedOrderNo?: string | null
+  lastError?: string | null
+  attemptCount: number
+  lastAttemptAt?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface PurchaseProductItem {
+  id: number
+  productKey: string
+  previewText: string
+  status: 'available' | 'reserved' | 'sold' | 'offline'
+  reservedOrderNo?: string | null
+  soldOrderNo?: string | null
+  reservedAt?: string | null
+  soldAt?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+  content?: string
+}
+
+export interface LdcShopProduct {
+  productKey: string
+  productName: string
+  amount: string
+  serviceDays: number
+  deliveryMode: PurchaseDeliveryMode
+  fulfillmentMode?: PurchaseFulfillmentMode
+  availableCount: number
+}
+
+export interface LdcShopOrder {
+  orderNo: string
+  creditOrderNo?: string
+  productKey: string
+  productName: string
+  amount: string
+  status: string
+  deliveryMode: PurchaseDeliveryMode
+  fulfillmentMode?: PurchaseFulfillmentMode
+  itemPreview?: string
+  userEmail?: string
+  createdAt?: string | null
+  paidAt?: string | null
+  deliveryInlineAt?: string | null
+  deliveryEmailSentAt?: string | null
+  deliveryError?: string | null
+  delivery?: {
+    mode: PurchaseDeliveryMode
+    inlineContent?: string | null
+    emailSentAt?: string | null
+    emailTo?: string | null
+  }
+  credit?: {
+    status: string
+    tradeNo?: string | null
+    payUrl?: string | null
+    paidAt?: string | null
+    refundedAt?: string | null
+    refundMessage?: string | null
+  }
 }
 
 export interface PurchaseCreateOrderResponse {
@@ -831,6 +944,9 @@ export interface CreditAdminOrder {
   createdAt: string
   paidAt?: string | null
   refundedAt?: string | null
+  orderEmail?: string | null
+  codeId?: number | null
+  codeAccountEmail?: string | null
 }
 
 export interface CreditAdminOrdersResponse {
@@ -977,17 +1093,67 @@ export interface AdminPointsWithdrawSettingsResponse {
 export interface AdminRedemptionCodeSettingsResponse {
   settings: {
     batchCreateMaxCount: number
+    lowStockThreshold: number
   }
   effective: {
     batchCreateMaxCount: number
+    lowStockThreshold: number
     source: 'db' | 'env' | 'default'
+    sources?: {
+      batchCreateMaxCount: 'db' | 'env' | 'default'
+      lowStockThreshold: 'db' | 'env' | 'default'
+    }
   }
   stored: {
     batchCreateMaxCount: number | null
+    lowStockThreshold: number | null
   }
   env: {
     batchCreateMaxCount: number
+    lowStockThreshold: number
   }
+}
+
+export interface AdminRedemptionLowStockTestResponse {
+  message: string
+  sent: boolean
+  threshold: number
+  lowStockChannels: Array<{
+    channel: string
+    channelName: string
+    availableCount: number
+  }>
+}
+
+export interface AdminEnvConfigItem {
+  key: string
+  value: string
+  inRuntime: boolean
+  synced: boolean
+  isSensitive?: boolean
+}
+
+export interface AdminEnvConfigsResponse {
+  envFilePath: string
+  exists: boolean
+  count: number
+  items: AdminEnvConfigItem[]
+}
+
+export interface AdminEnvConfigsUpdateResponse extends AdminEnvConfigsResponse {
+  message: string
+  updatedKeys: string[]
+  mode?: 'replace' | 'upsert'
+  syncedCount?: number
+  removedRuntimeKeys?: string[]
+}
+
+export interface AdminEnvConfigsSyncResponse {
+  message: string
+  envFilePath: string
+  count: number
+  keys: string[]
+  removedKeys?: string[]
 }
 
 export interface AdminSmtpSettingsResponse {
@@ -1202,12 +1368,30 @@ export const adminService = {
     return response.data
   },
 
-  async updateRedemptionCodeSettings(payload: { batchCreateMaxCount: number }): Promise<AdminRedemptionCodeSettingsResponse> {
+  async updateRedemptionCodeSettings(payload: { batchCreateMaxCount?: number; lowStockThreshold?: number }): Promise<AdminRedemptionCodeSettingsResponse> {
     const response = await api.put('/admin/redemption-code-settings', {
-      settings: {
-        batchCreateMaxCount: payload.batchCreateMaxCount
-      }
+      settings: payload
     })
+    return response.data
+  },
+
+  async testRedemptionLowStockAlert(): Promise<AdminRedemptionLowStockTestResponse> {
+    const response = await api.post('/admin/redemption-code-settings/test-low-stock-alert')
+    return response.data
+  },
+
+  async getEnvConfigs(): Promise<AdminEnvConfigsResponse> {
+    const response = await api.get('/admin/env-configs')
+    return response.data
+  },
+
+  async updateEnvConfigs(payload: { entries: Array<{ key: string; value: string }> } | { text: string }): Promise<AdminEnvConfigsUpdateResponse> {
+    const response = await api.put('/admin/env-configs', payload)
+    return response.data
+  },
+
+  async syncEnvConfigs(): Promise<AdminEnvConfigsSyncResponse> {
+    const response = await api.post('/admin/env-configs/sync')
     return response.data
   },
 
@@ -1430,6 +1614,10 @@ export const adminService = {
     serviceDays: number
     orderType: PurchaseOrderType
     codeChannels: string
+    category?: PurchaseProductCategory
+    deliveryMode?: PurchaseDeliveryMode
+    fulfillmentMode?: PurchaseFulfillmentMode
+    redeemProvider?: string
     isActive?: boolean
     sortOrder?: number
   }): Promise<{ product: PurchaseProduct }> {
@@ -1445,6 +1633,10 @@ export const adminService = {
       serviceDays: number
       orderType: PurchaseOrderType
       codeChannels: string
+      category: PurchaseProductCategory
+      deliveryMode: PurchaseDeliveryMode
+      fulfillmentMode: PurchaseFulfillmentMode
+      redeemProvider: string
       isActive: boolean
       sortOrder: number
     }>
@@ -1453,8 +1645,76 @@ export const adminService = {
     return response.data
   },
 
-  async deletePurchaseProduct(productKey: string): Promise<{ product: PurchaseProduct }> {
+  async deletePurchaseProduct(productKey: string): Promise<{ ok: boolean }> {
     const response = await api.delete(`/admin/purchase-products/${encodeURIComponent(productKey)}`)
+    return response.data
+  },
+
+  async getPurchaseProductItems(
+    productKey: string,
+    params?: { page?: number; pageSize?: number; includeContent?: boolean }
+  ): Promise<{
+    items: PurchaseProductItem[]
+    pagination: { page: number; pageSize: number; total: number }
+    statusCount: Record<string, number>
+  }> {
+    const response = await api.get(`/admin/purchase-products/${encodeURIComponent(productKey)}/items`, { params })
+    return response.data
+  },
+
+  async createPurchaseProductItem(
+    productKey: string,
+    payload: { content: string; previewText?: string; status?: 'available' | 'offline' }
+  ): Promise<{ item: PurchaseProductItem }> {
+    const response = await api.post(`/admin/purchase-products/${encodeURIComponent(productKey)}/items`, payload)
+    return response.data
+  },
+
+  async updatePurchaseProductItem(
+    productKey: string,
+    itemId: number,
+    payload: { content?: string; previewText?: string; status?: 'available' | 'offline' }
+  ): Promise<{ item: PurchaseProductItem }> {
+    const response = await api.patch(`/admin/purchase-products/${encodeURIComponent(productKey)}/items/${itemId}`, payload)
+    return response.data
+  },
+
+  async deletePurchaseProductItem(productKey: string, itemId: number): Promise<{ ok: boolean }> {
+    const response = await api.delete(`/admin/purchase-products/${encodeURIComponent(productKey)}/items/${itemId}`)
+    return response.data
+  },
+
+  async getPurchaseProductRedeemCodes(
+    productKey: string,
+    params?: { page?: number; pageSize?: number; includeCode?: boolean }
+  ): Promise<{
+    codes: PurchaseProductRedeemCode[]
+    pagination: { page: number; pageSize: number; total: number }
+    statusCount: Record<string, number>
+  }> {
+    const response = await api.get(`/admin/purchase-products/${encodeURIComponent(productKey)}/redeem-codes`, { params })
+    return response.data
+  },
+
+  async importPurchaseProductRedeemCodes(
+    productKey: string,
+    payload: { codesText: string; provider?: string }
+  ): Promise<{ added: number; skipped: number; provider: string; total: number }> {
+    const response = await api.post(`/admin/purchase-products/${encodeURIComponent(productKey)}/redeem-codes/import`, payload)
+    return response.data
+  },
+
+  async updatePurchaseProductRedeemCode(
+    productKey: string,
+    codeId: number,
+    payload: { status: 'available' | 'offline' }
+  ): Promise<{ ok: boolean }> {
+    const response = await api.patch(`/admin/purchase-products/${encodeURIComponent(productKey)}/redeem-codes/${codeId}`, payload)
+    return response.data
+  },
+
+  async deletePurchaseProductRedeemCode(productKey: string, codeId: number): Promise<{ ok: boolean }> {
+    const response = await api.delete(`/admin/purchase-products/${encodeURIComponent(productKey)}/redeem-codes/${codeId}`)
     return response.data
   },
 }
@@ -1692,6 +1952,20 @@ export interface GptAccountsListResponse {
   }
 }
 
+export interface DeleteBannedAccountsBatchResponse {
+  message: string
+  deleted: number
+  matched: number
+  requestedIds: number[] | null
+}
+
+export interface DeleteExpiredAccountsBatchResponse {
+  message: string
+  deleted: number
+  matched: number
+  requestedIds: number[] | null
+}
+
 export const gptAccountService = {
   async getAll(params?: GptAccountsListParams): Promise<GptAccountsListResponse> {
     const response = await api.get('/gpt-accounts', { params })
@@ -1717,6 +1991,22 @@ export const gptAccountService = {
     await api.delete(`/gpt-accounts/${id}`)
   },
 
+  async deleteBannedBatch(accountIds?: number[]): Promise<DeleteBannedAccountsBatchResponse> {
+    const payload = Array.isArray(accountIds) && accountIds.length > 0
+      ? { accountIds }
+      : undefined
+    const response = await api.delete('/gpt-accounts/banned/batch', { data: payload })
+    return response.data
+  },
+
+  async deleteExpiredBatch(accountIds?: number[]): Promise<DeleteExpiredAccountsBatchResponse> {
+    const payload = Array.isArray(accountIds) && accountIds.length > 0
+      ? { accountIds }
+      : undefined
+    const response = await api.delete('/gpt-accounts/expired/batch', { data: payload })
+    return response.data
+  },
+
   async checkAccessToken(token: string): Promise<CheckGptAccessTokenResponse> {
     const response = await api.post('/gpt-accounts/check-token', { token })
     return response.data
@@ -1732,6 +2022,11 @@ export const gptAccountService = {
     return response.data
   },
 
+  async syncZeroJoinedBatch(): Promise<SyncZeroJoinedBatchResponse> {
+    const response = await api.post('/gpt-accounts/sync-user-count/zero-joined')
+    return response.data
+  },
+
   async deleteAccountUser(accountId: number, userId: string): Promise<SyncUserCountResponse> {
     const response = await api.delete(`/gpt-accounts/${accountId}/users/${encodeURIComponent(userId)}`)
     return response.data
@@ -1739,6 +2034,17 @@ export const gptAccountService = {
 
   async inviteAccountUser(accountId: number, email: string): Promise<InviteUserResponse> {
     const response = await api.post(`/gpt-accounts/${accountId}/invite-user`, { email })
+    return response.data
+  },
+
+  async inviteAccountUserDirect(email: string, accountId?: number): Promise<DirectInviteUserResponse> {
+    const normalizedAccountId = Number.isFinite(Number(accountId)) && Number(accountId) > 0
+      ? Number(accountId)
+      : undefined
+    const response = await api.post('/gpt-accounts/invite/direct', {
+      email,
+      accountId: normalizedAccountId
+    })
     return response.data
   },
 
@@ -1928,6 +2234,67 @@ export const openAccountsService = {
       }
     )
     return response.data
+  },
+
+  async shopListProducts(sessionToken: string): Promise<{ products: LdcShopProduct[] }> {
+    const response = await api.get('/open-accounts/shop/products', {
+      headers: {
+        'x-linuxdo-token': sessionToken
+      }
+    })
+    return response.data
+  },
+
+  async shopCreateOrder(
+    sessionToken: string,
+    payload: { productKey: string }
+  ): Promise<{
+    orderNo: string
+    productKey: string
+    productName: string
+    amount: string
+    deliveryMode: PurchaseDeliveryMode
+    fulfillmentMode?: PurchaseFulfillmentMode
+    status: string
+    reused: boolean
+    creditOrder: {
+      orderNo: string
+      amount: string
+      payUrl?: string | null
+      payRequest?: { method?: 'POST' | 'GET'; url: string; fields?: Record<string, string> }
+    }
+  }> {
+    const response = await api.post('/open-accounts/shop/orders', payload, {
+      headers: {
+        'x-linuxdo-token': sessionToken
+      }
+    })
+    return response.data
+  },
+
+  async shopGetOrder(sessionToken: string, orderNo: string): Promise<{ order: LdcShopOrder }> {
+    const response = await api.get(`/open-accounts/shop/orders/${encodeURIComponent(orderNo)}`, {
+      headers: {
+        'x-linuxdo-token': sessionToken
+      }
+    })
+    return response.data
+  },
+
+  async shopListOrders(
+    sessionToken: string,
+    params?: { page?: number; pageSize?: number }
+  ): Promise<{
+    orders: LdcShopOrder[]
+    pagination: { page: number; pageSize: number; total: number }
+  }> {
+    const response = await api.get('/open-accounts/shop/orders', {
+      params,
+      headers: {
+        'x-linuxdo-token': sessionToken
+      }
+    })
+    return response.data
   }
 }
 
@@ -2089,7 +2456,7 @@ export const redemptionCodeService = {
   },
 
   async redeem(
-    data: { email: string; code: string; channel?: RedemptionChannel; redeemerUid?: string; orderType?: PurchaseOrderType },
+    data: { email: string; code: string; channel?: RedemptionChannel; redeemerUid?: string },
     options?: { linuxDoSessionToken?: string }
   ): Promise<any> {
     // 为兑换接口创建一个不带认证的请求
@@ -2110,7 +2477,6 @@ export const redemptionCodeService = {
     code: string
     channel?: RedemptionChannel
     redeemerUid?: string
-    orderType?: PurchaseOrderType
   }): Promise<any> {
     const response = await api.post('/redemption-codes/admin/redeem', data)
     return response

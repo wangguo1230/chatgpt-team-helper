@@ -68,9 +68,16 @@ OPENAI_SCOPE=openid profile email offline_access
 # SMTP_PASS=
 # SMTP_FROM=
 # ADMIN_ALERT_EMAIL=
+# 邮箱验证码标题（默认：邮箱验证码）
 # EMAIL_VERIFICATION_SUBJECT=邮箱验证码
+# 开放账号扫描报告邮件标题（默认：开放账号超员扫描报告）
 # OPEN_ACCOUNTS_SWEEPER_REPORT_SUBJECT=开放账号超员扫描报告
+# 兑换链路汇总告警邮件标题（默认：兑换链路汇总告警）
+# REDEMPTION_ALERT_EMAIL_SUBJECT=兑换链路汇总告警
+# 购买通知邮件标题（默认：订单信息）
 # PURCHASE_EMAIL_SUBJECT=订单信息
+# LDC 小店交付邮件标题（默认：LDC 商品交付通知）
+# LDC_SHOP_EMAIL_SUBJECT=LDC 商品交付通知
 
 # ======================
 # 代理（可选）
@@ -169,12 +176,38 @@ TELEGRAM_INTERNAL_API_BASE_URL=
 # OPEN_ACCOUNTS_USER_DAILY_BOARD_LIMIT=1
 
 # 开放账号超员扫描（定时任务）
+# 说明：修改以下调度参数后需重启后端服务生效
 # OPEN_ACCOUNTS_SWEEPER_ENABLED=true
+# 旧版小时间隔（默认 1 小时；当未设置分钟间隔/自定义时段时生效）
 # OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS=2
-# OPEN_ACCOUNTS_MAX_JOINED=6
+# 扫描间隔（分钟，默认 60；优先级高于 OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS）
+# OPEN_ACCOUNTS_SWEEPER_INTERVAL_MINUTES=30
+# 自定义扫描小时（可选，逗号分隔 0-23；配置后优先于 interval 分支）
+# 示例：0,6,12,18 表示每天 00:00/06:00/12:00/18:00 触发
+# OPEN_ACCOUNTS_SWEEPER_SCHEDULE_HOURS=0,6,12,18
+# 自定义扫描分钟（默认 0；仅在设置了 OPEN_ACCOUNTS_SWEEPER_SCHEDULE_HOURS 时生效）
+# OPEN_ACCOUNTS_SWEEPER_SCHEDULE_MINUTE=0
+# 示例：每 30 分钟执行一次（使用 interval 分支）
+# OPEN_ACCOUNTS_SWEEPER_ENABLED=true
+# OPEN_ACCOUNTS_SWEEPER_INTERVAL_MINUTES=30
+# OPEN_ACCOUNTS_SWEEPER_SCHEDULE_HOURS=
+# 超员阈值与开放账号容量上限统一：
+# 扫描器使用 OPEN_ACCOUNTS_CAPACITY_LIMIT / 系统配置 open_accounts_capacity_limit
+# 成员人数 joined > 容量上限 时触发踢人流程（默认 5）
+# 扫描最近 N 天创建的开放账号（0 表示不限制，默认 15）
 # OPEN_ACCOUNTS_SWEEPER_CREATED_WITHIN_DAYS=15
+# 并发 worker 数（默认 3）
 # OPEN_ACCOUNTS_SWEEPER_CONCURRENCY=3
+# 启动后是否立即执行一次（默认 false）
 # OPEN_ACCOUNTS_SWEEPER_RUN_ON_STARTUP=false
+# 开启账号安全检测（默认 true）：检测异常会自动封号并下架未使用兑换码
+# OPEN_ACCOUNTS_SWEEPER_SECURITY_CHECK_ENABLED=true
+
+# 兑换链路告警
+# 兑换后按渠道检查可用兑换码库存，低于阈值会发送汇总邮件（0 表示关闭）
+# REDEMPTION_LOW_STOCK_THRESHOLD=10
+# 自动选码懒重试次数（默认 8；仅当前选中码账号不可用时尝试下一个）
+# REDEEM_LAZY_RETRY_MAX_ATTEMPTS=8
 
 # 订单过期清理任务（推荐开启）
 # 用于定期将“已下单但未支付且超时”的订单更新为 expired，避免前台/后台长期展示无效订单。
@@ -200,6 +233,32 @@ TELEGRAM_INTERNAL_API_BASE_URL=
 # OPEN_ACCOUNTS_BOARD_SHORT_RETRY_ENABLED=true
 # OPEN_ACCOUNTS_BOARD_SHORT_RETRY_MAX_ATTEMPTS=3
 # OPEN_ACCOUNTS_BOARD_SHORT_RETRY_BASE_DELAY_MS=800
+
+# LDC 商品小店订单查单最小间隔（毫秒，默认 8000）
+# LDC_SHOP_ORDER_QUERY_MIN_INTERVAL_MS=8000
+
+# LDC 商品小店自动发卡（redeem_api）配置
+# 说明：当商品 fulfillmentMode=redeem_api 时生效。流程：validate -> redeem -> task-status。
+# LDC_SHOP_REDEEM_BASE_URL=https://yyl.ncet.top
+# LDC_SHOP_REDEEM_VALIDATE_PATH=/shop/shop/redeem/validate
+# LDC_SHOP_REDEEM_SUBMIT_PATH=/shop/shop/redeem
+# LDC_SHOP_REDEEM_TASK_STATUS_PATH=/shop/shop/redeem/task-status/{task_id}
+# 请求超时（毫秒，默认 20000；最小 3000）
+# LDC_SHOP_REDEEM_TIMEOUT_MS=20000
+# 单请求失败重试次数（默认 2）
+# LDC_SHOP_REDEEM_REQUEST_RETRIES=2
+# task-status 最大轮询次数（默认 8）
+# LDC_SHOP_REDEEM_TASK_POLL_MAX_ATTEMPTS=8
+# task-status 轮询间隔（毫秒，默认 30000）
+# LDC_SHOP_REDEEM_TASK_POLL_INTERVAL_MS=30000
+# redeem 请求的 contactEmail（可空）
+# LDC_SHOP_REDEEM_CONTACT_EMAIL=
+# redeem 请求 visitorId 前缀
+# LDC_SHOP_REDEEM_VISITOR_ID_PREFIX=visitor_
+# redeem 请求 quantity（默认 1）
+# LDC_SHOP_REDEEM_QUANTITY=1
+# 自动切换失效兑换码的最大次数（默认 3）
+# LDC_SHOP_REDEEM_CODE_MAX_SWITCH_ATTEMPTS=3
 
 # ======================
 # Linux DO OAuth（可选）
