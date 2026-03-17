@@ -3028,12 +3028,20 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
               AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
               AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
               AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-              AND ${getCodeAccountRedeemableExistsSql()}
+              AND (
+                rc.account_email IS NULL
+                OR trim(rc.account_email) = ''
+                OR EXISTS (
+                  SELECT 1
+                  FROM gpt_accounts ga
+                  WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+                )
+              )
               ${exclude.clause}
             ORDER BY rc.created_at ASC
             LIMIT 1
           `,
-          [minAccountExpireAt, ...exclude.params]
+          [...exclude.params]
         )
         let codeRow = todayResult?.[0]?.values?.[0] || null
         if (codeRow) return codeRow
@@ -3101,12 +3109,20 @@ router.post('/xianyu/redeem-order', requireFeatureEnabled('xianyu'), async (req,
                 AND (rc.reserved_for_uid IS NULL OR rc.reserved_for_uid = '')
                 AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
                 AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-                AND ${getCodeAccountRedeemableExistsSql()}
+                AND (
+                  rc.account_email IS NULL
+                  OR trim(rc.account_email) = ''
+                  OR EXISTS (
+                    SELECT 1
+                    FROM gpt_accounts ga
+                    WHERE lower(trim(ga.email)) = lower(trim(rc.account_email))
+                  )
+                )
                 ${exclude.clause}
               ORDER BY rc.created_at ASC
               LIMIT 1
             `,
-            [minAccountExpireAt, ...exclude.params]
+            [...exclude.params]
           )
           let codeRow = todayResult?.[0]?.values?.[0] || null
           if (codeRow) return codeRow

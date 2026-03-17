@@ -727,6 +727,9 @@ export interface PurchaseOrder {
   serviceDays: number
   productKey?: string | null
   codeChannel?: string | null
+  codeId?: number | null
+  code?: string | null
+  codeAccountEmail?: string | null
   orderType?: PurchaseOrderType
   payType?: 'alipay' | 'wxpay' | null
   payUrl?: string | null
@@ -870,6 +873,33 @@ export interface XianyuStatus {
     startedAt?: string
     finishedAt?: string
   } | null
+}
+
+export interface AlipayRedpackOrder {
+  id: number
+  email: string
+  alipayPassphrase: string
+  redemptionCodeId?: number | null
+  redemptionCodeRedeemedAt?: string | null
+  note?: string
+  status: 'pending' | 'invited' | 'redeemed' | string
+  inviteResult?: string
+  invitedAccountId?: number | null
+  invitedAccountEmail?: string | null
+  inviteSentAt?: string | null
+  redeemedAt?: string | null
+  operatorUserId?: number | null
+  operatorUsername?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface AlipayRedpackStock {
+  availableCount: number
+  invitableAccountCount: number
+  candidateAccountCount: number
+  capacityLimit: number
+  updatedAt?: string | null
 }
 
 export interface LinuxDoUser {
@@ -2823,6 +2853,55 @@ export const xianyuService = {
     const response = await api.post(`/xianyu/orders/${id}/bind-code`, payload)
     return response.data
   },
+}
+
+export const alipayRedpackService = {
+  async getPublicStock(): Promise<AlipayRedpackStock> {
+    const response = await axios.get(`${API_URL}/alipay-redpack/stock`, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async createOrderPublic(payload: { email: string; alipayPassphrase: string; note?: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
+    const response = await axios.post(`${API_URL}/alipay-redpack/orders`, payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async supplementPublic(payload: { email: string; alipayPassphrase: string; note?: string }): Promise<{ message: string; created: boolean; order: AlipayRedpackOrder }> {
+    const response = await axios.post(`${API_URL}/alipay-redpack/orders/supplement`, payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async adminListOrders(params?: { search?: string; status?: string; limit?: number; offset?: number }): Promise<{ orders: AlipayRedpackOrder[]; total: number; limit: number; offset: number }> {
+    const response = await api.get('/alipay-redpack/admin/orders', { params })
+    return response.data
+  },
+
+  async adminQuickInvite(id: number, payload?: { accountId?: number }): Promise<{ message: string; order: AlipayRedpackOrder; queueState?: { isMember: boolean; isInvited: boolean }; redemptionCode?: RedemptionCode | null }> {
+    const response = await api.post(`/alipay-redpack/admin/orders/${id}/quick-invite`, payload || {})
+    return response.data
+  },
+
+  async adminSyncStatus(id: number): Promise<{ message: string; order: AlipayRedpackOrder; queueState?: { isMember: boolean; isInvited: boolean } }> {
+    const response = await api.post(`/alipay-redpack/admin/orders/${id}/sync-status`)
+    return response.data
+  },
+
+  async adminUpdateNote(id: number, payload: { note: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
+    const response = await api.patch(`/alipay-redpack/admin/orders/${id}/note`, payload)
+    return response.data
+  }
 }
 
 export default api

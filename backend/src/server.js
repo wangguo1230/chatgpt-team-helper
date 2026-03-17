@@ -13,6 +13,7 @@ import configRoutes from './routes/config.js'
 import versionRoutes from './routes/version.js'
 import xhsRoutes from './routes/xhs.js'
 import xianyuRoutes from './routes/xianyu.js'
+import alipayRedpackRoutes from './routes/alipay-redpack.js'
 import openAccountsRoutes from './routes/open-accounts.js'
 import openAccountsShopRoutes from './routes/open-accounts-shop.js'
 import purchaseRoutes from './routes/purchase.js'
@@ -134,6 +135,7 @@ app.use('/api/version', versionRoutes)
 app.use('/api/waiting-room', waitingRoomRoutes)
 app.use('/api/xhs', xhsRoutes)
 app.use('/api/xianyu', xianyuRoutes)
+app.use('/api/alipay-redpack', alipayRedpackRoutes)
 app.use('/api/open-accounts/shop', openAccountsShopRoutes)
 app.use('/api/open-accounts', openAccountsRoutes)
 app.use('/api/purchase', purchaseRoutes)

@@ -677,6 +677,13 @@ const getProductFulfillmentMode = (product: PurchaseProduct | null | undefined):
   return (product?.fulfillmentMode || 'item_pool') as PurchaseFulfillmentMode
 }
 const isRedeemApiProduct = (product: PurchaseProduct | null | undefined) => getProductFulfillmentMode(product) === 'redeem_api'
+const getOrderTypeLabel = (value: PurchaseOrderType | string | null | undefined) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'warranty') return '有质保'
+  if (normalized === 'no_warranty' || normalized === 'no-warranty' || normalized === 'nowarranty') return '无质保'
+  if (normalized === 'anti_ban' || normalized === 'anti-ban') return '防封禁'
+  return normalized || '-'
+}
 const getFulfillmentModeLabel = (mode: PurchaseFulfillmentMode | string | null | undefined) => {
   const normalized = String(mode || 'item_pool').trim().toLowerCase()
   if (normalized === 'redeem_api') return '兑换码池（自动发卡）'
@@ -2344,7 +2351,7 @@ const savePointsWithdrawSettings = async () => {
                   <td class="px-4 py-3 font-mono text-gray-700">{{ (product.category || 'code') === 'ldc_shop' ? `${product.amount} Credit` : `¥ ${product.amount}` }}</td>
                   <td class="px-4 py-3 text-gray-700">{{ product.serviceDays }} 天</td>
                   <td class="px-4 py-3">
-                    <span class="px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700">{{ product.orderType }}</span>
+                    <span class="px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700">{{ getOrderTypeLabel(product.orderType) }}</span>
                   </td>
                   <td class="px-4 py-3">
                     <span class="px-2 py-1 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">{{ product.deliveryMode || 'email' }}</span>
@@ -2529,9 +2536,9 @@ const savePointsWithdrawSettings = async () => {
                   <SelectValue placeholder="请选择" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="warranty">warranty</SelectItem>
-                  <SelectItem value="no_warranty">no_warranty</SelectItem>
-                  <SelectItem value="anti_ban">anti_ban</SelectItem>
+                  <SelectItem value="warranty">有质保（warranty）</SelectItem>
+                  <SelectItem value="no_warranty">无质保（no_warranty）</SelectItem>
+                  <SelectItem value="anti_ban">防封禁（anti_ban）</SelectItem>
                 </SelectContent>
               </Select>
             </div>

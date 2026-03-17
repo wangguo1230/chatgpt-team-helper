@@ -117,6 +117,14 @@ const statusLabel = (status?: string) => {
   return status || '未知'
 }
 
+const orderTypeLabel = (orderType?: string | null) => {
+  const normalized = String(orderType || '').trim().toLowerCase()
+  if (normalized === 'no_warranty' || normalized === 'no-warranty' || normalized === 'nowarranty') return '无质保'
+  if (normalized === 'warranty') return '有质保'
+  if (normalized === 'anti_ban' || normalized === 'anti-ban') return '防封禁'
+  return normalized || '-'
+}
+
 const getStatusColor = (status?: string) => {
   switch (status) {
     case 'paid': return 'bg-green-100 text-green-700 border-green-200'
@@ -317,6 +325,7 @@ onUnmounted(() => {
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">订单号</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">用户邮箱</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">商品</th>
+                   <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">关联兑换码</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">金额</th>
                    <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
                    <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
@@ -342,7 +351,23 @@ onUnmounted(() => {
                       </div>
                    </td>
                    <td class="px-6 py-5">
-                      <span class="text-sm font-medium text-gray-900">{{ item.productName }}</span>
+                      <div class="space-y-1">
+                        <span class="text-sm font-medium text-gray-900">{{ item.productName }}</span>
+                        <div class="text-xs text-gray-500">
+                          <span>商品键：{{ item.productKey || '-' }}</span>
+                          <span class="mx-1">|</span>
+                          <span>{{ orderTypeLabel(item.orderType) }}</span>
+                          <span class="mx-1">|</span>
+                          <span>质保天数：{{ item.orderType === 'no_warranty' ? '-' : (item.serviceDays || '-') }}</span>
+                        </div>
+                      </div>
+                   </td>
+                   <td class="px-6 py-5">
+                      <div class="space-y-1">
+                        <p class="text-xs font-mono text-gray-900 break-all">{{ item.code || '-' }}</p>
+                        <p class="text-xs text-gray-500">编码ID：{{ item.codeId || '-' }}</p>
+                        <p class="text-xs text-gray-500">渠道：{{ item.codeChannel || '-' }}</p>
+                      </div>
                    </td>
                    <td class="px-6 py-5">
                       <span class="text-sm font-medium text-gray-900">¥ {{ item.amount }}</span>

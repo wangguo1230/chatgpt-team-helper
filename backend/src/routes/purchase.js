@@ -151,6 +151,11 @@ const parseOrderType = (value) => {
 }
 
 const normalizeOrderType = (value) => parseOrderType(value) || ORDER_TYPE_WARRANTY
+const normalizeServiceDays = (value, fallback = 0) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.floor(parsed)
+}
 
 const resolvePurchaseCodeChannel = (orderType) => (
   normalizeOrderType(orderType) === ORDER_TYPE_WARRANTY ? CODE_CHANNEL_PAYPAL : CODE_CHANNEL_COMMON
@@ -246,6 +251,24 @@ const getPurchasePlan = (orderType) => {
 
 const isNoWarrantyOrderType = (orderType) => normalizeOrderType(orderType) === ORDER_TYPE_NO_WARRANTY
 const isAntiBanOrderType = (orderType) => normalizeOrderType(orderType) === ORDER_TYPE_ANTI_BAN
+
+const buildCodeProductMatch = ({ orderType, serviceDays } = {}) => {
+  const resolvedOrderType = normalizeOrderType(orderType)
+  const clauses = [
+    `COALESCE(NULLIF(lower(trim(rc.order_type)), ''), '${ORDER_TYPE_WARRANTY}') = ?`
+  ]
+  const params = [resolvedOrderType]
+
+  if (resolvedOrderType === ORDER_TYPE_NO_WARRANTY) {
+    clauses.push('COALESCE(rc.service_days, 0) = 0')
+    return { clauses, params }
+  }
+
+  const resolvedServiceDays = normalizeServiceDays(serviceDays, 0)
+  clauses.push('COALESCE(rc.service_days, 0) = ?')
+  params.push(resolvedServiceDays)
+  return { clauses, params }
+}
 
 const getInviteOrderRewardPoints = () => Math.max(0, toInt(process.env.INVITE_ORDER_REWARD_POINTS, 5))
 const getPurchaseOrderRewardPoints = () => Math.max(0, toInt(process.env.PURCHASE_ORDER_REWARD_POINTS, 3))
@@ -449,46 +472,50 @@ const cleanupExpiredOrders = (db, { expireMinutes }) => {
   return released
 }
 
-const getTodayAvailableCodeCount = (db, { channel } = {}) => {
+const getTodayAvailableCodeCount = (db, { channel, orderType, serviceDays } = {}) => {
   const resolvedChannel = String(channel || CODE_CHANNEL_COMMON).trim().toLowerCase() || CODE_CHANNEL_COMMON
+  const codeMatch = buildCodeProductMatch({ orderType, serviceDays })
   const result = db.exec(
     `
-	      SELECT COUNT(*)
+		      SELECT COUNT(*)
 	      FROM redemption_codes rc
 	      JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
 	      WHERE rc.is_redeemed = 0
 	        AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = ?
 	        AND rc.account_email IS NOT NULL
-        AND ga.is_open = 1
-        AND ga.user_count < 6
-        AND DATE(ga.created_at) = DATE('now', 'localtime')
-        AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-        AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-    `,
-    [resolvedChannel]
+	        AND ga.is_open = 1
+	        AND ga.user_count < 6
+	        AND DATE(ga.created_at) = DATE('now', 'localtime')
+	        AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+	        AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+          AND ${codeMatch.clauses.join(' AND ')}
+	    `,
+    [resolvedChannel, ...codeMatch.params]
   )
   return Number(result[0]?.values?.[0]?.[0] || 0)
 }
 
-const reserveTodayCode = (db, { orderNo, email, channel } = {}) => {
+const reserveTodayCode = (db, { orderNo, email, channel, orderType, serviceDays } = {}) => {
   const resolvedChannel = String(channel || CODE_CHANNEL_COMMON).trim().toLowerCase() || CODE_CHANNEL_COMMON
+  const codeMatch = buildCodeProductMatch({ orderType, serviceDays })
   const row = db.exec(
     `
-	      SELECT rc.id, rc.code, rc.account_email
+		      SELECT rc.id, rc.code, rc.account_email
 	      FROM redemption_codes rc
 	      JOIN gpt_accounts ga ON lower(trim(ga.email)) = lower(trim(rc.account_email))
 	      WHERE rc.is_redeemed = 0
 	        AND COALESCE(NULLIF(lower(trim(rc.channel)), ''), 'common') = ?
 	        AND rc.account_email IS NOT NULL
         AND ga.is_open = 1
-        AND ga.user_count < 6
-        AND DATE(ga.created_at) = DATE('now', 'localtime')
-        AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
-        AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
-      ORDER BY rc.created_at ASC
-      LIMIT 1
-    `,
-    [resolvedChannel]
+	        AND ga.user_count < 6
+	        AND DATE(ga.created_at) = DATE('now', 'localtime')
+	        AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+	        AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+          AND ${codeMatch.clauses.join(' AND ')}
+	      ORDER BY rc.created_at ASC
+	      LIMIT 1
+	    `,
+    [resolvedChannel, ...codeMatch.params]
   )[0]?.values?.[0]
 
   if (!row) return null
@@ -1112,7 +1139,11 @@ router.get('/meta', async (req, res) => {
       const codeChannels = parseProductCodeChannels(product, channelsByKey)
       let availableCount = 0
       for (const channel of codeChannels) {
-        availableCount += getTodayAvailableCodeCount(db, { channel })
+        availableCount += getTodayAvailableCodeCount(db, {
+          channel,
+          orderType,
+          serviceDays: product.serviceDays,
+        })
       }
 
       const isNoWarranty = orderType === ORDER_TYPE_NO_WARRANTY
@@ -1130,8 +1161,16 @@ router.get('/meta', async (req, res) => {
 
     if (!responsePlans.length) {
       const legacy = getPurchasePlans()
-      const legacyWarrantyCount = getTodayAvailableCodeCount(db, { channel: CODE_CHANNEL_PAYPAL })
-      const legacyNoWarrantyCount = getTodayAvailableCodeCount(db, { channel: CODE_CHANNEL_COMMON })
+      const legacyWarrantyCount = getTodayAvailableCodeCount(db, {
+        channel: CODE_CHANNEL_PAYPAL,
+        orderType: ORDER_TYPE_WARRANTY,
+        serviceDays: legacy.plans.warranty.serviceDays,
+      })
+      const legacyNoWarrantyCount = getTodayAvailableCodeCount(db, {
+        channel: CODE_CHANNEL_COMMON,
+        orderType: ORDER_TYPE_NO_WARRANTY,
+        serviceDays: 0,
+      })
       return res.json({
         plans: [
           {
@@ -1240,7 +1279,13 @@ router.post('/orders', async (req, res) => {
       let reserved = null
       let lockedChannel = ''
       for (const channel of candidateChannels) {
-        reserved = reserveTodayCode(db, { orderNo, email, channel })
+        reserved = reserveTodayCode(db, {
+          orderNo,
+          email,
+          channel,
+          orderType,
+          serviceDays: product.serviceDays,
+        })
         if (reserved) {
           lockedChannel = channel
           break
@@ -1908,7 +1953,9 @@ router.get('/admin/orders', async (req, res) => {
     const offset = (page - 1) * pageSize
     const result = db.exec(
       `
-        SELECT order_no, email, product_name, amount, service_days, order_type, pay_type, status, created_at, paid_at, refunded_at, refund_amount, zpay_payurl
+        SELECT order_no, email, product_key, product_name, amount, service_days, order_type, pay_type, status,
+               code_channel, code_id, code, code_account_email,
+               created_at, paid_at, refunded_at, refund_amount, zpay_payurl
         FROM purchase_orders
         ${whereClause}
         ORDER BY created_at DESC
@@ -1921,17 +1968,22 @@ router.get('/admin/orders', async (req, res) => {
       orders: rows.map(row => ({
         orderNo: row[0],
         email: row[1],
-        productName: row[2],
-        amount: row[3],
-        serviceDays: Number(row[4]) || 30,
-        orderType: normalizeOrderType(row[5]),
-        payType: row[6] || null,
-        status: row[7],
-        createdAt: row[8],
-        paidAt: row[9] || null,
-        refundedAt: row[10] || null,
-        refundAmount: row[11] || null,
-        payUrl: row[12] || null
+        productKey: row[2] || null,
+        productName: row[3],
+        amount: row[4],
+        serviceDays: Number(row[5]) || 30,
+        orderType: normalizeOrderType(row[6]),
+        payType: row[7] || null,
+        status: row[8],
+        codeChannel: row[9] || null,
+        codeId: row[10] != null ? Number(row[10]) : null,
+        code: row[11] || null,
+        codeAccountEmail: row[12] || null,
+        createdAt: row[13],
+        paidAt: row[14] || null,
+        refundedAt: row[15] || null,
+        refundAmount: row[16] || null,
+        payUrl: row[17] || null
       })),
       pagination: { page, pageSize, total }
     })

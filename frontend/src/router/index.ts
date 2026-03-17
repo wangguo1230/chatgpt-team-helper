@@ -8,6 +8,7 @@ import LinuxDoRedeemView from '../views/LinuxDoRedeemView.vue'
 import LinuxDoOpenAccountsView from '../views/LinuxDoOpenAccountsView.vue'
 import XhsRedeemView from '../views/XhsRedeemView.vue'
 import XianyuRedeemView from '../views/XianyuRedeemView.vue'
+import AlipayRedpackRedeemView from '../views/AlipayRedpackRedeemView.vue'
 import PurchaseView from '../views/PurchaseView.vue'
 import PurchaseCatalogView from '../views/PurchaseCatalogView.vue'
 import PurchaseProductView from '../views/PurchaseProductView.vue'
@@ -22,6 +23,7 @@ import AppleShowcase from '../views/AppleShowcase.vue'
 import WaitingRoomAdminView from '../views/WaitingRoomAdminView.vue'
 import XhsOrdersView from '../views/XhsOrdersView.vue'
 import XianyuOrdersView from '../views/XianyuOrdersView.vue'
+import AlipayRedpackOrdersView from '../views/AlipayRedpackOrdersView.vue'
 import PurchaseOrdersView from '../views/PurchaseOrdersView.vue'
 import CreditOrdersView from '../views/CreditOrdersView.vue'
 import AccountRecoveryAdminView from '../views/AccountRecoveryAdminView.vue'
@@ -126,6 +128,11 @@ const router = createRouter({
       meta: { featureKey: 'xianyu' },
     },
     {
+      path: '/redeem/alipay-redpack',
+      name: 'alipay-redpack-redeem',
+      component: AlipayRedpackRedeemView,
+    },
+    {
       path: '/redeem/:channelKey',
       name: 'generic-redeem',
       component: GenericRedeemView,
@@ -227,6 +234,12 @@ const router = createRouter({
           name: 'credit-orders',
           component: CreditOrdersView,
           meta: { requiredMenuKey: 'credit_orders', featureKey: 'openAccounts' },
+        },
+        {
+          path: 'alipay-redpack-orders',
+          name: 'alipay-redpack-orders',
+          component: AlipayRedpackOrdersView,
+          meta: { requiredMenuKey: 'alipay_redpack_orders' },
         },
         {
           path: 'waiting-room',

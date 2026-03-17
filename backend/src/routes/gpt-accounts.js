@@ -8,6 +8,7 @@ import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, f
 import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
 import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 import { withLocks } from '../utils/locks.js'
+import { performDirectInvite } from '../services/direct-invite.js'
 
 const router = express.Router()
 const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -1687,96 +1688,9 @@ router.post('/:id/invite-user', async (req, res) => {
 
 router.post('/invite/direct', async (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email)
-    const accountIdInput = Number.parseInt(String(req.body?.accountId ?? '').trim(), 10)
-    const preferredAccountId = Number.isFinite(accountIdInput) && accountIdInput > 0 ? accountIdInput : null
-
-    if (!email) {
-      return res.status(400).json({ error: '请提供邀请邮箱地址' })
-    }
-
-    if (!EMAIL_REGEX.test(email)) {
-      return res.status(400).json({ error: '邮箱格式不正确' })
-    }
-
-    const lockKeys = ['direct-invite:global']
-    if (preferredAccountId) {
-      lockKeys.push(`direct-invite:account:${preferredAccountId}`)
-    }
-
-    const response = await withLocks(lockKeys, async () => {
-      const db = await getDatabase()
-      const account = resolveDirectInviteAccount(db, preferredAccountId)
-      const codeStats = getDirectInviteCodeStats(db, account.email)
-      const needsCodeConsume = codeStats.totalCount > 0
-      const reserveKey = needsCodeConsume
-        ? `direct_invite:${account.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
-        : null
-      const reservedCode = needsCodeConsume && reserveKey
-        ? reserveDirectInviteCode(db, account.email, email, reserveKey)
-        : null
-
-      if (needsCodeConsume && !reservedCode) {
-        throw new AccountSyncError('账号邀请码已不足，请补充未使用邀请码后重试', 409)
-      }
-
-      let result
-      try {
-        result = await inviteAccountUser(account.id, email)
-      } catch (error) {
-        if (reservedCode && reserveKey) {
-          try {
-            releaseDirectInviteCodeReservation(db, reservedCode.id, reserveKey)
-          } catch (releaseError) {
-            console.error('快捷邀请失败后释放兑换码预留失败:', releaseError)
-          }
-        }
-        throw error
-      }
-
-      const optimisticInviteCount = incrementInviteCountOptimistically(db, account.id)
-
-      let codeConsumed = reservedCode && reserveKey
-        ? consumeReservedDirectInviteCode(db, reservedCode.id, reserveKey)
-        : false
-      if (reservedCode && !codeConsumed) {
-        codeConsumed = forceConsumeDirectInviteCode(db, reservedCode.id)
-      }
-      if (reservedCode && !codeConsumed) {
-        console.error('快捷邀请扣减兑换码失败', {
-          accountId: account.id,
-          accountEmail: account.email,
-          inviteEmail: email,
-          reservedCodeId: reservedCode?.id
-        })
-      }
-
-      let inviteCount = Number.isFinite(optimisticInviteCount) ? optimisticInviteCount : null
-      try {
-        const synced = await syncAccountInviteCount(account.id, {
-          inviteListParams: { offset: 0, limit: 1, query: '' }
-        })
-        const syncedInviteCount = Number(synced.inviteCount)
-        if (Number.isFinite(syncedInviteCount)) {
-          inviteCount = syncedInviteCount
-        }
-        if (Number.isFinite(optimisticInviteCount)) {
-          const normalizedFloor = Math.max(Number(optimisticInviteCount), Number(inviteCount || 0))
-          inviteCount = ensureInviteCountAtLeast(db, account.id, normalizedFloor) ?? normalizedFloor
-        }
-      } catch (syncError) {
-        console.warn('快捷邀请发送成功，但同步邀请数失败:', syncError?.message || syncError)
-      }
-
-      return {
-        ...result,
-        accountId: account.id,
-        accountEmail: account.email,
-        inviteCount,
-        autoSelected: !preferredAccountId,
-        consumedCodeId: codeConsumed && reservedCode ? reservedCode.id : null,
-        consumedCode: codeConsumed && reservedCode ? reservedCode.code : null
-      }
+    const response = await performDirectInvite({
+      email: req.body?.email,
+      accountId: req.body?.accountId
     })
 
     res.json(response)

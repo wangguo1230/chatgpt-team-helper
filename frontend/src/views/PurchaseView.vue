@@ -36,42 +36,34 @@
       >
         <div class="p-8 sm:p-10 space-y-8">
           <div class="space-y-2">
-            <p class="text-[13px] font-semibold text-[#86868b] uppercase tracking-wider">订单类型</p>
-            <div
-              class="grid gap-3"
-              :class="warrantyPlan && noWarrantyPlan ? 'grid-cols-2' : 'grid-cols-1'"
-            >
+            <p class="text-[13px] font-semibold text-[#86868b] uppercase tracking-wider">选择商品</p>
+            <div class="grid gap-3 grid-cols-1">
               <button
-                v-if="warrantyPlan"
+                v-for="plan in plans"
+                :key="plan.key"
                 type="button"
                 class="rounded-2xl border backdrop-blur px-4 py-3 text-left text-[14px] font-medium transition"
-                :class="orderType === 'warranty'
+                :class="currentPlan?.key === plan.key
                   ? 'border-blue-500/40 bg-blue-500/10 text-[#007AFF]'
                   : 'border-black/5 dark:border-white/10 bg-white/40 dark:bg-black/20 text-[#1d1d1f]/70 dark:text-white/70 hover:bg-white/60'"
                 :disabled="creating"
-                @click="orderType = 'warranty'"
+                @click="selectedPlanKey = plan.key"
               >
-                <div class="flex items-center justify-between">
-                  <span>质保</span>
-                  <span class="tabular-nums">¥ {{ warrantyPlan?.amount ?? meta?.amount ?? '...' }}</span>
+                <div class="flex items-start justify-between gap-4">
+                  <div class="space-y-1">
+                    <p class="font-semibold text-[#1d1d1f] dark:text-white">{{ plan.productName }}</p>
+                    <p class="text-[12px] text-[#86868b]">
+                      {{ orderTypeLabel(plan.orderType) }} · 质保天数：{{ plan.orderType === 'no_warranty' ? '-' : plan.serviceDays }}
+                    </p>
+                    <p class="text-[12px]" :class="Number(plan.availableCount || 0) > 0 ? 'text-emerald-600' : 'text-red-500'">
+                      库存：{{ plan.availableCount ?? 0 }}
+                    </p>
+                  </div>
+                  <div class="text-right">
+                    <p class="tabular-nums text-[15px] font-semibold text-[#1d1d1f] dark:text-white">¥ {{ plan.amount }}</p>
+                    <p class="text-[11px] text-[#86868b] mt-1">{{ orderTypeHint(plan.orderType) }}</p>
+                  </div>
                 </div>
-                <p class="mt-1 text-[12px] text-[#86868b]">支持退款 / 补号</p>
-              </button>
-              <button
-                v-if="noWarrantyPlan"
-                type="button"
-                class="rounded-2xl border backdrop-blur px-4 py-3 text-left text-[14px] font-medium transition"
-                :class="orderType === 'no_warranty'
-                  ? 'border-blue-500/40 bg-blue-500/10 text-[#007AFF]'
-                  : 'border-black/5 dark:border-white/10 bg-white/40 dark:bg-black/20 text-[#1d1d1f]/70 dark:text-white/70 hover:bg-white/60'"
-                :disabled="creating"
-                @click="orderType = 'no_warranty'"
-              >
-                <div class="flex items-center justify-between">
-                  <span>无质保</span>
-                  <span class="tabular-nums">¥ {{ noWarrantyPlan?.amount ?? '5.00' }}</span>
-                </div>
-                <p class="mt-1 text-[12px] text-[#86868b]">仅提供首次登陆咨询</p>
               </button>
             </div>
           </div>
@@ -90,7 +82,7 @@
                 有效期：{{ currentPlan?.serviceDays ?? meta?.serviceDays ?? 30 }} 天（下单日起算）
               </p>
               <p>
-                购买奖励： +{{ currentPlan?.buyerRewardPoints ?? (orderType === 'no_warranty' ? 1 : '...') }} 积分
+                购买奖励： +{{ currentPlan?.buyerRewardPoints ?? (currentOrderType === 'no_warranty' ? 1 : '...') }} 积分
               </p>
             </div>
           </div>
@@ -238,7 +230,7 @@ const route = useRoute()
 const meta = ref<PurchaseMeta | null>(null)
 const email = ref('')
 const payType = ref<'alipay' | 'wxpay'>('alipay')
-const orderType = ref<PurchaseOrderType>('warranty')
+const selectedPlanKey = ref('')
 const creating = ref(false)
 const refreshing = ref(false)
 const errorMessage = ref('')
@@ -250,22 +242,26 @@ const orderFetchInFlight = ref(false)
 
 const { success: showSuccessToast, warning: showWarningToast } = useToast()
 
+const normalizePlanOrderType = (value: unknown): PurchaseOrderType => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (normalized === 'no_warranty' || normalized === 'no-warranty' || normalized === 'nowarranty') return 'no_warranty'
+  if (normalized === 'anti_ban' || normalized === 'anti-ban' || normalized === 'antiban') return 'anti_ban'
+  return 'warranty'
+}
+
+const normalizeProductKeyFromQuery = (value: unknown): string => {
+  const raw = Array.isArray(value) ? value[0] : value
+  return String(raw ?? '').trim()
+}
+
 const normalizeOrderTypeFromQuery = (value: unknown): PurchaseOrderType | null => {
   const raw = Array.isArray(value) ? value[0] : value
   const normalized = String(raw ?? '').trim().toLowerCase()
   if (normalized === 'warranty') return 'warranty'
   if (normalized === 'no_warranty' || normalized === 'no-warranty' || normalized === 'nowarranty') return 'no_warranty'
+  if (normalized === 'anti_ban' || normalized === 'anti-ban' || normalized === 'antiban') return 'anti_ban'
   return null
 }
-
-watch(
-  () => route.query.orderType,
-  (value) => {
-    const parsed = normalizeOrderTypeFromQuery(value)
-    if (parsed) orderType.value = parsed
-  },
-  { immediate: true }
-)
 
 const isValidEmail = computed(() => {
   if (!email.value) return true
@@ -274,20 +270,68 @@ const isValidEmail = computed(() => {
 
 const plans = computed<PurchasePlan[]>(() => meta.value?.plans || [])
 
+const currentOrderType = computed<PurchaseOrderType>(() => (
+  normalizePlanOrderType(currentPlan.value?.orderType)
+))
+
 const currentPlan = computed<PurchasePlan | null>(() => {
   if (!plans.value.length) return null
+  const selectedKey = selectedPlanKey.value.trim()
+  if (selectedKey) {
+    const selected = plans.value.find((plan) => plan.key === selectedKey)
+    if (selected) return selected
+  }
   const firstPlan = plans.value[0]
-  if (!firstPlan) return null
-  return plans.value.find(plan => plan.orderType === orderType.value) || firstPlan
+  return firstPlan || null
 })
 
-const warrantyPlan = computed<PurchasePlan | null>(
-  () => plans.value.find(plan => plan.orderType === 'warranty') || null
-)
+const orderTypeLabel = (type: PurchaseOrderType | null | undefined) => {
+  if (type === 'no_warranty') return '无质保'
+  if (type === 'anti_ban') return '防封禁'
+  return '有质保'
+}
 
-const noWarrantyPlan = computed<PurchasePlan | null>(
-  () => plans.value.find(plan => plan.orderType === 'no_warranty') || null
-)
+const orderTypeHint = (type: PurchaseOrderType | null | undefined) => {
+  if (type === 'no_warranty') return '低价体验'
+  if (type === 'anti_ban') return '防封禁策略'
+  return '官方质保'
+}
+
+const resolvePlanKeyFromQuery = (inputPlans: PurchasePlan[]): string => {
+  if (!inputPlans.length) return ''
+  const queryProductKey = normalizeProductKeyFromQuery(route.query.productKey ?? route.query.product_key)
+  if (queryProductKey) {
+    const planByKey = inputPlans.find((plan) => String(plan.key || '').trim() === queryProductKey)
+    if (planByKey?.key) return planByKey.key
+  }
+
+  const queryOrderType = normalizeOrderTypeFromQuery(route.query.orderType ?? route.query.order_type)
+  if (queryOrderType) {
+    const planByType = inputPlans.find((plan) => normalizePlanOrderType(plan.orderType) === queryOrderType)
+    if (planByType?.key) return planByType.key
+  }
+
+  return ''
+}
+
+const ensureSelectedPlan = (inputPlans: PurchasePlan[]) => {
+  if (!inputPlans.length) {
+    selectedPlanKey.value = ''
+    return
+  }
+  const firstPlan = inputPlans[0]
+  if (!firstPlan?.key) {
+    selectedPlanKey.value = ''
+    return
+  }
+
+  const currentKey = selectedPlanKey.value.trim()
+  const hasCurrent = Boolean(currentKey) && inputPlans.some((plan) => plan.key === currentKey)
+  if (hasCurrent) return
+
+  const queryMatchedKey = resolvePlanKeyFromQuery(inputPlans)
+  selectedPlanKey.value = queryMatchedKey || firstPlan.key
+}
 
 const currentAvailableCount = computed(() => (
   currentPlan.value?.availableCount ?? meta.value?.availableCount ?? 0
@@ -324,15 +368,7 @@ const orderPaidHint = computed(() => {
 const loadMeta = async () => {
   try {
     meta.value = await purchaseService.getMeta()
-    if (meta.value?.plans?.length) {
-      const hasSelected = meta.value.plans.some(plan => plan.orderType === orderType.value)
-      if (!hasSelected) {
-        const firstPlan = meta.value.plans[0]
-        if (firstPlan?.orderType) {
-          orderType.value = firstPlan.orderType
-        }
-      }
-    }
+    ensureSelectedPlan(meta.value?.plans || [])
   } catch (error: any) {
     errorMessage.value = error?.response?.data?.error || '加载库存失败，请稍后重试'
   }
@@ -341,6 +377,22 @@ const loadMeta = async () => {
 onMounted(async () => {
   await loadMeta()
 })
+
+watch(
+  () => [
+    route.query.productKey,
+    route.query.product_key,
+    route.query.orderType,
+    route.query.order_type
+  ],
+  () => {
+    if (!plans.value.length) return
+    const queryMatchedKey = resolvePlanKeyFromQuery(plans.value)
+    if (queryMatchedKey) {
+      selectedPlanKey.value = queryMatchedKey
+    }
+  }
+)
 
 const stopAutoRefresh = () => {
   if (autoRefreshTimer.value) {
@@ -396,7 +448,7 @@ const handleCreateOrder = async () => {
       email: normalizedEmail,
       type: payType.value,
       productKey: currentPlan.value.key,
-      orderType: orderType.value
+      orderType: currentOrderType.value
     })
     await refreshOrder()
     startAutoRefresh()

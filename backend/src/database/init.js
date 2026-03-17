@@ -370,8 +370,9 @@ const ensureRbacTables = (database) => {
       { key: 'purchase_orders', label: '支付订单', path: '/admin/purchase-orders', parentKey: 'order_management', sortOrder: 1 },
       { key: 'xhs_orders', label: '小红书订单', path: '/admin/xhs-orders', parentKey: 'order_management', sortOrder: 2 },
       { key: 'xianyu_orders', label: '闲鱼订单', path: '/admin/xianyu-orders', parentKey: 'order_management', sortOrder: 3 },
-      { key: 'credit_orders', label: 'Credit 订单', path: '/admin/credit-orders', parentKey: 'order_management', sortOrder: 4 },
-      { key: 'account_recovery', label: '补号管理', path: '/admin/account-recovery', parentKey: 'order_management', sortOrder: 5 },
+      { key: 'alipay_redpack_orders', label: '支付宝口令红包订单', path: '/admin/alipay-redpack-orders', parentKey: 'order_management', sortOrder: 4 },
+      { key: 'credit_orders', label: 'Credit 订单', path: '/admin/credit-orders', parentKey: 'order_management', sortOrder: 5 },
+      { key: 'account_recovery', label: '补号管理', path: '/admin/account-recovery', parentKey: 'order_management', sortOrder: 6 },
       { key: 'permission_management', label: '权限管理', path: '', sortOrder: 7 },
       { key: 'user_management', label: '用户管理', path: '/admin/users', parentKey: 'permission_management', sortOrder: 1 },
       { key: 'role_management', label: '角色管理', path: '/admin/roles', parentKey: 'permission_management', sortOrder: 2 },
@@ -559,6 +560,7 @@ const migrateUtcTimestampsToLocaltime = (database) => {
     { table: 'xhs_orders', columns: ['extracted_at', 'reserved_at', 'used_at', 'created_at', 'updated_at'] },
     { table: 'xianyu_config', columns: ['updated_at', 'last_sync_at', 'last_success_at'] },
     { table: 'xianyu_orders', columns: ['extracted_at', 'reserved_at', 'used_at', 'created_at', 'updated_at'] },
+    { table: 'alipay_redpack_orders', columns: ['invite_sent_at', 'redeemed_at', 'redemption_code_redeemed_at', 'created_at', 'updated_at'] },
   ]
 
   const startedAt = Date.now()
@@ -1132,6 +1134,111 @@ const ensureXianyuTables = (database) => {
     }
   } catch (error) {
     console.warn('[DB] 无法初始化 xianyu_config 表:', error)
+  }
+
+  return changed
+}
+
+const ensureAlipayRedpackOrdersTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'alipay_redpack_orders')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS alipay_redpack_orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL,
+          alipay_passphrase TEXT NOT NULL UNIQUE,
+          redemption_code_id INTEGER,
+          redemption_code_redeemed_at DATETIME,
+          note TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          invite_result TEXT,
+          invited_account_id INTEGER,
+          invited_account_email TEXT,
+          invite_sent_at DATETIME,
+          redeemed_at DATETIME,
+          operator_user_id INTEGER,
+          operator_username TEXT,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const tableInfo = database.exec('PRAGMA table_info(alipay_redpack_orders)')
+      if (tableInfo.length > 0) {
+        const columns = tableInfo[0].values.map(row => row[1])
+        if (!columns.includes('invite_result')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invite_result TEXT')
+          changed = true
+        }
+        if (!columns.includes('invited_account_id')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invited_account_id INTEGER')
+          changed = true
+        }
+        if (!columns.includes('invited_account_email')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invited_account_email TEXT')
+          changed = true
+        }
+        if (!columns.includes('redemption_code_id')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN redemption_code_id INTEGER')
+          changed = true
+        }
+        if (!columns.includes('redemption_code_redeemed_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN redemption_code_redeemed_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('invite_sent_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invite_sent_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('redeemed_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN redeemed_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('operator_user_id')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN operator_user_id INTEGER')
+          changed = true
+        }
+        if (!columns.includes('operator_username')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN operator_username TEXT')
+          changed = true
+        }
+        if (!columns.includes('created_at')) {
+          database.run("ALTER TABLE alipay_redpack_orders ADD COLUMN created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+          changed = true
+        }
+        if (!columns.includes('updated_at')) {
+          database.run("ALTER TABLE alipay_redpack_orders ADD COLUMN updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+          changed = true
+        }
+      }
+    }
+
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_status_created_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_status_created_at ON alipay_redpack_orders(status, created_at)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_email',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_email ON alipay_redpack_orders(email)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_invited_account_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_invited_account_id ON alipay_redpack_orders(invited_account_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_redemption_code_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_redemption_code_id ON alipay_redpack_orders(redemption_code_id)'
+    ) || changed
+  } catch (error) {
+    console.warn('[DB] 无法初始化 alipay_redpack_orders 表:', error)
   }
 
   return changed
@@ -2352,6 +2459,7 @@ export async function initDatabase() {
         const waitingRoomCreated = ensureWaitingRoomTable(database)
         const xhsTablesCreated = ensureXhsTables(database)
         const xianyuTablesCreated = ensureXianyuTables(database)
+        const alipayRedpackOrdersCreated = ensureAlipayRedpackOrdersTable(database)
         const linuxDoUsersCreated = ensureLinuxDoUsersTable(database)
         const accountRecoveryCreated = ensureAccountRecoveryTable(database)
         const purchaseOrdersCreated = ensurePurchaseOrdersTable(database)
@@ -2370,6 +2478,7 @@ export async function initDatabase() {
           waitingRoomCreated ||
           xhsTablesCreated ||
           xianyuTablesCreated ||
+          alipayRedpackOrdersCreated ||
           linuxDoUsersCreated ||
           accountRecoveryCreated ||
           purchaseOrdersCreated ||
@@ -2649,6 +2758,7 @@ export async function initDatabase() {
 	  const waitingRoomInitialized = ensureWaitingRoomTable(database)
 	  const xhsTablesInitialized = ensureXhsTables(database)
 	  const xianyuTablesInitialized = ensureXianyuTables(database)
+  const alipayRedpackOrdersInitialized = ensureAlipayRedpackOrdersTable(database)
 	  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
   const accountRecoveryInitialized = ensureAccountRecoveryTable(database)
   const purchaseOrdersInitialized = ensurePurchaseOrdersTable(database)
@@ -2666,6 +2776,7 @@ export async function initDatabase() {
     waitingRoomInitialized ||
     xhsTablesInitialized ||
     xianyuTablesInitialized ||
+    alipayRedpackOrdersInitialized ||
     linuxDoUsersInitialized ||
     accountRecoveryInitialized ||
     purchaseOrdersInitialized ||

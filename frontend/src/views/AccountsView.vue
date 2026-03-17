@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, onUnmounted, nextTick, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { API_URL, authService, gptAccountService, openaiOAuthService, userService, type AccountStatus, type CheckAccountStatusItem, type CheckAccountStatusResponse, type GptAccount, type CreateGptAccountDto, type SyncUserCountResponse, type GptAccountsListParams, type ChatgptAccountInviteItem, type ChatgptAccountCheckInfo, type OpenAIOAuthSession, type OpenAIOAuthExchangeResult } from '@/services/api'
 import { formatShanghaiDate } from '@/lib/datetime'
 import { useAppConfigStore } from '@/stores/appConfig'
@@ -31,6 +31,7 @@ import AppleNativeDateTimeInput from '@/components/ui/apple/NativeDateTimeInput.
 import { Plus, Eye, EyeOff, RefreshCw, Ban, FilePenLine, Trash2, AlertTriangle, X, FolderOpen, Search, Mail } from 'lucide-vue-next'
 
 const router = useRouter()
+const route = useRoute()
 const accounts = ref<GptAccount[]>([])
 const loading = ref(true)
 const error = ref('')
@@ -150,6 +151,7 @@ const resyncingAfterAction = ref(false)
 const RESYNC_AFTER_ACTION_DELAY_MS = 3000
 let resyncAfterActionTimer: ReturnType<typeof setTimeout> | null = null
 let resyncAfterActionVersion = 0
+const autoSyncHandledAccountId = ref<number | null>(null)
 
 const formData = ref<CreateGptAccountDto>({
   email: '',
@@ -185,6 +187,33 @@ const resolveRequestError = (err: any, fallback: string) => {
     err?.message ||
     fallback
   )
+}
+
+const parsePositiveInt = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return Math.floor(parsed)
+}
+
+const parseSyncAccountIdFromQuery = () => {
+  const raw = Array.isArray(route.query.syncAccountId)
+    ? route.query.syncAccountId[0]
+    : route.query.syncAccountId
+  return parsePositiveInt(raw)
+}
+
+const clearSyncAccountIdQuery = async () => {
+  if (!Object.prototype.hasOwnProperty.call(route.query, 'syncAccountId')) return
+  const nextQuery = { ...route.query } as Record<string, any>
+  delete nextQuery.syncAccountId
+  try {
+    await router.replace({
+      path: route.path,
+      query: nextQuery
+    })
+  } catch {
+    // ignore route cleanup errors
+  }
 }
 
 type ParsedAccountTokenInput = {
@@ -762,6 +791,30 @@ const loadAccounts = async () => {
     const response = await gptAccountService.getAll(params)
     accounts.value = response.accounts || []
     paginationMeta.value = response.pagination || { page: 1, pageSize: 10, total: 0 }
+
+    const syncAccountId = parseSyncAccountIdFromQuery()
+    if (
+      syncAccountId &&
+      autoSyncHandledAccountId.value !== syncAccountId &&
+      !syncingAccountId.value
+    ) {
+      autoSyncHandledAccountId.value = syncAccountId
+      let targetAccount = accounts.value.find(item => Number(item?.id) === syncAccountId) || null
+      if (!targetAccount) {
+        try {
+          targetAccount = await gptAccountService.getById(syncAccountId)
+        } catch {
+          targetAccount = null
+        }
+      }
+      await clearSyncAccountIdQuery()
+      if (!targetAccount) {
+        showWarningToast(`未找到账号 ID=${syncAccountId}，无法执行同步自查`)
+      } else {
+        showInfoToast(`已触发账号同步自查：${targetAccount.email}`)
+        await handleSyncUserCount(targetAccount)
+      }
+    }
   } catch (err: any) {
     error.value = err.response?.data?.error || 'Failed to load accounts'
     if (err.response?.status === 401 || err.response?.status === 403) {
@@ -1115,6 +1168,21 @@ watch(searchQuery, () => {
     searchDebounceTimer = null
   }, 300)
 })
+
+watch(
+  () => route.query.syncAccountId,
+  (nextValue) => {
+    if (!nextValue) {
+      autoSyncHandledAccountId.value = null
+      return
+    }
+
+    autoSyncHandledAccountId.value = null
+    if (!loading.value) {
+      loadAccounts()
+    }
+  }
+)
 
 watch(
   () => formData.value.chatgptAccountId,
