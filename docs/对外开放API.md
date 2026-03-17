@@ -58,6 +58,8 @@ API Key 的读取优先级：
 | `expireAt` | 否 | string/number | 过期时间：支持 `YYYY/MM/DD HH:mm`、`YYYY-MM-DD HH:mm`、毫秒时间戳 |
 | `isOpen` / `is_open` | 否 | boolean/number/string | 是否设为开放账号；默认 `true`（`1/true/yes` 为开，`0/false/no` 为关） |
 | `codePlans` / `code_plans` | 否 | array | 按渠道批量建码计划（见下方） |
+| `channel` / `channelKey` / `channel_key` | 否 | string | 单渠道建码简写；当未传 `codePlans` 时生效 |
+| `codeCount` / `code_count` / `count` | 否 | number | 单渠道建码数量（配合 `channel`，默认 `1`） |
 | `isDemoted`/`is_demoted` | 否 | boolean/number | **Deprecated**：已弃用（请求会被忽略；响应恒为 `false`，仅保留兼容） |
 
 兼容别名（可直接传 OpenAI OAuth/客户端返回 JSON）：
@@ -85,8 +87,10 @@ API Key 的读取优先级：
 - `isOpen`：默认 `true`；如账号已封号且请求要设为开放，会返回 `400`。
 - 账号封号时不允许通过该接口创建兑换码。
 - `codePlans`：可一次请求按多渠道创建兑换码；不传则只创建/更新账号，不自动建码。
+- `channel`：若未传 `codePlans`，可使用单渠道简写参数创建兑换码（底层会转换为单条 `codePlans`）。
 - 容量上限读取优先级：`system_config.open_accounts_capacity_limit` > `OPEN_ACCOUNTS_CAPACITY_LIMIT`（`.env`）> 默认 `5`。
 - `max_minus` 计算方式：`计划数量 = 当前剩余名额 - minus`，其中剩余名额 = 容量上限 - (`user_count + invite_count + 未兑换码数量`)。
+- 支持渠道由后台“渠道管理”决定，内置包含：`common`、`linux-do`、`xhs`、`xianyu`、`alipay_redpack`。
 - `isDemoted`/`is_demoted`：已弃用，后端会忽略该字段。
 - 会触发一次账号同步（`syncResult`/`removedUsers` 字段返回）。
 - `token`/`refreshToken` 支持直接粘贴 JSON；如果请求体直接包含 `access_token` 等字段，也可直接创建/更新。
@@ -126,12 +130,26 @@ curl -X POST "https://<host>/api/auto-boarding" \
         "orderType": "no_warranty"
       },
       {
-        "channel": "yizhifu",
+        "channel": "alipay_redpack",
         "count": 1,
-        "orderType": "anti_ban",
-        "serviceDays": 7
+        "orderType": "no_warranty"
       }
     ]
+  }'
+```
+
+单渠道简写示例（未传 `codePlans`）：
+
+```bash
+curl -X POST "https://<host>/api/auto-boarding" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <your_api_key>" \
+  -d '{
+    "email": "user@example.com",
+    "token": "eyJhbGciOi...",
+    "channel": "alipay_redpack",
+    "count": 2,
+    "orderType": "no_warranty"
   }'
 ```
 

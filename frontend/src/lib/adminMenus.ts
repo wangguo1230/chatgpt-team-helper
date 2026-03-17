@@ -52,6 +52,7 @@ const ICONS_BY_MENU_KEY: Record<string, any> = {
   xhs_orders: Package,
   xianyu_orders: Package,
   alipay_redpack_orders: Gift,
+  alipay_redpack_supplements: Recycle,
   purchase_orders: CreditCard,
   credit_orders: Coins,
   order_management: ShoppingCart,
@@ -79,6 +80,7 @@ const FALLBACK_ADMIN_MENU_TREE: AdminMenuDraftNode[] = [
       { key: 'alipay_redpack_orders', path: '/admin/alipay-redpack-orders', label: '支付宝口令红包订单' },
       { key: 'credit_orders', path: '/admin/credit-orders', label: 'Credit 订单' },
       { key: 'account_recovery', path: '/admin/account-recovery', label: '补号管理' },
+      { key: 'alipay_redpack_supplements', path: '/admin/alipay-redpack-supplements', label: '支付宝口令补录管理' },
     ],
   },
   {

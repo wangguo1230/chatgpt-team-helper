@@ -7,7 +7,7 @@
       <p class="text-sm text-gray-500">提交邮箱和支付宝口令，管理员会处理邀请</p>
       <div class="flex items-center justify-center gap-2 text-xs">
         <span class="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-emerald-700">
-          当前可邀请库存：{{ stockLoading ? '加载中...' : (stock?.availableCount ?? '--') }}
+          当前可兑换库存：{{ stockLoading ? '加载中...' : (stock?.availableCount ?? '--') }}
         </span>
         <button
           type="button"
@@ -40,8 +40,8 @@
             placeholder="请输入支付宝口令红包口令"
             type="text"
             :disabled="loading"
-            :error="formData.alipayPassphrase ? '' : ''"
-            helperText="口令全局唯一，请勿重复提交"
+            :error="formData.alipayPassphrase && !isValidAlipayPassphrase ? '支付宝口令至少8位字符' : ''"
+            helperText="提交订单时必填，长度至少8位"
           />
 
           <AppleInput
@@ -52,7 +52,7 @@
             :disabled="loading"
           />
 
-          <div class="grid gap-3 sm:grid-cols-2 pt-1">
+          <div class="pt-1">
             <AppleButton
               type="submit"
               variant="primary"
@@ -63,19 +63,14 @@
             >
               提交订单
             </AppleButton>
-
-            <AppleButton
-              type="button"
-              variant="secondary"
-              size="lg"
-              class="w-full"
-              :loading="supplementing"
-              :disabled="loading"
-              @click="handleSupplement"
-            >
-              补录
-            </AppleButton>
           </div>
+
+          <p class="text-xs text-gray-500">
+            掉号补录请
+            <router-link class="font-medium text-cyan-600 hover:text-cyan-700" to="/redeem/alipay-redpack/supplement">
+              点击此处
+            </router-link>
+          </p>
         </form>
 
         <div v-if="successMessage" class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">
@@ -106,6 +101,8 @@ import RedeemShell from '@/components/RedeemShell.vue'
 import { alipayRedpackService, type AlipayRedpackOrder, type AlipayRedpackStock } from '@/services/api'
 import { EMAIL_REGEX } from '@/lib/validation'
 
+const ALIPAY_PASSPHRASE_MIN_LENGTH = 8
+
 const formData = ref({
   email: '',
   alipayPassphrase: '',
@@ -113,7 +110,6 @@ const formData = ref({
 })
 
 const submitting = ref(false)
-const supplementing = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const lastOrder = ref<AlipayRedpackOrder | null>(null)
@@ -121,13 +117,17 @@ const stock = ref<AlipayRedpackStock | null>(null)
 const stockLoading = ref(false)
 const stockError = ref('')
 
-const loading = computed(() => submitting.value || supplementing.value)
+const loading = computed(() => submitting.value)
 const isValidEmail = computed(() => {
   if (!formData.value.email) return true
   return EMAIL_REGEX.test(formData.value.email)
 })
+const isValidAlipayPassphrase = computed(() => {
+  if (!formData.value.alipayPassphrase) return true
+  return formData.value.alipayPassphrase.length >= ALIPAY_PASSPHRASE_MIN_LENGTH
+})
 
-const canSubmit = () => {
+const canSubmitOrder = () => {
   if (!formData.value.email || !EMAIL_REGEX.test(formData.value.email)) {
     errorMessage.value = '请输入有效邮箱地址'
     return false
@@ -136,9 +136,12 @@ const canSubmit = () => {
     errorMessage.value = '请输入支付宝口令'
     return false
   }
+  if (formData.value.alipayPassphrase.trim().length < ALIPAY_PASSPHRASE_MIN_LENGTH) {
+    errorMessage.value = '支付宝口令至少8位字符'
+    return false
+  }
   return true
 }
-
 const statusText = (status?: string) => {
   if (status === 'pending') return '待处理'
   if (status === 'invited') return '已邀请'
@@ -159,7 +162,7 @@ const fetchStock = async () => {
 }
 
 const handleSubmit = async () => {
-  if (!canSubmit()) return
+  if (!canSubmitOrder()) return
 
   submitting.value = true
   errorMessage.value = ''
@@ -172,31 +175,11 @@ const handleSubmit = async () => {
     })
     lastOrder.value = response.order
     successMessage.value = response.message || '提交成功'
+    await fetchStock()
   } catch (err: any) {
     errorMessage.value = err?.response?.data?.error || '提交失败，请稍后重试'
   } finally {
     submitting.value = false
-  }
-}
-
-const handleSupplement = async () => {
-  if (!canSubmit()) return
-
-  supplementing.value = true
-  errorMessage.value = ''
-  successMessage.value = ''
-  try {
-    const response = await alipayRedpackService.supplementPublic({
-      email: formData.value.email,
-      alipayPassphrase: formData.value.alipayPassphrase,
-      note: formData.value.note || undefined,
-    })
-    lastOrder.value = response.order
-    successMessage.value = response.message || '补录成功'
-  } catch (err: any) {
-    errorMessage.value = err?.response?.data?.error || '补录失败，请稍后重试'
-  } finally {
-    supplementing.value = false
   }
 }
 

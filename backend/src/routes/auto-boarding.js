@@ -209,6 +209,36 @@ const normalizeCodePlans = (value) => {
   })
 }
 
+const buildSingleCodePlanFromPayload = (body = {}) => {
+  const channelInput = body.channel ?? body.channelKey ?? body.channel_key
+  const hasChannelInput = channelInput !== undefined && channelInput !== null && String(channelInput).trim() !== ''
+  if (!hasChannelInput) return null
+
+  const countModeInput = body.countMode ?? body.count_mode
+  const codeCountInput = body.codeCount ?? body.code_count ?? body.count
+  const orderTypeInput = body.orderType ?? body.order_type
+  const serviceDaysInput = body.serviceDays ?? body.service_days
+  const hasServiceDaysInput = serviceDaysInput != null && String(serviceDaysInput).trim() !== ''
+  const singlePlan = {
+    channel: channelInput,
+    countMode: countModeInput,
+    count: codeCountInput != null && String(codeCountInput).trim() !== '' ? codeCountInput : 1,
+    minus: body.minus ?? body.maxMinus ?? body.max_minus,
+    orderType: orderTypeInput ?? (hasServiceDaysInput ? ORDER_TYPE_WARRANTY : ORDER_TYPE_NO_WARRANTY),
+    serviceDays: serviceDaysInput,
+  }
+
+  return normalizeCodePlans([singlePlan])[0]
+}
+
+const resolveCodePlansFromPayload = (body = {}) => {
+  const plans = normalizeCodePlans(body.codePlans ?? body.code_plans)
+  if (plans.length > 0) return plans
+
+  const singlePlan = buildSingleCodePlanFromPayload(body)
+  return singlePlan ? [singlePlan] : []
+}
+
 const runTransaction = async (db, callback) => {
   db.run('BEGIN IMMEDIATE TRANSACTION')
   try {
@@ -433,7 +463,7 @@ router.post('/', apiKeyAuth, async (req, res) => {
     const shouldUpdateExpireAt = hasExpireAt || Boolean(deriveExpireAtFromToken(token))
     const derivedExpireAt = shouldUpdateExpireAt && !hasExpireAt ? deriveExpireAtFromToken(token) : null
     const expireAt = hasExpireAt ? normalizedExpireAt : (derivedExpireAt || null)
-    const codePlans = normalizeCodePlans(body.codePlans ?? body.code_plans)
+    const codePlans = resolveCodePlansFromPayload(body)
     // isDemoted/is_demoted: deprecated (ignored). Keep request compatibility.
 
     if (hasExpireAt && expireAtInput != null && String(expireAtInput).trim() && !normalizedExpireAt) {

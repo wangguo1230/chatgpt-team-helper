@@ -12,6 +12,7 @@ const CHANNEL_LABELS = {
   'linux-do': 'Linux DO 渠道',
   xhs: '小红书渠道',
   xianyu: '闲鱼渠道',
+  alipay_redpack: '支付宝口令红包',
   'artisan-flow': 'ArtisanFlow 渠道',
 }
 const DEFAULT_CHANNEL = 'common'
@@ -61,6 +62,15 @@ const BUILTIN_CHANNELS = [
     isActive: 1,
     isBuiltin: 1,
     sortOrder: 50
+  },
+  {
+    key: 'alipay_redpack',
+    name: CHANNEL_LABELS.alipay_redpack,
+    redeemMode: 'code',
+    allowCommonFallback: 0,
+    isActive: 1,
+    isBuiltin: 1,
+    sortOrder: 55
   },
   {
     key: 'artisan-flow',
@@ -373,6 +383,7 @@ const ensureRbacTables = (database) => {
       { key: 'alipay_redpack_orders', label: '支付宝口令红包订单', path: '/admin/alipay-redpack-orders', parentKey: 'order_management', sortOrder: 4 },
       { key: 'credit_orders', label: 'Credit 订单', path: '/admin/credit-orders', parentKey: 'order_management', sortOrder: 5 },
       { key: 'account_recovery', label: '补号管理', path: '/admin/account-recovery', parentKey: 'order_management', sortOrder: 6 },
+      { key: 'alipay_redpack_supplements', label: '支付宝口令补录管理', path: '/admin/alipay-redpack-supplements', parentKey: 'order_management', sortOrder: 7 },
       { key: 'permission_management', label: '权限管理', path: '', sortOrder: 7 },
       { key: 'user_management', label: '用户管理', path: '/admin/users', parentKey: 'permission_management', sortOrder: 1 },
       { key: 'role_management', label: '角色管理', path: '/admin/roles', parentKey: 'permission_management', sortOrder: 2 },
@@ -561,6 +572,7 @@ const migrateUtcTimestampsToLocaltime = (database) => {
     { table: 'xianyu_config', columns: ['updated_at', 'last_sync_at', 'last_success_at'] },
     { table: 'xianyu_orders', columns: ['extracted_at', 'reserved_at', 'used_at', 'created_at', 'updated_at'] },
     { table: 'alipay_redpack_orders', columns: ['invite_sent_at', 'redeemed_at', 'redemption_code_redeemed_at', 'created_at', 'updated_at'] },
+    { table: 'alipay_redpack_supplements', columns: ['window_ends_at', 'created_at', 'processed_at', 'updated_at'] },
   ]
 
   const startedAt = Date.now()
@@ -1239,6 +1251,92 @@ const ensureAlipayRedpackOrdersTable = (database) => {
     ) || changed
   } catch (error) {
     console.warn('[DB] 无法初始化 alipay_redpack_orders 表:', error)
+  }
+
+  return changed
+}
+
+const ensureAlipayRedpackSupplementsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'alipay_redpack_supplements')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS alipay_redpack_supplements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id INTEGER NOT NULL,
+          email TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'processing',
+          requested_by TEXT NOT NULL DEFAULT 'public',
+          detail TEXT,
+          redemption_code_id INTEGER,
+          redemption_code TEXT,
+          invite_account_id INTEGER,
+          invite_account_email TEXT,
+          queue_is_member INTEGER DEFAULT 0,
+          queue_is_invited INTEGER DEFAULT 0,
+          within_warranty INTEGER DEFAULT 0,
+          window_ends_at DATETIME,
+          processed_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          FOREIGN KEY (order_id) REFERENCES alipay_redpack_orders(id),
+          FOREIGN KEY (redemption_code_id) REFERENCES redemption_codes(id)
+        )
+      `)
+      changed = true
+    } else {
+      const tableInfo = database.exec('PRAGMA table_info(alipay_redpack_supplements)')
+      if (tableInfo.length > 0) {
+        const columns = tableInfo[0].values.map(row => row[1])
+        const addColumn = (name, ddl) => {
+          if (columns.includes(name)) return
+          database.run(`ALTER TABLE alipay_redpack_supplements ADD COLUMN ${ddl}`)
+          changed = true
+        }
+
+        addColumn('order_id', 'order_id INTEGER')
+        addColumn('email', 'email TEXT')
+        addColumn('status', "status TEXT NOT NULL DEFAULT 'processing'")
+        addColumn('requested_by', "requested_by TEXT NOT NULL DEFAULT 'public'")
+        addColumn('detail', 'detail TEXT')
+        addColumn('redemption_code_id', 'redemption_code_id INTEGER')
+        addColumn('redemption_code', 'redemption_code TEXT')
+        addColumn('invite_account_id', 'invite_account_id INTEGER')
+        addColumn('invite_account_email', 'invite_account_email TEXT')
+        addColumn('queue_is_member', 'queue_is_member INTEGER DEFAULT 0')
+        addColumn('queue_is_invited', 'queue_is_invited INTEGER DEFAULT 0')
+        addColumn('within_warranty', 'within_warranty INTEGER DEFAULT 0')
+        addColumn('window_ends_at', 'window_ends_at DATETIME')
+        addColumn('processed_at', 'processed_at DATETIME')
+        addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+        addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      }
+    }
+
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplements_order_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplements_order_id ON alipay_redpack_supplements(order_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplements_email',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplements_email ON alipay_redpack_supplements(email)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplements_status_created_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplements_status_created_at ON alipay_redpack_supplements(status, created_at)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplements_requested_by',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplements_requested_by ON alipay_redpack_supplements(requested_by)'
+    ) || changed
+  } catch (error) {
+    console.warn('[DB] 无法初始化 alipay_redpack_supplements 表:', error)
   }
 
   return changed
@@ -2460,6 +2558,7 @@ export async function initDatabase() {
         const xhsTablesCreated = ensureXhsTables(database)
         const xianyuTablesCreated = ensureXianyuTables(database)
         const alipayRedpackOrdersCreated = ensureAlipayRedpackOrdersTable(database)
+        const alipayRedpackSupplementsCreated = ensureAlipayRedpackSupplementsTable(database)
         const linuxDoUsersCreated = ensureLinuxDoUsersTable(database)
         const accountRecoveryCreated = ensureAccountRecoveryTable(database)
         const purchaseOrdersCreated = ensurePurchaseOrdersTable(database)
@@ -2479,6 +2578,7 @@ export async function initDatabase() {
           xhsTablesCreated ||
           xianyuTablesCreated ||
           alipayRedpackOrdersCreated ||
+          alipayRedpackSupplementsCreated ||
           linuxDoUsersCreated ||
           accountRecoveryCreated ||
           purchaseOrdersCreated ||
@@ -2755,11 +2855,12 @@ export async function initDatabase() {
 
 	  ensureCoreIndexes(database)
 
-	  const waitingRoomInitialized = ensureWaitingRoomTable(database)
-	  const xhsTablesInitialized = ensureXhsTables(database)
-	  const xianyuTablesInitialized = ensureXianyuTables(database)
+  const waitingRoomInitialized = ensureWaitingRoomTable(database)
+  const xhsTablesInitialized = ensureXhsTables(database)
+  const xianyuTablesInitialized = ensureXianyuTables(database)
   const alipayRedpackOrdersInitialized = ensureAlipayRedpackOrdersTable(database)
-	  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
+  const alipayRedpackSupplementsInitialized = ensureAlipayRedpackSupplementsTable(database)
+  const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
   const accountRecoveryInitialized = ensureAccountRecoveryTable(database)
   const purchaseOrdersInitialized = ensurePurchaseOrdersTable(database)
   const purchaseProductItemsInitialized = ensurePurchaseProductItemsTable(database)
@@ -2777,6 +2878,7 @@ export async function initDatabase() {
     xhsTablesInitialized ||
     xianyuTablesInitialized ||
     alipayRedpackOrdersInitialized ||
+    alipayRedpackSupplementsInitialized ||
     linuxDoUsersInitialized ||
     accountRecoveryInitialized ||
     purchaseOrdersInitialized ||

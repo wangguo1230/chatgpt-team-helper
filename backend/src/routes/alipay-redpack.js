@@ -3,19 +3,27 @@ import { authenticateToken } from '../middleware/auth.js'
 import { requireMenu } from '../middleware/rbac.js'
 import {
   createAlipayRedpackOrderPublic,
-  supplementAlipayRedpackOrderPublic,
   listAlipayRedpackOrdersAdmin,
   getAlipayRedpackOrderById,
+  listAlipayRedpackSupplementOrdersByEmail,
+  getAlipayRedpackSupplementCandidateByOrder,
+  prepareAlipayRedpackOrderForAutoSupplement,
+  createAlipayRedpackSupplementRecord,
+  updateAlipayRedpackSupplementRecord,
+  getAlipayRedpackSupplementById,
+  listAlipayRedpackSupplementsAdmin,
+  getAlipayRedpackRedemptionCodeStockSummary,
   consumeAlipayRedpackOrderRedemptionCode,
   rollbackAlipayRedpackOrderRedemptionCodeConsume,
   markAlipayRedpackOrderInviteFailed,
   markAlipayRedpackOrderInvited,
   markAlipayRedpackOrderRedeemed,
+  markAlipayRedpackOrderReturned,
   updateAlipayRedpackOrderInviteResult,
   updateAlipayRedpackOrderNote,
   AlipayRedpackOrderError,
 } from '../services/alipay-redpack-orders.js'
-import { performDirectInvite, getDirectInviteStockSummary } from '../services/direct-invite.js'
+import { performDirectInvite } from '../services/direct-invite.js'
 import {
   fetchAccountUsersList,
   fetchAccountInvites,
@@ -29,6 +37,7 @@ const router = express.Router()
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const ADMIN_MENU_KEY = 'alipay_redpack_orders'
+const SUPPLEMENT_ADMIN_MENU_KEY = 'alipay_redpack_supplements'
 const parsePositiveIntWithDefault = (value, fallback) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
@@ -208,6 +217,25 @@ const detectEmailInAccountQueues = async (accountId, email) => {
 
   return { isMember, isInvited }
 }
+const sleep = async (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const syncAndDetectEmailQueueState = async (accountId, email, { retryOnMissing = false } = {}) => {
+  await Promise.allSettled([
+    syncAccountUserCount(accountId, { userListParams: { offset: 0, limit: 1, query: '' } }),
+    syncAccountInviteCount(accountId, { inviteListParams: { offset: 0, limit: 1, query: '' } }),
+  ])
+
+  let queueState = await detectEmailInAccountQueues(accountId, email)
+  if (retryOnMissing && !queueState.isMember && !queueState.isInvited) {
+    await sleep(1200)
+    await Promise.allSettled([
+      syncAccountUserCount(accountId, { userListParams: { offset: 0, limit: 1, query: '' } }),
+      syncAccountInviteCount(accountId, { inviteListParams: { offset: 0, limit: 1, query: '' } }),
+    ])
+    queueState = await detectEmailInAccountQueues(accountId, email)
+  }
+
+  return queueState
+}
 
 const resolveRouteError = (error, fallback = '服务器错误，请稍后再试') => {
   if (error instanceof AlipayRedpackOrderError) {
@@ -232,6 +260,227 @@ const resolveRouteError = (error, fallback = '服务器错误，请稍后再试'
   return {
     status: 500,
     body: { error: fallback },
+  }
+}
+
+const executeAlipayRedpackOrderSupplement = async ({
+  email,
+  orderId,
+  note,
+  requestedBy = 'public',
+  operator = null,
+} = {}) => {
+  const requestLabel = String(requestedBy || 'public').trim() || 'public'
+  const allowPending = requestLabel !== 'public'
+  const candidate = await getAlipayRedpackSupplementCandidateByOrder({
+    email,
+    orderId,
+    allowPending,
+  })
+  const normalizedOrderId = Number(candidate?.order?.id || orderId || 0)
+  const normalizedEmail = normalizeEmail(candidate?.order?.email || email)
+
+  let supplement = await createAlipayRedpackSupplementRecord({
+    orderId: normalizedOrderId,
+    email: normalizedEmail,
+    status: 'processing',
+    requestedBy: requestLabel,
+    detail: '补录任务已创建，准备自动处理',
+    withinWarranty: candidate.withinWarranty,
+    windowEndsAt: candidate.windowEndsAt,
+  })
+
+  if (!candidate.withinWarranty) {
+    supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+      status: 'rejected_out_of_warranty',
+      detail: '已超过质保天数，拒绝自动补录',
+    })
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: '已超过质保天数，无法自动补录，请联系客服',
+        code: 'alipay_redpack_out_of_warranty',
+        order: candidate.order,
+        windowEndsAt: candidate.windowEndsAt,
+        supplement,
+      },
+    }
+  }
+
+  try {
+    await prepareAlipayRedpackOrderForAutoSupplement(normalizedOrderId, {
+      note,
+      inviteResult: '自动补录：重新分配兑换码并开始邀请',
+    })
+  } catch (error) {
+    if (error instanceof AlipayRedpackOrderError && error.code === 'alipay_redpack_out_of_stock') {
+      supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+        status: 'manual_required',
+        detail: '自动补录失败：补录库存不足，需要人工介入',
+      })
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: '当前补录库存不足，已转人工处理',
+          code: 'alipay_redpack_out_of_stock',
+          manualInterventionRequired: true,
+          order: candidate.order,
+          windowEndsAt: candidate.windowEndsAt,
+          supplement,
+        },
+      }
+    }
+
+    if (error instanceof AlipayRedpackOrderError && error.code === 'alipay_redpack_order_returned') {
+      supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+        status: 'skipped_no_need',
+        detail: '订单已退回，跳过自动补录',
+      })
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: '该订单已退回，无法补录，请让用户重新提交有效口令',
+          code: error.code,
+          order: candidate.order,
+          windowEndsAt: candidate.windowEndsAt,
+          supplement,
+        },
+      }
+    }
+
+    const resolved = resolveRouteError(error, '自动补录准备失败')
+    supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+      status: 'auto_failed',
+      detail: `自动补录准备失败：${resolved.body?.error || error?.message || '未知错误'}`,
+    })
+    return {
+      ok: false,
+      status: resolved.status,
+      body: {
+        ...resolved.body,
+        order: candidate.order,
+        windowEndsAt: candidate.windowEndsAt,
+        supplement,
+      },
+    }
+  }
+
+  const orderForInvite = await getAlipayRedpackOrderById(normalizedOrderId)
+  if (!orderForInvite) {
+    throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
+  }
+
+  let inviteSent = false
+  let consumeResult = null
+  try {
+    consumeResult = await consumeAlipayRedpackOrderRedemptionCode(normalizedOrderId, {
+      redeemedBy: `alipay_redpack_supplement:${supplement.id} | order:${normalizedOrderId} | email:${normalizedEmail}`,
+    })
+
+    const invite = await performDirectInvite({
+      email: normalizedEmail,
+      consumeCode: false,
+    })
+    inviteSent = true
+
+    const queueState = await syncAndDetectEmailQueueState(invite.accountId, normalizedEmail, { retryOnMissing: true })
+
+    let updatedOrder = null
+    if (queueState.isMember) {
+      updatedOrder = await markAlipayRedpackOrderRedeemed(normalizedOrderId, {
+        inviteResult: `自动补录成功，用户已入组（账号：${invite.accountEmail}）`,
+        invitedAccountId: invite.accountId,
+        invitedAccountEmail: invite.accountEmail,
+        ...(operator || {}),
+      })
+    } else if (queueState.isInvited) {
+      updatedOrder = await markAlipayRedpackOrderInvited(normalizedOrderId, {
+        inviteResult: `自动补录成功，邀请已发送（账号：${invite.accountEmail}）`,
+        invitedAccountId: invite.accountId,
+        invitedAccountEmail: invite.accountEmail,
+        ...(operator || {}),
+      })
+    } else {
+      updatedOrder = await markAlipayRedpackOrderInvited(normalizedOrderId, {
+        inviteResult: `自动补录成功，邀请请求已提交但暂未检索到记录（账号：${invite.accountEmail}）`,
+        invitedAccountId: invite.accountId,
+        invitedAccountEmail: invite.accountEmail,
+        ...(operator || {}),
+      })
+    }
+
+    supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+      status: 'auto_success',
+      detail: '自动补录成功',
+      redemptionCodeId: consumeResult?.code?.id || updatedOrder?.redemptionCodeId || null,
+      redemptionCode: consumeResult?.code?.code || null,
+      inviteAccountId: invite.accountId,
+      inviteAccountEmail: invite.accountEmail,
+      queueIsMember: queueState.isMember,
+      queueIsInvited: queueState.isInvited,
+      withinWarranty: candidate.withinWarranty,
+      windowEndsAt: candidate.windowEndsAt,
+    })
+
+    enqueueOrderAlertSummary({
+      action: requestLabel === 'public' ? '公开补录（订单自动补录）' : '后台补录（订单自动补录）',
+      order: updatedOrder,
+    })
+
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        message: '补录成功，已自动完成处理',
+        order: updatedOrder,
+        windowEndsAt: candidate.windowEndsAt,
+        supplement,
+        queueState,
+        redemptionCode: consumeResult?.code || null,
+      },
+    }
+  } catch (error) {
+    if (!inviteSent && consumeResult?.consumedNow) {
+      const codeId = Number(consumeResult?.code?.id || orderForInvite.redemptionCodeId || 0)
+      if (codeId > 0) {
+        await rollbackAlipayRedpackOrderRedemptionCodeConsume({
+          orderId: normalizedOrderId,
+          codeId,
+        }).catch((rollbackError) => {
+          console.warn('[AlipayRedpack] 自动补录失败后回滚兑换码失败:', rollbackError?.message || rollbackError)
+        })
+      }
+    }
+
+    const inviteErrorMessage = String(error?.message || '自动补录失败').trim() || '自动补录失败'
+    const updatedOrder = await markAlipayRedpackOrderInviteFailed(normalizedOrderId, {
+      inviteResult: `自动补录失败：${inviteErrorMessage}`,
+      ...(operator || {}),
+    })
+
+    supplement = await updateAlipayRedpackSupplementRecord(supplement.id, {
+      status: 'auto_failed',
+      detail: `自动补录失败：${inviteErrorMessage}`,
+      redemptionCodeId: consumeResult?.code?.id || updatedOrder?.redemptionCodeId || null,
+      redemptionCode: consumeResult?.code?.code || null,
+      withinWarranty: candidate.withinWarranty,
+      windowEndsAt: candidate.windowEndsAt,
+    })
+
+    const resolved = resolveRouteError(error, inviteErrorMessage)
+    return {
+      ok: false,
+      status: resolved.status,
+      body: {
+        ...resolved.body,
+        order: updatedOrder,
+        supplement,
+        windowEndsAt: candidate.windowEndsAt,
+      },
+    }
   }
 }
 
@@ -261,12 +510,23 @@ router.post('/orders', async (req, res) => {
 
 router.get('/stock', async (_req, res) => {
   try {
-    const stock = await getDirectInviteStockSummary({ consumeCode: false })
+    const stock = await getAlipayRedpackRedemptionCodeStockSummary()
+    const availableCount = Number.isFinite(Number(stock?.availableCount))
+      ? Math.max(0, Number(stock.availableCount))
+      : 0
+    const reservedCount = Number.isFinite(Number(stock?.reservedCount))
+      ? Math.max(0, Number(stock.reservedCount))
+      : 0
+    const totalUnusedCount = Number.isFinite(Number(stock?.totalUnusedCount))
+      ? Math.max(0, Number(stock.totalUnusedCount))
+      : availableCount + reservedCount
+
     res.json({
-      availableCount: stock.availableSlots,
-      invitableAccountCount: stock.invitableAccountCount,
-      candidateAccountCount: stock.candidateAccountCount,
-      capacityLimit: stock.capacityLimit,
+      availableCount,
+      rawAvailableCount: availableCount,
+      pendingReservationCount: reservedCount,
+      reservedCount,
+      totalUnusedCount,
       updatedAt: new Date().toISOString(),
     })
   } catch (error) {
@@ -276,29 +536,32 @@ router.get('/stock', async (_req, res) => {
   }
 })
 
+router.get('/orders/supplement/candidates', async (req, res) => {
+  try {
+    const { email } = req.query || {}
+    const data = await listAlipayRedpackSupplementOrdersByEmail(email, { limit: 30 })
+    res.json(data)
+  } catch (error) {
+    console.error('[AlipayRedpack] 查询补录候选订单失败:', error)
+    const resolved = resolveRouteError(error, '查询补录候选订单失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
 router.post('/orders/supplement', async (req, res) => {
   try {
     if (enforcePublicRateLimit(req, res)) return
 
-    const { email, alipayPassphrase, note } = req.body || {}
-    const result = await supplementAlipayRedpackOrderPublic({
+    const { email, orderId, note } = req.body || {}
+    const result = await executeAlipayRedpackOrderSupplement({
       email,
-      alipayPassphrase,
+      orderId,
       note,
+      requestedBy: 'public',
     })
-
-    enqueueOrderAlertSummary({
-      action: result.created ? '公开补录（新建）' : '公开补录（更新）',
-      order: result.order,
-    })
-
-    res.json({
-      message: result.created ? '补录成功，已创建订单' : '补录成功，已更新订单',
-      created: result.created,
-      order: result.order,
-    })
+    res.status(result.status).json(result.body)
   } catch (error) {
-    console.error('[AlipayRedpack] 补录失败:', error)
+    console.error('[AlipayRedpack] 订单补录失败:', error)
     const resolved = resolveRouteError(error, '补录失败，请稍后重试')
     res.status(resolved.status).json(resolved.body)
   }
@@ -322,6 +585,79 @@ router.get('/admin/orders', authenticateToken, requireMenu(ADMIN_MENU_KEY), asyn
   }
 })
 
+router.get('/admin/supplements', authenticateToken, requireMenu(SUPPLEMENT_ADMIN_MENU_KEY), async (req, res) => {
+  try {
+    const { search = '', status = 'all', limit = 200, offset = 0 } = req.query || {}
+    const data = await listAlipayRedpackSupplementsAdmin({
+      search,
+      status,
+      limit,
+      offset,
+    })
+    res.json(data)
+  } catch (error) {
+    console.error('[AlipayRedpack] 查询补录记录失败:', error)
+    const resolved = resolveRouteError(error, '获取补录记录失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.post('/admin/supplements/:id/retry', authenticateToken, requireMenu(SUPPLEMENT_ADMIN_MENU_KEY), async (req, res) => {
+  try {
+    const supplementId = toPositiveInt(req.params.id)
+    if (!supplementId) {
+      return res.status(400).json({ error: '无效补录记录ID' })
+    }
+
+    const supplement = await getAlipayRedpackSupplementById(supplementId)
+    if (!supplement) {
+      return res.status(404).json({ error: '补录记录不存在' })
+    }
+
+    const operator = resolveOperator(req)
+    const result = await executeAlipayRedpackOrderSupplement({
+      email: supplement.email,
+      orderId: supplement.orderId,
+      note: req.body?.note,
+      requestedBy: 'admin_retry',
+      operator,
+    })
+
+    res.status(result.status).json({
+      ...result.body,
+      retryFromSupplementId: supplementId,
+    })
+  } catch (error) {
+    console.error('[AlipayRedpack] 重试补录失败:', error)
+    const resolved = resolveRouteError(error, '重试补录失败，请稍后重试')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.patch('/admin/supplements/:id/manual-close', authenticateToken, requireMenu(SUPPLEMENT_ADMIN_MENU_KEY), async (req, res) => {
+  try {
+    const supplementId = toPositiveInt(req.params.id)
+    if (!supplementId) {
+      return res.status(400).json({ error: '无效补录记录ID' })
+    }
+
+    const detail = String(req.body?.detail || '').trim() || '已人工介入处理'
+    const updated = await updateAlipayRedpackSupplementRecord(supplementId, {
+      status: 'manual_done',
+      detail,
+    })
+
+    res.json({
+      message: '补录记录已标记为人工处理完成',
+      record: updated,
+    })
+  } catch (error) {
+    console.error('[AlipayRedpack] 标记人工处理失败:', error)
+    const resolved = resolveRouteError(error, '标记人工处理失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
 router.post('/admin/orders/:id/quick-invite', authenticateToken, requireMenu(ADMIN_MENU_KEY), async (req, res) => {
   try {
     const orderId = toPositiveInt(req.params.id)
@@ -335,6 +671,9 @@ router.post('/admin/orders/:id/quick-invite', authenticateToken, requireMenu(ADM
     }
     if (!EMAIL_REGEX.test(String(order.email || ''))) {
       return res.status(400).json({ error: '订单邮箱格式无效，无法发起邀请' })
+    }
+    if (order.status === 'returned') {
+      return res.status(409).json({ error: '该订单已退回，无法邀请，请让用户重新提交有效口令', order })
     }
     if (order.status === 'redeemed') {
       return res.status(409).json({ error: '该订单已兑换，无需重复邀请', order })
@@ -356,12 +695,7 @@ router.post('/admin/orders/:id/quick-invite', authenticateToken, requireMenu(ADM
       })
       inviteSent = true
 
-      await Promise.allSettled([
-        syncAccountUserCount(invite.accountId, { userListParams: { offset: 0, limit: 1, query: '' } }),
-        syncAccountInviteCount(invite.accountId, { inviteListParams: { offset: 0, limit: 1, query: '' } }),
-      ])
-
-      const queueState = await detectEmailInAccountQueues(invite.accountId, order.email)
+      const queueState = await syncAndDetectEmailQueueState(invite.accountId, order.email, { retryOnMissing: true })
 
       let updatedOrder = null
       if (queueState.isMember) {
@@ -437,6 +771,9 @@ router.post('/admin/orders/:id/sync-status', authenticateToken, requireMenu(ADMI
     if (!order) {
       return res.status(404).json({ error: '订单不存在' })
     }
+    if (order.status === 'returned') {
+      return res.status(409).json({ error: '该订单已退回，无需同步状态', order })
+    }
 
     const accountId = toPositiveInt(order.invitedAccountId)
     if (!accountId) {
@@ -445,12 +782,7 @@ router.post('/admin/orders/:id/sync-status', authenticateToken, requireMenu(ADMI
 
     const operator = resolveOperator(req)
 
-    await Promise.all([
-      syncAccountUserCount(accountId, { userListParams: { offset: 0, limit: 1, query: '' } }),
-      syncAccountInviteCount(accountId, { inviteListParams: { offset: 0, limit: 1, query: '' } }),
-    ])
-
-    const queueState = await detectEmailInAccountQueues(accountId, order.email)
+    const queueState = await syncAndDetectEmailQueueState(accountId, order.email, { retryOnMissing: true })
 
     let updatedOrder
     if (queueState.isMember) {
@@ -482,6 +814,35 @@ router.post('/admin/orders/:id/sync-status', authenticateToken, requireMenu(ADMI
   } catch (error) {
     console.error('[AlipayRedpack] 同步状态失败:', error)
     const resolved = resolveRouteError(error, '同步状态失败，请稍后重试')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.post('/admin/orders/:id/return', authenticateToken, requireMenu(ADMIN_MENU_KEY), async (req, res) => {
+  try {
+    const orderId = toPositiveInt(req.params.id)
+    if (!orderId) {
+      return res.status(400).json({ error: '无效订单ID' })
+    }
+
+    const order = await getAlipayRedpackOrderById(orderId)
+    if (!order) {
+      return res.status(404).json({ error: '订单不存在' })
+    }
+
+    const operator = resolveOperator(req)
+    const returned = await markAlipayRedpackOrderReturned(orderId, {
+      reason: req.body?.reason,
+      ...operator,
+    })
+
+    res.json({
+      message: '订单已退回并释放占用',
+      order: returned,
+    })
+  } catch (error) {
+    console.error('[AlipayRedpack] 退回订单失败:', error)
+    const resolved = resolveRouteError(error, '退回订单失败，请稍后重试')
     res.status(resolved.status).json(resolved.body)
   }
 })

@@ -880,9 +880,10 @@ export interface AlipayRedpackOrder {
   email: string
   alipayPassphrase: string
   redemptionCodeId?: number | null
+  redemptionCode?: string | null
   redemptionCodeRedeemedAt?: string | null
   note?: string
-  status: 'pending' | 'invited' | 'redeemed' | string
+  status: 'pending' | 'invited' | 'redeemed' | 'returned' | string
   inviteResult?: string
   invitedAccountId?: number | null
   invitedAccountEmail?: string | null
@@ -896,9 +897,43 @@ export interface AlipayRedpackOrder {
 
 export interface AlipayRedpackStock {
   availableCount: number
-  invitableAccountCount: number
-  candidateAccountCount: number
-  capacityLimit: number
+  reservedCount?: number
+  totalUnusedCount?: number
+  updatedAt?: string | null
+}
+
+export interface AlipayRedpackSupplementCandidateOrder {
+  orderId: number
+  createdAt?: string | null
+  status: 'pending' | 'invited' | 'redeemed' | 'returned' | string
+  warrantyDays?: number | null
+  withinWarranty: boolean
+  windowEndsAt?: string | null
+}
+
+export interface AlipayRedpackSupplementCandidateResponse {
+  email: string
+  total: number
+  orders: AlipayRedpackSupplementCandidateOrder[]
+}
+
+export interface AlipayRedpackSupplementRecord {
+  id: number
+  orderId: number
+  email: string
+  status: string
+  requestedBy: string
+  detail?: string
+  redemptionCodeId?: number | null
+  redemptionCode?: string | null
+  inviteAccountId?: number | null
+  inviteAccountEmail?: string | null
+  queueIsMember?: boolean
+  queueIsInvited?: boolean
+  withinWarranty?: boolean
+  windowEndsAt?: string | null
+  processedAt?: string | null
+  createdAt?: string | null
   updatedAt?: string | null
 }
 
@@ -2874,7 +2909,17 @@ export const alipayRedpackService = {
     return response.data
   },
 
-  async supplementPublic(payload: { email: string; alipayPassphrase: string; note?: string }): Promise<{ message: string; created: boolean; order: AlipayRedpackOrder }> {
+  async getSupplementCandidatesByEmail(email: string): Promise<AlipayRedpackSupplementCandidateResponse> {
+    const response = await axios.get(`${API_URL}/alipay-redpack/orders/supplement/candidates`, {
+      params: { email },
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async supplementPublic(payload: { email: string; orderId: number; note?: string }): Promise<{ message: string; order: AlipayRedpackOrder; windowEndsAt?: string | null; supplement?: AlipayRedpackSupplementRecord; manualInterventionRequired?: boolean }> {
     const response = await axios.post(`${API_URL}/alipay-redpack/orders/supplement`, payload, {
       headers: {
         'Content-Type': 'application/json'
@@ -2893,6 +2938,11 @@ export const alipayRedpackService = {
     return response.data
   },
 
+  async adminReturnOrder(id: number, payload?: { reason?: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
+    const response = await api.post(`/alipay-redpack/admin/orders/${id}/return`, payload || {})
+    return response.data
+  },
+
   async adminSyncStatus(id: number): Promise<{ message: string; order: AlipayRedpackOrder; queueState?: { isMember: boolean; isInvited: boolean } }> {
     const response = await api.post(`/alipay-redpack/admin/orders/${id}/sync-status`)
     return response.data
@@ -2900,6 +2950,21 @@ export const alipayRedpackService = {
 
   async adminUpdateNote(id: number, payload: { note: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
     const response = await api.patch(`/alipay-redpack/admin/orders/${id}/note`, payload)
+    return response.data
+  },
+
+  async adminListSupplements(params?: { search?: string; status?: string; limit?: number; offset?: number }): Promise<{ records: AlipayRedpackSupplementRecord[]; total: number; limit: number; offset: number }> {
+    const response = await api.get('/alipay-redpack/admin/supplements', { params })
+    return response.data
+  },
+
+  async adminRetrySupplement(id: number, payload?: { note?: string }): Promise<{ message?: string; order?: AlipayRedpackOrder; supplement?: AlipayRedpackSupplementRecord; manualInterventionRequired?: boolean }> {
+    const response = await api.post(`/alipay-redpack/admin/supplements/${id}/retry`, payload || {})
+    return response.data
+  },
+
+  async adminManualCloseSupplement(id: number, payload?: { detail?: string }): Promise<{ message: string; record: AlipayRedpackSupplementRecord }> {
+    const response = await api.patch(`/alipay-redpack/admin/supplements/${id}/manual-close`, payload || {})
     return response.data
   }
 }

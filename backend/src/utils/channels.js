@@ -1,6 +1,6 @@
 import { getDatabase } from '../database/init.js'
 
-export const CHANNEL_KEY_REGEX = /^[a-z0-9-]{2,32}$/
+export const CHANNEL_KEY_REGEX = /^[a-z0-9_-]{2,32}$/
 
 const CACHE_TTL_MS = 30 * 1000
 let cached = { list: [], byKey: new Map() }
