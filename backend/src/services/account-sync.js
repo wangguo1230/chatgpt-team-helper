@@ -441,45 +441,75 @@ export async function deleteUnusedCodesByAccountId(db, accountId) {
  */
 export const markAccountAsBannedAndCleanup = async (db, accountId, reason, options = {}) => {
   const sendAlertEmail = shouldSendAlertEmail(options)
+  const alertEmailSender = typeof options?.alertEmailSender === 'function' ? options.alertEmailSender : sendAdminAlertEmail
+  const normalizedAccountId = Number(accountId)
+  const lockKey = Number.isFinite(normalizedAccountId) ? `acct:${normalizedAccountId}` : `acct:${String(accountId)}`
   let account = null
   let cleanup = { accountId: Number(accountId), accountEmail: '', deletedCount: 0 }
+  let newlyBanned = false
+  let alertEmailSent = false
 
   try {
-    db.run(
-      `
-        UPDATE gpt_accounts
-        SET is_open = 0,
-            is_banned = 1,
-            ban_processed = 0,
-            banned_at = COALESCE(banned_at, DATETIME('now', 'localtime')),
-            expire_at = ?,
-            updated_at = DATETIME('now', 'localtime')
-        WHERE id = ?
-      `,
-      [INVALID_ACCOUNT_EXPIRE_AT, accountId]
-    )
-    await saveDatabase()
-    cleanup = await deleteUnusedCodesByAccountId(db, accountId)
-    account = await fetchAccountById(db, accountId)
+    await withLocks([lockKey], async () => {
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 0,
+              is_banned = 1,
+              ban_processed = 0,
+              banned_at = COALESCE(banned_at, DATETIME('now', 'localtime')),
+              expire_at = ?,
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id = ?
+            AND COALESCE(is_banned, 0) = 0
+        `,
+        [INVALID_ACCOUNT_EXPIRE_AT, accountId]
+      )
+      const changedRows = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+      newlyBanned = changedRows > 0
 
-    console.warn('[AccountSync] 账号已标记为封号并下架', {
-      accountId,
-      reason,
-      deletedUnusedCodes: cleanup.deletedCount || 0
+      if (newlyBanned) {
+        await saveDatabase()
+        cleanup = await deleteUnusedCodesByAccountId(db, accountId)
+      }
+
+      account = await fetchAccountById(db, accountId)
+      if (!newlyBanned) {
+        cleanup = {
+          accountId: Number(accountId),
+          accountEmail: account?.email || '',
+          deletedCount: 0
+        }
+      }
+
+      if (newlyBanned) {
+        console.warn('[AccountSync] 账号已标记为封号并下架', {
+          accountId,
+          reason,
+          deletedUnusedCodes: cleanup.deletedCount || 0
+        })
+      } else {
+        console.info('[AccountSync] 账号已处于封号状态，跳过重复通知', {
+          accountId,
+          reason
+        })
+      }
+
+      if (sendAlertEmail && newlyBanned && account) {
+        alertEmailSent = Boolean(
+          await alertEmailSender({
+            subject: `[账号封号] ${account.email}`,
+            text: [
+              '账号已自动标记为封号并下架。',
+              `账号 ID: ${accountId}`,
+              `邮箱: ${account.email}`,
+              `原因: ${reason || '未知原因'}`,
+              `已删除未使用兑换码: ${cleanup.deletedCount || 0}`
+            ].join('\n')
+          })
+        )
+      }
     })
-
-    if (sendAlertEmail && account) {
-      await sendAdminAlertEmail({
-        subject: `[账号封号] ${account.email}`,
-        text: [
-          '账号已自动标记为封号并下架。',
-          `账号 ID: ${accountId}`,
-          `邮箱: ${account.email}`,
-          `原因: ${reason || '未知原因'}`,
-          `已删除未使用兑换码: ${cleanup.deletedCount || 0}`
-        ].join('\n')
-      })
-    }
   } catch (error) {
     console.error(`[AccountSync] 标记账号封号失败: ID=${accountId}`, error)
   }
@@ -488,7 +518,9 @@ export const markAccountAsBannedAndCleanup = async (db, accountId, reason, optio
     accountId: Number(accountId),
     accountEmail: account?.email || cleanup.accountEmail || '',
     deletedUnusedCodeCount: Number(cleanup.deletedCount || 0),
-    reason: String(reason || '').trim()
+    reason: String(reason || '').trim(),
+    newlyBanned,
+    alertEmailSent
   }
 }
 
@@ -1127,6 +1159,40 @@ export async function inviteAccountUser(accountId, email, options = {}) {
     return {
       message: '邀请已发送',
       invite: data
+    }
+  }, options)
+}
+
+export async function revokeAccountInviteByEmail(accountId, email, options = {}) {
+  return executeWithTokenRefresh(accountId, async (acc) => {
+    const normalizedEmail = String(email || '').trim().toLowerCase()
+    if (!normalizedEmail) {
+      throw new AccountSyncError('请提供邀请邮箱地址', 400)
+    }
+
+    await requestDeleteAccountInvite(acc, normalizedEmail, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    })
+
+    const invitesData = await requestAccountInvites(acc, {
+      offset: 0,
+      limit: 1,
+      query: '',
+    }, {
+      proxy: options.proxy,
+      suppressAlertEmail: options.suppressAlertEmail
+    })
+    const db = await getDatabase()
+    db.run(
+      `UPDATE gpt_accounts SET invite_count = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
+      [invitesData.total, acc.id]
+    )
+    await saveDatabase()
+
+    return {
+      message: '邀请已撤销',
+      inviteCount: invitesData.total
     }
   }, options)
 }

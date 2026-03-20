@@ -35,7 +35,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `views/LinuxDoOpenAccountsView.vue` | 开放账号卡片页（前台标题：栗子LDC）+ 上车交互 |
+| `views/LinuxDoOpenAccountsView.vue` | 开放账号卡片页（前台标题：栗子小店）+ 上车交互 |
 | `composables/useLinuxDoAuthSession.ts` | LinuxDo OAuth 状态管理 |
 | `views/PointsExchangeView.vue` | 站内积分兑换 / 提现（独立于 LDC） |
 | `views/CreditOrdersView.vue` | 管理后台 Credit 订单列表 |

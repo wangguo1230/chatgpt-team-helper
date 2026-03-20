@@ -15,6 +15,7 @@ const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const RISK_NOTE_MAX_LENGTH = 500
 
 const normalizeBoolean = (value) => {
   if (typeof value === 'boolean') return value
@@ -177,7 +178,7 @@ const mapInvitableAccount = (row) => {
   }
 }
 
-const DIRECT_INVITE_COMMON_CHANNEL_CONDITION = "COALESCE(NULLIF(lower(trim(channel)), ''), 'common') = 'common'"
+const DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION = "COALESCE(NULLIF(lower(trim(channel)), ''), 'common') IN ('common', 'alipay_redpack', 'alipay-redpack', 'alipayredpack', '支付宝口令红包')"
 const DIRECT_INVITE_UNUSED_CODE_CONDITION = `
   is_redeemed = 0
   AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
@@ -211,7 +212,7 @@ const getDirectInviteCodeStats = (db, accountEmail) => {
         ) AS available_count
       FROM redemption_codes
       WHERE lower(trim(account_email)) = ?
-        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND ${DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION}
     `,
     [normalizedEmail]
   )
@@ -221,8 +222,15 @@ const getDirectInviteCodeStats = (db, accountEmail) => {
 
 const hasEligibleDirectInviteCodes = (stats) => {
   const normalized = normalizeDirectInviteCodeStats(stats?.totalCount, stats?.availableCount)
-  // 快捷邀请规则：未创建邀请码（total=0）可邀请；创建后必须仍有可用邀请码。
-  return normalized.totalCount === 0 || normalized.availableCount > 0
+  // 快捷邀请规则：必须存在可用邀请码，且不能占用支付宝口令订单已绑定的邀请码。
+  return normalized.totalCount > 0 && normalized.availableCount > 0
+}
+
+const normalizeRiskNote = (value) => {
+  if (value == null) return null
+  const normalized = String(value).trim()
+  if (!normalized) return null
+  return normalized.slice(0, RISK_NOTE_MAX_LENGTH)
 }
 
 const loadDirectInviteCodeStatsByEmails = (db, emails) => {
@@ -244,7 +252,7 @@ const loadDirectInviteCodeStatsByEmails = (db, emails) => {
           END
         ) AS available_count
       FROM redemption_codes
-      WHERE ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+      WHERE ${DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION}
         AND lower(trim(account_email)) IN (${placeholders})
       GROUP BY lower(trim(account_email))
     `,
@@ -270,7 +278,7 @@ const reserveDirectInviteCode = (db, accountEmail, inviteEmail, reserveKey) => {
       SELECT id, code
       FROM redemption_codes
       WHERE lower(trim(account_email)) = ?
-        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND ${DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION}
         AND ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
       ORDER BY datetime(created_at) ASC, id ASC
       LIMIT 1
@@ -411,7 +419,7 @@ const resolveDirectInviteAccount = (db, accountId = null) => {
     assertInvitableAccount(account, { capacityLimit, nowMs })
     const codeStats = getDirectInviteCodeStats(db, account?.email)
     if (!hasEligibleDirectInviteCodes(codeStats)) {
-      throw new AccountSyncError('所选账号已创建邀请码但无未使用邀请码，请先补充邀请码', 409)
+      throw new AccountSyncError('所选账号无可用邀请码，请先补充邀请码', 409)
     }
     return account
   }
@@ -446,7 +454,7 @@ const resolveDirectInviteAccount = (db, accountId = null) => {
     }
   }
 
-  throw new AccountSyncError('暂无符合快捷邀请条件的账号（需未满员，且邀请码为未创建或存在未使用）', 409)
+  throw new AccountSyncError('暂无符合快捷邀请条件的账号（需已开放、未封禁、未满员且存在可用邀请码）', 409)
 }
 
 const buildQuickInviteMeta = (account, { capacityLimit, nowMs, codeStats }) => {
@@ -479,7 +487,7 @@ const buildQuickInviteMeta = (account, { capacityLimit, nowMs, codeStats }) => {
     return { ...base, quickInviteEligible: false, quickInviteReason: '账号已满员' }
   }
   if (!hasEligibleDirectInviteCodes(normalizedStats)) {
-    return { ...base, quickInviteEligible: false, quickInviteReason: '已创建邀请码但无未使用邀请码' }
+    return { ...base, quickInviteEligible: false, quickInviteReason: '无可用邀请码' }
   }
 
   return { ...base, quickInviteEligible: true, quickInviteReason: null }
@@ -1290,6 +1298,52 @@ router.put('/:id', async (req, res) => {
 })
 
 // 设置账号是否开放展示
+router.patch('/:id/risk-note', async (req, res) => {
+  try {
+    const accountId = Number(req.params.id)
+    if (!Number.isFinite(accountId) || accountId <= 0) {
+      return res.status(400).json({ error: 'Invalid account id' })
+    }
+
+    const db = await getDatabase()
+    const checkResult = db.exec('SELECT id FROM gpt_accounts WHERE id = ?', [accountId])
+    if (checkResult.length === 0 || checkResult[0].values.length === 0) {
+      return res.status(404).json({ error: 'Account not found' })
+    }
+
+    const normalizedRiskNote = normalizeRiskNote(req.body?.riskNote ?? req.body?.risk_note)
+    db.run(
+      `UPDATE gpt_accounts SET risk_note = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
+      [normalizedRiskNote, accountId]
+    )
+    saveDatabase()
+
+    const result = db.exec(
+      `
+        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+               COALESCE(is_banned, 0) AS is_banned,
+               banned_at,
+               risk_note,
+               created_at, updated_at
+        FROM gpt_accounts
+        WHERE id = ?
+      `,
+      [accountId]
+    )
+    const row = result[0].values[0]
+    const account = mapGptAccountRow(row)
+
+    return res.json({
+      message: '备注已更新',
+      account
+    })
+  } catch (error) {
+    console.error('Update GPT account risk note error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 设置账号是否开放展示
 router.patch('/:id/open', async (req, res) => {
   try {
     const { isOpen } = req.body || {}
@@ -1690,7 +1744,8 @@ router.post('/invite/direct', async (req, res) => {
   try {
     const response = await performDirectInvite({
       email: req.body?.email,
-      accountId: req.body?.accountId
+      accountId: req.body?.accountId,
+      requireAvailableDirectInviteCode: true
     })
 
     res.json(response)

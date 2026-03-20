@@ -41,12 +41,20 @@ import FeatureDisabledView from '../views/FeatureDisabledView.vue'
 import { useAppConfigStore } from '@/stores/appConfig'
 import { pinia } from '@/stores/pinia'
 
+const PUBLIC_ALIPAY_REDPACK_PATH = '/redeem/alipay-redpack'
+const PUBLIC_ALIPAY_REDPACK_SUPPLEMENT_PATH = '/redeem/alipay-redpack/supplement'
+const PUBLIC_ALLOWED_PATHS = new Set([
+  '/login',
+  PUBLIC_ALIPAY_REDPACK_PATH,
+  PUBLIC_ALIPAY_REDPACK_SUPPLEMENT_PATH,
+])
+
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
     {
       path: '/',
-      redirect: '/login',
+      redirect: PUBLIC_ALIPAY_REDPACK_PATH,
     },
     {
       path: '/feature-disabled/:feature',
@@ -290,6 +298,12 @@ const router = createRouter({
 
 // Navigation guard
 router.beforeEach(async (to, from, next) => {
+  const isAdminPath = to.path.startsWith('/admin')
+  if (!isAdminPath && !PUBLIC_ALLOWED_PATHS.has(to.path)) {
+    next(PUBLIC_ALIPAY_REDPACK_PATH)
+    return
+  }
+
   const appConfigStore = useAppConfigStore(pinia)
   await appConfigStore.loadConfig()
 

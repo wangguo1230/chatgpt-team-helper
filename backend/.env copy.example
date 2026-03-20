@@ -179,9 +179,9 @@ TELEGRAM_INTERNAL_API_BASE_URL=
 # 说明：修改以下调度参数后需重启后端服务生效
 # OPEN_ACCOUNTS_SWEEPER_ENABLED=true
 # 旧版小时间隔（默认 1 小时；当未设置分钟间隔/自定义时段时生效）
-# OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS=2
+# OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS=1
 # 扫描间隔（分钟，默认 60；优先级高于 OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS）
-# OPEN_ACCOUNTS_SWEEPER_INTERVAL_MINUTES=30
+# OPEN_ACCOUNTS_SWEEPER_INTERVAL_MINUTES=60
 # 自定义扫描小时（可选，逗号分隔 0-23；配置后优先于 interval 分支）
 # 示例：0,6,12,18 表示每天 00:00/06:00/12:00/18:00 触发
 # OPEN_ACCOUNTS_SWEEPER_SCHEDULE_HOURS=0,6,12,18
@@ -194,12 +194,12 @@ TELEGRAM_INTERNAL_API_BASE_URL=
 # 超员阈值与开放账号容量上限统一：
 # 扫描器使用 OPEN_ACCOUNTS_CAPACITY_LIMIT / 系统配置 open_accounts_capacity_limit
 # 成员人数 joined > 容量上限 时触发踢人流程（默认 5）
-# 扫描最近 N 天创建的开放账号（0 表示不限制，默认 15）
-# OPEN_ACCOUNTS_SWEEPER_CREATED_WITHIN_DAYS=15
+# 扫描最近 N 天创建的开放账号（0 表示不限制，默认 0=全量扫描）
+# OPEN_ACCOUNTS_SWEEPER_CREATED_WITHIN_DAYS=0
 # 并发 worker 数（默认 3）
 # OPEN_ACCOUNTS_SWEEPER_CONCURRENCY=3
-# 启动后是否立即执行一次（默认 false）
-# OPEN_ACCOUNTS_SWEEPER_RUN_ON_STARTUP=false
+# 启动后是否立即执行一次（默认 true）
+# OPEN_ACCOUNTS_SWEEPER_RUN_ON_STARTUP=true
 # 开启账号安全检测（默认 true）：检测异常会自动封号并下架未使用兑换码
 # OPEN_ACCOUNTS_SWEEPER_SECURITY_CHECK_ENABLED=true
 
@@ -363,6 +363,40 @@ LINUXDO_CREDIT_BASE_URL=https://credit.linux.do/epay
 
 # 补录相关策略（兑换码创建时间窗口、是否要求覆盖订单截止日）
 # 已迁移到后台「系统设置 -> 补录设置」并存储在 system_config。
+
+# ======================
+# 支付宝口令红包订单 / 补录（可选）
+# ======================
+# 公开接口限流：窗口秒数 + 单窗口最大请求数（默认 60 秒 / 30 次）
+# ALIPAY_REDPACK_PUBLIC_RATE_LIMIT_WINDOW_SEC=60
+# ALIPAY_REDPACK_PUBLIC_RATE_LIMIT_MAX=30
+
+# 管理员汇总告警：发送间隔（秒）与队列最大事件数（默认 600 秒 / 500 条）
+# ALIPAY_REDPACK_ADMIN_ALERT_SUMMARY_INTERVAL_SEC=600
+# ALIPAY_REDPACK_ADMIN_ALERT_SUMMARY_MAX_EVENTS=500
+
+# 公开补录鉴权：是否要求 OTP（默认 true）
+# ALIPAY_REDPACK_SUPPLEMENT_REQUIRE_OTP=true
+# OTP 有效期（秒，默认 300）
+# ALIPAY_REDPACK_SUPPLEMENT_OTP_TTL_SEC=300
+# 同邮箱发送 OTP 冷却（秒，默认 60）
+# ALIPAY_REDPACK_SUPPLEMENT_OTP_SEND_COOLDOWN_SEC=60
+
+# 补录票据有效期与可用次数（默认 900 秒 / 8 次）
+# ALIPAY_REDPACK_SUPPLEMENT_TICKET_TTL_SEC=900
+# ALIPAY_REDPACK_SUPPLEMENT_TICKET_MAX_USES=8
+
+# 单订单补录保护：窗口秒数 + 最大尝试次数 + 执行锁时长（默认 86400 秒 / 3 次 / 120 秒）
+# ALIPAY_REDPACK_SUPPLEMENT_ATTEMPT_WINDOW_SEC=86400
+# ALIPAY_REDPACK_SUPPLEMENT_MAX_ATTEMPTS_PER_ORDER=3
+# ALIPAY_REDPACK_SUPPLEMENT_ORDER_LOCK_SEC=120
+
+# 订单处理成功通知邮件（默认使用下方文案和链接）
+# ALIPAY_REDPACK_ORDER_PROCESSED_EMAIL_SUBJECT=支付宝口令订单已处理通知
+# ALIPAY_REDPACK_ORDER_RETURNED_EMAIL_SUBJECT=支付宝口令订单退回通知
+# ALIPAY_REDPACK_SUPPORT_SELF_SERVICE_URL=http://ldc.lizitool.de5.net/redeem/alipay-redpack
+# ALIPAY_REDPACK_SUPPORT_GROUP_URL=https://t.me/+fCeXgVykd7xjY2Jl
+# ALIPAY_REDPACK_SUPPORT_TG_URL=https://t.me/liziwang
 
 # ======================
 # ZPAY（可选）

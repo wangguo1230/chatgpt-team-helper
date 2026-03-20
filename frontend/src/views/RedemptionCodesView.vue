@@ -32,6 +32,7 @@ import { Search, Plus, Download, Trash2, ChevronLeft, ChevronRight, RefreshCcw, 
 const router = useRouter()
 const route = useRoute()
 const DEFAULT_BATCH_COUNT = 4
+const DEFAULT_OPEN_ACCOUNTS_CAPACITY_LIMIT = 5
 const codes = ref<RedemptionCode[]>([])
 const totalCodes = ref(0)
 const accounts = ref<GptAccount[]>([])
@@ -41,6 +42,7 @@ const teleportReady = ref(false)
 const showBatchDialog = ref(false)
 const batchCount = ref(DEFAULT_BATCH_COUNT)
 const batchCreateMaxCount = ref(5)
+const runtimeOpenAccountsCapacityLimit = ref<number | null>(null)
 const selectedAccountEmail = ref('')
 const selectedBatchChannel = ref('common')
 const batchOrderType = ref<PurchaseOrderType>('warranty')
@@ -79,6 +81,37 @@ const updatingChannelId = ref<number | null>(null)
 let popoverTimer: ReturnType<typeof setTimeout> | null = null
 const { success: showSuccessToast, info: showInfoToast, warning: showWarningToast, error: showErrorToast } = useToast()
 
+const toPositiveInt = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 1) return null
+  return Math.floor(parsed)
+}
+
+const toNonNegativeInt = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0) return 0
+  return Math.floor(parsed)
+}
+
+const getAccountOccupancy = (account?: GptAccount | null) => {
+  return toNonNegativeInt(account?.userCount) + toNonNegativeInt(account?.inviteCount)
+}
+
+const resolveAccountCapacityLimit = (account?: GptAccount | null) => {
+  const fromAccount = toPositiveInt(account?.quickInviteCapacityLimit)
+  if (fromAccount) return fromAccount
+  const fromRuntime = toPositiveInt(runtimeOpenAccountsCapacityLimit.value)
+  if (fromRuntime) return fromRuntime
+  return DEFAULT_OPEN_ACCOUNTS_CAPACITY_LIMIT
+}
+
+const resolveDefaultBatchChannel = () => {
+  if (channelOptions.value.some(option => option.value === 'common')) {
+    return 'common'
+  }
+  return channelOptions.value[0]?.value || 'common'
+}
+
 const accountsByEmail = computed(() => {
   const map = new Map<string, GptAccount>()
   for (const account of accounts.value) {
@@ -97,8 +130,16 @@ const activeAccounts = computed(() => accounts.value.filter(account => {
       return false
     }
   }
+  if (getAccountOccupancy(account) >= resolveAccountCapacityLimit(account)) {
+    return false
+  }
   return true
 }))
+
+const selectedAccountCapacityLimit = computed(() => {
+  const selectedAccount = activeAccounts.value.find(account => account.email === selectedAccountEmail.value) || null
+  return resolveAccountCapacityLimit(selectedAccount)
+})
 
 const isAccountBanned = (accountEmail?: string | null) => {
   const normalizedEmail = String(accountEmail || '').trim().toLowerCase()
@@ -281,6 +322,8 @@ const loadChannels = async () => {
   try {
     const runtime = await configService.getRuntimeConfig()
     const runtimeBatchMax = Number(runtime.redemptionBatchCreateMaxCount)
+    const runtimeCapacity = toPositiveInt(runtime.openAccountsCapacityLimit)
+    runtimeOpenAccountsCapacityLimit.value = runtimeCapacity || null
     if (Number.isFinite(runtimeBatchMax) && runtimeBatchMax >= 1) {
       batchCreateMaxCount.value = Math.floor(runtimeBatchMax)
       if (batchCount.value > batchCreateMaxCount.value) {
@@ -296,7 +339,7 @@ const loadChannels = async () => {
     }))
 
     if (!channelOptions.value.some(option => option.value === selectedBatchChannel.value)) {
-      selectedBatchChannel.value = channelOptions.value[0]?.value || 'common'
+      selectedBatchChannel.value = resolveDefaultBatchChannel()
     }
   } catch (err) {
     console.warn('[RedemptionCodes] load channels failed', err)
@@ -422,7 +465,7 @@ const truncateText = (text?: string | null, maxLength: number = 20) => {
 const openBatchDialog = () => {
   batchCount.value = Math.min(DEFAULT_BATCH_COUNT, batchCreateMaxCount.value)
   selectedAccountEmail.value = activeAccounts.value.length > 0 ? (activeAccounts.value[0]?.email || '') : ''
-  selectedBatchChannel.value = 'common'
+  selectedBatchChannel.value = resolveDefaultBatchChannel()
   showBatchDialog.value = true
 }
 
@@ -430,7 +473,7 @@ const closeBatchDialog = () => {
   showBatchDialog.value = false
   batchCount.value = Math.min(DEFAULT_BATCH_COUNT, batchCreateMaxCount.value)
   selectedAccountEmail.value = ''
-  selectedBatchChannel.value = 'common'
+  selectedBatchChannel.value = resolveDefaultBatchChannel()
   batchOrderType.value = 'warranty'
   batchServiceDays.value = 30
 }
@@ -1577,12 +1620,12 @@ const handleInviteSubmit = async () => {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem v-for="account in activeAccounts" :key="account.id" :value="account.email">
-                    {{ account.email }} (当前{{ account.userCount }}人)
+                    {{ account.email }} (当前{{ getAccountOccupancy(account) }}人)
                   </SelectItem>
                 </SelectContent>
               </Select>
               <p class="text-xs text-gray-400">
-                可创建数量 = 5 - 当前人数 - 未使用的兑换码数；单次最多 {{ batchCreateMaxCount }} 个。
+                可创建数量 = {{ selectedAccountCapacityLimit }} - 当前人数 - 未使用的兑换码数；单次最多 {{ batchCreateMaxCount }} 个。
               </p>
            </div>
 

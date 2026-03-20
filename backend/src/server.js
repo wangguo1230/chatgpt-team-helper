@@ -31,6 +31,7 @@ import { startTelegramBot } from './services/telegram-bot.js'
 import { startXianyuLoginRefreshScheduler } from './services/xianyu-login-refresh.js'
 import { startXhsAutoSyncScheduler } from './services/xhs-auto-sync.js'
 import { startXianyuWsDeliveryBot } from './services/xianyu-ws-delivery.js'
+import { startAlipayRedpackInvitedOrderSyncSweeper } from './services/alipay-redpack-order-sync-sweeper.js'
 
 dotenv.config()
 
@@ -77,7 +78,7 @@ app.use(
       return callback(null, corsOrigins.has(origin))
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Linuxdo-Token', 'Cache-Control', 'Pragma'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Linuxdo-Token', 'X-Alipay-Redpack-Ticket', 'Cache-Control', 'Pragma'],
     credentials: false,
     maxAge: 86400
   })
@@ -113,6 +114,7 @@ initDatabase()
 	    startXianyuLoginRefreshScheduler()
 	    startXianyuWsDeliveryBot()
 	    startXhsAutoSyncScheduler()
+      startAlipayRedpackInvitedOrderSyncSweeper()
 
 	    startServer()
 	  })

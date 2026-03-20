@@ -816,3 +816,161 @@ export async function sendVerificationCodeEmail(email, code, options = {}) {
     return false
   }
 }
+
+const resolveAlipayRedpackSupportLinks = () => {
+  const afterSalesUrl = String(
+    process.env.ALIPAY_REDPACK_SUPPORT_SELF_SERVICE_URL || 'http://ldc.lizitool.de5.net/redeem/alipay-redpack'
+  ).trim() || 'http://ldc.lizitool.de5.net/redeem/alipay-redpack'
+  const supportGroupUrl = String(
+    process.env.ALIPAY_REDPACK_SUPPORT_GROUP_URL || 'https://t.me/+fCeXgVykd7xjY2Jl'
+  ).trim() || 'https://t.me/+fCeXgVykd7xjY2Jl'
+  const telegramUrl = String(
+    process.env.ALIPAY_REDPACK_SUPPORT_TG_URL || 'https://t.me/liziwang'
+  ).trim() || 'https://t.me/liziwang'
+  return {
+    afterSalesUrl,
+    supportGroupUrl,
+    telegramUrl,
+  }
+}
+
+export async function sendAlipayRedpackOrderProcessedEmail({ to, orderId } = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[AlipayRedpackOrderEmail] SMTP 配置不完整，跳过发送订单处理通知邮件')
+    return false
+  }
+
+  const recipient = String(to || '').trim()
+  if (!recipient) {
+    console.warn('[AlipayRedpackOrderEmail] 缺少收件邮箱，跳过发送订单处理通知邮件')
+    return false
+  }
+
+  const subject = String(
+    process.env.ALIPAY_REDPACK_ORDER_PROCESSED_EMAIL_SUBJECT || '支付宝口令订单已处理通知'
+  ).trim() || '支付宝口令订单已处理通知'
+  const {
+    afterSalesUrl,
+    supportGroupUrl,
+    telegramUrl,
+  } = resolveAlipayRedpackSupportLinks()
+
+  const normalizedOrderId = Number(orderId || 0)
+  const orderLabel = Number.isFinite(normalizedOrderId) && normalizedOrderId > 0
+    ? `订单ID：#${Math.floor(normalizedOrderId)}`
+    : ''
+  const text = [
+    '您好，您的订单已处理，请查收邮箱是否有GPT邀请。',
+    orderLabel || null,
+    `售后：访问 ${afterSalesUrl} 自助补录。`,
+    `TG售后群: ${supportGroupUrl}`,
+    `TG: ${telegramUrl}`,
+  ].filter(Boolean).join('\n')
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.7;">
+      <h2 style="margin: 0 0 12px;">支付宝口令订单通知</h2>
+      <p style="margin: 0 0 10px;">您好，您的订单已处理，请查收邮箱是否有 GPT 邀请。</p>
+      ${orderLabel ? `<p style="margin: 0 0 10px;">${escapeHtml(orderLabel)}</p>` : ''}
+      <p style="margin: 0 0 6px;">售后：访问 <a href="${escapeHtml(afterSalesUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(afterSalesUrl)}</a> 自助补录。</p>
+      <p style="margin: 0 0 6px;">TG售后群：<a href="${escapeHtml(supportGroupUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(supportGroupUrl)}</a></p>
+      <p style="margin: 0;">TG：<a href="${escapeHtml(telegramUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(telegramUrl)}</a></p>
+    </div>
+  `
+
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const transporter = nodemailer.createTransport(smtpConfig)
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipient,
+      subject,
+      text,
+      html,
+    })
+    console.log('[AlipayRedpackOrderEmail] 订单处理通知邮件已发送', {
+      to: recipient,
+      orderId: orderLabel || null,
+    })
+    return true
+  } catch (error) {
+    console.warn('[AlipayRedpackOrderEmail] 订单处理通知邮件发送失败', error?.message || error)
+    return false
+  }
+}
+
+export async function sendAlipayRedpackOrderReturnedEmail({ to, orderId, reason } = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[AlipayRedpackOrderEmail] SMTP 配置不完整，跳过发送订单退回通知邮件')
+    return false
+  }
+
+  const recipient = String(to || '').trim()
+  if (!recipient) {
+    console.warn('[AlipayRedpackOrderEmail] 缺少收件邮箱，跳过发送订单退回通知邮件')
+    return false
+  }
+
+  const subject = String(
+    process.env.ALIPAY_REDPACK_ORDER_RETURNED_EMAIL_SUBJECT || '支付宝口令订单退回通知'
+  ).trim() || '支付宝口令订单退回通知'
+  const {
+    afterSalesUrl,
+    supportGroupUrl,
+    telegramUrl,
+  } = resolveAlipayRedpackSupportLinks()
+
+  const normalizedOrderId = Number(orderId || 0)
+  const orderLabel = Number.isFinite(normalizedOrderId) && normalizedOrderId > 0
+    ? `订单ID：#${Math.floor(normalizedOrderId)}`
+    : ''
+  const normalizedReason = String(reason || '').trim() || '口令不可用'
+  const text = [
+    '您好，您的支付宝口令订单已退回。',
+    orderLabel || null,
+    `退回原因：${normalizedReason}`,
+    '如需继续处理，请重新提交有效口令。',
+    `售后：访问 ${afterSalesUrl} 自助补录。`,
+    `TG售后群: ${supportGroupUrl}`,
+    `TG: ${telegramUrl}`,
+  ].filter(Boolean).join('\n')
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.7;">
+      <h2 style="margin: 0 0 12px;">支付宝口令订单退回通知</h2>
+      <p style="margin: 0 0 10px;">您好，您的支付宝口令订单已退回。</p>
+      ${orderLabel ? `<p style="margin: 0 0 10px;">${escapeHtml(orderLabel)}</p>` : ''}
+      <p style="margin: 0 0 10px;">退回原因：${escapeHtml(normalizedReason)}</p>
+      <p style="margin: 0 0 10px;">如需继续处理，请重新提交有效口令。</p>
+      <p style="margin: 0 0 6px;">售后：访问 <a href="${escapeHtml(afterSalesUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(afterSalesUrl)}</a> 自助补录。</p>
+      <p style="margin: 0 0 6px;">TG售后群：<a href="${escapeHtml(supportGroupUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(supportGroupUrl)}</a></p>
+      <p style="margin: 0;">TG：<a href="${escapeHtml(telegramUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(telegramUrl)}</a></p>
+    </div>
+  `
+
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const transporter = nodemailer.createTransport(smtpConfig)
+
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipient,
+      subject,
+      text,
+      html,
+    })
+    console.log('[AlipayRedpackOrderEmail] 订单退回通知邮件已发送', {
+      to: recipient,
+      orderId: orderLabel || null,
+    })
+    return true
+  } catch (error) {
+    console.warn('[AlipayRedpackOrderEmail] 订单退回通知邮件发送失败', error?.message || error)
+    return false
+  }
+}

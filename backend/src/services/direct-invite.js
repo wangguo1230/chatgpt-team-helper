@@ -5,7 +5,7 @@ import { inviteAccountUser, syncAccountInviteCount, AccountSyncError } from './a
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-const DIRECT_INVITE_COMMON_CHANNEL_CONDITION = "COALESCE(NULLIF(lower(trim(channel)), ''), 'common') = 'common'"
+const DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION = "COALESCE(NULLIF(lower(trim(channel)), ''), 'common') IN ('common', 'alipay_redpack', 'alipay-redpack', 'alipayredpack', '支付宝口令红包')"
 const DIRECT_INVITE_UNUSED_CODE_CONDITION = `
   is_redeemed = 0
   AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
@@ -88,7 +88,7 @@ const getDirectInviteCodeStats = (db, accountEmail) => {
         ) AS available_count
       FROM redemption_codes
       WHERE lower(trim(account_email)) = ?
-        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND ${DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION}
     `,
     [normalizedEmail]
   )
@@ -99,6 +99,11 @@ const getDirectInviteCodeStats = (db, accountEmail) => {
 const hasEligibleDirectInviteCodes = (stats) => {
   const normalized = normalizeDirectInviteCodeStats(stats?.totalCount, stats?.availableCount)
   return normalized.totalCount === 0 || normalized.availableCount > 0
+}
+
+const hasAvailableDirectInviteCodes = (stats) => {
+  const normalized = normalizeDirectInviteCodeStats(stats?.totalCount, stats?.availableCount)
+  return normalized.totalCount > 0 && normalized.availableCount > 0
 }
 
 const readAccountInviteCount = (db, accountId) => {
@@ -175,7 +180,7 @@ const reserveDirectInviteCode = (db, accountEmail, inviteEmail, reserveKey) => {
       SELECT id, code
       FROM redemption_codes
       WHERE lower(trim(account_email)) = ?
-        AND ${DIRECT_INVITE_COMMON_CHANNEL_CONDITION}
+        AND ${DIRECT_INVITE_ALLOWED_CHANNEL_CONDITION}
         AND ${DIRECT_INVITE_UNUSED_CODE_CONDITION}
       ORDER BY datetime(created_at) ASC, id ASC
       LIMIT 1
@@ -299,6 +304,7 @@ const assertInvitableAccount = (account, { capacityLimit, nowMs }) => {
 
 const resolveDirectInviteAccount = (db, accountId = null, options = {}) => {
   const consumeCode = options?.consumeCode !== false
+  const requireAvailableDirectInviteCode = options?.requireAvailableDirectInviteCode === true
   const capacityLimit = getOpenAccountsCapacityLimit(db)
   const nowMs = Date.now()
 
@@ -315,8 +321,11 @@ const resolveDirectInviteAccount = (db, accountId = null, options = {}) => {
     )
     const account = mapInvitableAccount(result?.[0]?.values?.[0] || null)
     assertInvitableAccount(account, { capacityLimit, nowMs })
+    const codeStats = getDirectInviteCodeStats(db, account?.email)
+    if (requireAvailableDirectInviteCode && !hasAvailableDirectInviteCodes(codeStats)) {
+      throw new AccountSyncError('所选账号无可用邀请码，请先补充邀请码', 409)
+    }
     if (consumeCode) {
-      const codeStats = getDirectInviteCodeStats(db, account?.email)
       if (!hasEligibleDirectInviteCodes(codeStats)) {
         throw new AccountSyncError('所选账号已创建邀请码但无未使用邀请码，请先补充邀请码', 409)
       }
@@ -344,8 +353,11 @@ const resolveDirectInviteAccount = (db, accountId = null, options = {}) => {
     const account = mapInvitableAccount(row)
     try {
       assertInvitableAccount(account, { capacityLimit, nowMs })
+      const codeStats = getDirectInviteCodeStats(db, account?.email)
+      if (requireAvailableDirectInviteCode && !hasAvailableDirectInviteCodes(codeStats)) {
+        continue
+      }
       if (consumeCode) {
-        const codeStats = getDirectInviteCodeStats(db, account?.email)
         if (!hasEligibleDirectInviteCodes(codeStats)) {
           continue
         }
@@ -356,6 +368,9 @@ const resolveDirectInviteAccount = (db, accountId = null, options = {}) => {
     }
   }
 
+  if (requireAvailableDirectInviteCode) {
+    throw new AccountSyncError('暂无符合快捷邀请条件的账号（需已开放、未满员且存在可用邀请码）', 409)
+  }
   if (consumeCode) {
     throw new AccountSyncError('暂无符合快捷邀请条件的账号（需未满员，且邀请码为未创建或存在未使用）', 409)
   }
@@ -415,7 +430,7 @@ export const getDirectInviteStockSummary = async ({ consumeCode = true } = {}) =
   }
 }
 
-export const performDirectInvite = async ({ email, accountId = null, consumeCode = true } = {}) => {
+export const performDirectInvite = async ({ email, accountId = null, consumeCode = true, requireAvailableDirectInviteCode = false } = {}) => {
   const normalizedEmail = normalizeEmail(email)
   if (!normalizedEmail) {
     throw new AccountSyncError('请提供邀请邮箱地址', 400)
@@ -432,7 +447,10 @@ export const performDirectInvite = async ({ email, accountId = null, consumeCode
 
   return withLocks(lockKeys, async () => {
     const db = await getDatabase()
-    const account = resolveDirectInviteAccount(db, preferredAccountId, { consumeCode })
+    const account = resolveDirectInviteAccount(db, preferredAccountId, {
+      consumeCode,
+      requireAvailableDirectInviteCode,
+    })
     const codeStats = consumeCode ? getDirectInviteCodeStats(db, account.email) : { totalCount: 0, availableCount: 0 }
     const needsCodeConsume = consumeCode && codeStats.totalCount > 0
     const reserveKey = needsCodeConsume

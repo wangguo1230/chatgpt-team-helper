@@ -63,6 +63,10 @@ COPY --from=backend-builder /app/backend/version.json ./backend/
 RUN mkdir -p /etc/nginx/conf.d
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY default.conf /etc/nginx/conf.d/default.conf
+RUN mkdir -p /etc/nginx/certs
+COPY lizitool.de5.net.pem /etc/nginx/certs/lizitool.de5.net.pem
+COPY lizitool.de5.key /etc/nginx/certs/lizitool.de5.key
+RUN chmod 644 /etc/nginx/certs/lizitool.de5.net.pem && chmod 600 /etc/nginx/certs/lizitool.de5.key
 
 # 创建 supervisor 配置
 COPY supervisord.conf /etc/supervisord.conf
@@ -70,8 +74,8 @@ COPY supervisord.conf /etc/supervisord.conf
 # 创建数据库目录
 RUN mkdir -p /app/backend/db
 
-# 暴露端口（只需要暴露前端端口，API 通过 nginx 内部代理）
-EXPOSE 5173
+# 暴露端口（HTTP + HTTPS）
+EXPOSE 80 443
 
 # 使用 supervisor 启动所有服务
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

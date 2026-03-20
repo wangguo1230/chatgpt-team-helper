@@ -1,5 +1,6 @@
 import { getDatabase, saveDatabase } from '../database/init.js'
-import { resolveOrderDeadlineMs } from './account-recovery.js'
+import crypto from 'crypto'
+import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 
 export class AlipayRedpackOrderError extends Error {
   constructor(message, statusCode = 400, code = 'alipay_redpack_bad_request') {
@@ -13,7 +14,7 @@ export class AlipayRedpackOrderError extends Error {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const ALIPAY_PASSPHRASE_MIN_LENGTH = 8
 const STATUS_SET = new Set(['pending', 'invited', 'redeemed', 'returned'])
-const PUBLIC_SUPPLEMENTABLE_STATUS_SET = new Set(['invited', 'redeemed'])
+const PUBLIC_SUPPLEMENTABLE_STATUS_SET = new Set(['redeemed'])
 const SUPPLEMENT_STATUS_PROCESSING = 'processing'
 const SUPPLEMENT_STATUS_AUTO_SUCCESS = 'auto_success'
 const SUPPLEMENT_STATUS_MANUAL_REQUIRED = 'manual_required'
@@ -32,12 +33,31 @@ const SUPPLEMENT_STATUS_SET = new Set([
 ])
 const ALIPAY_REDPACK_CHANNEL = 'alipay_redpack'
 const ALIPAY_REDPACK_CHANNEL_NAME = '支付宝口令红包'
+const ALIPAY_REDPACK_CHANNEL_NAME_NORMALIZED = ALIPAY_REDPACK_CHANNEL_NAME.trim().toLowerCase()
+const ALIPAY_REDPACK_CHANNEL_ALIAS_SET = new Set([
+  ALIPAY_REDPACK_CHANNEL,
+  'alipay-redpack',
+  'alipayredpack',
+  ALIPAY_REDPACK_CHANNEL_NAME_NORMALIZED,
+])
+const ALIPAY_REDPACK_CHANNEL_SQL_CONDITION = `
+  (
+    COALESCE(NULLIF(lower(trim(channel)), ''), '') IN ('alipay_redpack', 'alipay-redpack', 'alipayredpack', '支付宝口令红包')
+    OR (
+      COALESCE(NULLIF(trim(channel), ''), '') = ''
+      AND lower(trim(COALESCE(channel_name, ''))) = '支付宝口令红包'
+    )
+  )
+`
 const ALIPAY_REDPACK_ORDER_RESERVE_PREFIX = 'alipay_redpack_order:'
 const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
 const ORDER_TYPE_ANTI_BAN = 'anti_ban'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
 const DAY_MS = 24 * 60 * 60 * 1000
+const SUPPLEMENT_ATTEMPT_WINDOW_SEC_DEFAULT = 24 * 60 * 60
+const SUPPLEMENT_MAX_ATTEMPTS_DEFAULT = 3
+const SUPPLEMENT_LOCK_SEC_DEFAULT = 120
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
 const normalizePassphrase = (value) => String(value ?? '').trim()
@@ -55,6 +75,7 @@ const toPositiveInt = (value, fallback = 0) => {
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback
   return Math.floor(parsed)
 }
+const DATE_ONLY_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/
 const parseDateTimeToMs = (value) => {
   const raw = String(value || '').trim()
   if (!raw) return NaN
@@ -64,7 +85,58 @@ const parseDateTimeToMs = (value) => {
   const parsedWithTimezone = Date.parse(`${normalized}+08:00`)
   return Number.isNaN(parsedWithTimezone) ? NaN : parsedWithTimezone
 }
+const pad2 = (value) => String(value).padStart(2, '0')
+const EXPIRE_AT_PARSE_REGEX = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/
+const parseExpireAtToMs = (value) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return null
+  const match = raw.match(EXPIRE_AT_PARSE_REGEX)
+  if (!match) return null
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const hour = Number(match[4])
+  const minute = Number(match[5])
+  const second = match[6] != null ? Number(match[6]) : 0
+
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null
+  if (month < 1 || month > 12) return null
+  if (day < 1 || day > 31) return null
+  if (hour < 0 || hour > 23) return null
+  if (minute < 0 || minute > 59) return null
+  if (second < 0 || second > 59) return null
+
+  const iso = `${match[1]}-${pad2(month)}-${pad2(day)}T${pad2(hour)}:${pad2(minute)}:${pad2(second)}+08:00`
+  const parsed = Date.parse(iso)
+  return Number.isNaN(parsed) ? null : parsed
+}
 const getDefaultWarrantyServiceDays = () => Math.max(1, toPositiveInt(process.env.PURCHASE_SERVICE_DAYS, 30))
+const parsePositiveIntWithDefault = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+const getSupplementAttemptWindowSec = () => parsePositiveIntWithDefault(
+  process.env.ALIPAY_REDPACK_SUPPLEMENT_ATTEMPT_WINDOW_SEC,
+  SUPPLEMENT_ATTEMPT_WINDOW_SEC_DEFAULT
+)
+const getSupplementMaxAttemptsPerOrder = () => parsePositiveIntWithDefault(
+  process.env.ALIPAY_REDPACK_SUPPLEMENT_MAX_ATTEMPTS_PER_ORDER,
+  SUPPLEMENT_MAX_ATTEMPTS_DEFAULT
+)
+const getSupplementOrderLockSec = () => parsePositiveIntWithDefault(
+  process.env.ALIPAY_REDPACK_SUPPLEMENT_ORDER_LOCK_SEC,
+  SUPPLEMENT_LOCK_SEC_DEFAULT
+)
+
+const ORDER_SELECT_COLUMNS = `
+  id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
+  invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
+  operator_user_id, operator_username, created_at, updated_at,
+  warranty_anchor_at, warranty_service_days_snapshot, supplement_attempt_count, last_supplement_at,
+  supplement_lock_until, supplement_lock_token,
+  (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+`
 
 const mapOrderRow = (row = []) => ({
   id: Number(row[0]),
@@ -83,7 +155,12 @@ const mapOrderRow = (row = []) => ({
   operatorUsername: row[13] || null,
   createdAt: row[14] || null,
   updatedAt: row[15] || null,
-  redemptionCode: row[16] ? String(row[16]) : null,
+  warrantyAnchorAt: row[16] || null,
+  warrantyServiceDaysSnapshot: row[17] != null ? Number(row[17]) : null,
+  supplementAttemptCount: row[18] != null ? Number(row[18]) : 0,
+  lastSupplementAt: row[19] || null,
+  supplementLockUntil: row[20] || null,
+  redemptionCode: row[22] ? String(row[22]) : null,
 })
 
 const mapSupplementRow = (row = []) => ({
@@ -109,10 +186,7 @@ const mapSupplementRow = (row = []) => ({
 const getOrderRowById = (db, id) => {
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE id = ?
       LIMIT 1
@@ -125,10 +199,7 @@ const getOrderRowById = (db, id) => {
 const getOrderRowByPassphrase = (db, passphrase) => {
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE alipay_passphrase = ?
       LIMIT 1
@@ -143,10 +214,7 @@ const getLatestOrderRowByEmail = (db, email) => {
   if (!normalizedEmail) return null
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE lower(trim(email)) = ?
       ORDER BY datetime(created_at) DESC, id DESC
@@ -162,10 +230,7 @@ const getLatestActiveOrderRowByEmail = (db, email) => {
   if (!normalizedEmail) return null
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE lower(trim(email)) = ?
         AND status != 'returned'
@@ -183,10 +248,7 @@ const getOrderRowByIdAndEmail = (db, id, email) => {
   if (!normalizedId || !normalizedEmail) return null
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE id = ?
         AND lower(trim(email)) = ?
@@ -203,10 +265,7 @@ const listOrderRowsByEmail = (db, email, limit = 20) => {
   const normalizedLimit = Math.min(Math.max(toPositiveInt(limit, 20), 1), 100)
   const result = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       WHERE lower(trim(email)) = ?
       ORDER BY datetime(created_at) DESC, id DESC
@@ -251,13 +310,68 @@ const mapRedemptionCodeRow = (row = []) => ({
   reservedForOrderEmail: row[8] || null,
   reservedForUid: row[9] || null,
   reservedForEntryId: row[10] != null ? Number(row[10]) : null,
+  accountEmail: String(row[11] || '').trim().toLowerCase() || null,
 })
+
+const mapInvitableAccountRow = (row = []) => ({
+  id: Number(row[0] || 0),
+  email: String(row[1] || '').trim().toLowerCase(),
+  userCount: Number(row[2] || 0),
+  inviteCount: Number(row[3] || 0),
+  token: String(row[4] || ''),
+  chatgptAccountId: String(row[5] || ''),
+  expireAt: row[6] ? String(row[6]) : null,
+  isOpen: Number(row[7] || 0) === 1,
+  isBanned: Number(row[8] || 0) === 1,
+})
+
+const getInvitableAccountByEmail = (db, accountEmail) => {
+  const normalizedEmail = normalizeEmail(accountEmail)
+  if (!db || !normalizedEmail) return null
+  const result = db.exec(
+    `
+      SELECT id, email, COALESCE(user_count, 0), COALESCE(invite_count, 0),
+             token, chatgpt_account_id, expire_at, COALESCE(is_open, 0), COALESCE(is_banned, 0)
+      FROM gpt_accounts
+      WHERE lower(trim(email)) = ?
+      LIMIT 1
+    `,
+    [normalizedEmail]
+  )
+  const row = result?.[0]?.values?.[0]
+  return row ? mapInvitableAccountRow(row) : null
+}
+
+const isInvitableAccountForCodeBinding = (account, { capacityLimit, nowMs }) => {
+  if (!account || !account.id) return false
+  if (account.isBanned) return false
+  if (!account.isOpen) return false
+  if (!account.token || !account.chatgptAccountId) return false
+
+  const expireAtMs = parseExpireAtToMs(account.expireAt)
+  if (Number.isFinite(expireAtMs) && expireAtMs < nowMs) return false
+
+  const occupancy = Number(account.userCount || 0) + Number(account.inviteCount || 0)
+  return occupancy < Number(capacityLimit || 0)
+}
+
+const isCodeBoundAccountEligible = (db, accountEmail, { cache, capacityLimit, nowMs }) => {
+  const normalizedEmail = normalizeEmail(accountEmail)
+  if (!normalizedEmail) return false
+  if (cache && cache.has(normalizedEmail)) return cache.get(normalizedEmail) === true
+
+  const account = getInvitableAccountByEmail(db, normalizedEmail)
+  const eligible = isInvitableAccountForCodeBinding(account, { capacityLimit, nowMs })
+  if (cache) cache.set(normalizedEmail, eligible)
+  return eligible
+}
 
 const getRedemptionCodeRowById = (db, id) => {
   const result = db.exec(
     `
       SELECT id, code, COALESCE(is_redeemed, 0), redeemed_at, redeemed_by, channel, channel_name,
-             reserved_for_order_no, reserved_for_order_email, reserved_for_uid, COALESCE(reserved_for_entry_id, 0)
+             reserved_for_order_no, reserved_for_order_email, reserved_for_uid, COALESCE(reserved_for_entry_id, 0),
+             account_email
       FROM redemption_codes
       WHERE id = ?
       LIMIT 1
@@ -315,21 +429,21 @@ const resolveOrderWarrantyInfo = (db, order) => {
     code: passphrase,
   })
   const orderType = normalizeOrderType(meta.orderType || ORDER_TYPE_WARRANTY)
-  const startAt = order?.redeemedAt || order?.inviteSentAt || order?.createdAt || null
+  const startAt = order?.warrantyAnchorAt || order?.redeemedAt || order?.inviteSentAt || order?.createdAt || null
+  const snapshotDays = Number(order?.warrantyServiceDaysSnapshot)
+  const serviceDaysFromMeta = Number(meta.serviceDays)
+  const serviceDays = Number.isFinite(snapshotDays) && snapshotDays > 0
+    ? Math.floor(snapshotDays)
+    : (
+      Number.isFinite(serviceDaysFromMeta) && serviceDaysFromMeta > 0
+        ? Math.floor(serviceDaysFromMeta)
+        : getDefaultWarrantyServiceDays()
+    )
 
-  const deadlineMsFromResolver = resolveOrderDeadlineMs(db, {
-    originalCodeId: normalizedCodeId || undefined,
-    originalCode: passphrase || undefined,
-    redeemedAt: startAt,
-    orderType,
-  })
-  let deadlineMs = Number(deadlineMsFromResolver)
-
-  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
-    const startMs = parseDateTimeToMs(startAt)
-    if (Number.isFinite(startMs)) {
-      deadlineMs = startMs + getDefaultWarrantyServiceDays() * DAY_MS
-    }
+  let deadlineMs = NaN
+  const startMs = parseDateTimeToMs(startAt)
+  if (Number.isFinite(startMs)) {
+    deadlineMs = startMs + serviceDays * DAY_MS
   }
 
   const windowEndsAt = Number.isFinite(deadlineMs) && deadlineMs > 0
@@ -338,7 +452,7 @@ const resolveOrderWarrantyInfo = (db, order) => {
 
   return {
     orderType,
-    serviceDays: Number.isFinite(Number(meta.serviceDays)) ? Number(meta.serviceDays) : null,
+    serviceDays,
     windowEndsAt,
     withinWarranty: !isNoWarrantyOrderType(orderType) && (
       !Number.isFinite(deadlineMs) || deadlineMs <= 0 || Date.now() <= deadlineMs
@@ -346,9 +460,53 @@ const resolveOrderWarrantyInfo = (db, order) => {
   }
 }
 
-const isAlipayRedpackCodeChannel = (value) => String(value || '').trim().toLowerCase() === ALIPAY_REDPACK_CHANNEL
+const resolveWarrantyServiceDaysSnapshot = (db, order) => {
+  const snapshotDays = Number(order?.warrantyServiceDaysSnapshot)
+  if (Number.isFinite(snapshotDays) && snapshotDays > 0) {
+    return Math.floor(snapshotDays)
+  }
+
+  const normalizedCodeId = toPositiveInt(order?.redemptionCodeId, 0)
+  const passphrase = normalizePassphrase(order?.alipayPassphrase)
+  const meta = getRedemptionCodeOrderMeta(db, {
+    codeId: normalizedCodeId,
+    code: passphrase,
+  })
+  const metaDays = Number(meta?.serviceDays)
+  if (Number.isFinite(metaDays) && metaDays > 0) {
+    return Math.floor(metaDays)
+  }
+  return getDefaultWarrantyServiceDays()
+}
+
+const normalizeChannelValue = (value) => String(value || '').trim().toLowerCase()
+const isAlipayRedpackCodeChannel = (channelValue, channelNameValue = '') => {
+  const normalizedChannel = normalizeChannelValue(channelValue)
+  if (ALIPAY_REDPACK_CHANNEL_ALIAS_SET.has(normalizedChannel)) return true
+  if (normalizedChannel) return false
+  return normalizeChannelValue(channelNameValue) === ALIPAY_REDPACK_CHANNEL_NAME_NORMALIZED
+}
 const buildOrderReservationNo = (orderId) => `${ALIPAY_REDPACK_ORDER_RESERVE_PREFIX}${orderId}`
 const isBlank = (value) => String(value ?? '').trim() === ''
+const isCodeRedeemedByOrder = (redeemedBy, orderId) => {
+  const normalizedOrderId = toPositiveInt(orderId, 0)
+  if (!normalizedOrderId) return false
+
+  const raw = String(redeemedBy || '').trim().toLowerCase()
+  if (!raw) return false
+
+  const segments = raw
+    .split('|')
+    .map((segment) => segment.replace(/\s+/g, '').trim())
+    .filter(Boolean)
+  if (segments.includes(`order:${normalizedOrderId}`) || segments.includes(`alipay_redpack_order:${normalizedOrderId}`)) {
+    return true
+  }
+
+  const orderTagRegex = new RegExp(`(?:^|\\W)order\\s*:\\s*${normalizedOrderId}(?!\\d)`)
+  const directOrderTagRegex = new RegExp(`(?:^|\\W)alipay_redpack_order\\s*:\\s*${normalizedOrderId}(?!\\d)`)
+  return orderTagRegex.test(raw) || directOrderTagRegex.test(raw)
+}
 
 const reserveAlipayRedpackCodeById = (db, codeId, { reservationNo, orderEmail }) => {
   const normalizedCodeId = toPositiveInt(codeId, 0)
@@ -365,7 +523,7 @@ const reserveAlipayRedpackCodeById = (db, codeId, { reservationNo, orderEmail })
           updated_at = DATETIME('now', 'localtime')
       WHERE id = ?
         AND COALESCE(is_redeemed, 0) = 0
-        AND COALESCE(NULLIF(lower(trim(channel)), ''), '') = ?
+        AND ${ALIPAY_REDPACK_CHANNEL_SQL_CONDITION}
         AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
         AND COALESCE(reserved_for_entry_id, 0) = 0
         AND (
@@ -380,30 +538,31 @@ const reserveAlipayRedpackCodeById = (db, codeId, { reservationNo, orderEmail })
       ALIPAY_REDPACK_CHANNEL,
       ALIPAY_REDPACK_CHANNEL_NAME,
       normalizedCodeId,
-      ALIPAY_REDPACK_CHANNEL,
       reservationNo,
     ]
   )
   return Number(db.getRowsModified?.() || 0) > 0
 }
 
-const selectAvailableAlipayRedpackCodeRow = (db) => {
+const listAvailableAlipayRedpackCodeRows = (db, limit = 200) => {
+  const normalizedLimit = Math.min(Math.max(toPositiveInt(limit, 200), 1), 2000)
   const result = db.exec(
     `
       SELECT id, code, COALESCE(is_redeemed, 0), redeemed_at, redeemed_by, channel, channel_name,
-             reserved_for_order_no, reserved_for_order_email, reserved_for_uid, COALESCE(reserved_for_entry_id, 0)
+             reserved_for_order_no, reserved_for_order_email, reserved_for_uid, COALESCE(reserved_for_entry_id, 0),
+             account_email
       FROM redemption_codes
       WHERE COALESCE(is_redeemed, 0) = 0
-        AND COALESCE(NULLIF(lower(trim(channel)), ''), '') = ?
+        AND ${ALIPAY_REDPACK_CHANNEL_SQL_CONDITION}
         AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
         AND COALESCE(reserved_for_entry_id, 0) = 0
         AND (reserved_for_order_no IS NULL OR trim(reserved_for_order_no) = '')
       ORDER BY datetime(created_at) ASC, id ASC
-      LIMIT 1
+      LIMIT ?
     `,
-    [ALIPAY_REDPACK_CHANNEL]
+    [normalizedLimit]
   )
-  return result?.[0]?.values?.[0] || null
+  return result?.[0]?.values || []
 }
 
 const releaseAlipayRedpackOrderCodeReservation = (
@@ -422,17 +581,14 @@ const releaseAlipayRedpackOrderCodeReservation = (
   if (!codeRow) return { released: false, restoredFromRedeemed: false }
 
   const code = mapRedemptionCodeRow(codeRow)
-  if (!isAlipayRedpackCodeChannel(code.channel)) {
+  if (!isAlipayRedpackCodeChannel(code.channel, code.channelName)) {
     return { released: false, restoredFromRedeemed: false }
   }
 
   if (code.isRedeemed) {
     if (!recoverRedeemed) return { released: false, restoredFromRedeemed: false }
 
-    const redeemedBy = String(code.redeemedBy || '').trim().toLowerCase()
-    const byOrderTag = redeemedBy.includes(`alipay_redpack_order:${orderId}`)
-      || redeemedBy.includes(`order:${orderId}`)
-    const byThisOrder = byOrderTag
+    const byThisOrder = isCodeRedeemedByOrder(code.redeemedBy, orderId)
     if (!byThisOrder) return { released: false, restoredFromRedeemed: false }
 
     db.run(
@@ -486,53 +642,113 @@ const ensureOrderRedemptionCodeLinked = (db, order) => {
 
   const reservationNo = buildOrderReservationNo(order.id)
   const normalizedOrderEmail = normalizeEmail(order.email)
+  const capacityLimit = getOpenAccountsCapacityLimit(db)
+  const nowMs = Date.now()
+  const accountEligibilityCache = new Map()
+
+  const clearOrderCodeBinding = (orderId) => {
+    db.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET redemption_code_id = NULL,
+            redemption_code_redeemed_at = NULL,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [Number(orderId)]
+    )
+  }
+
+  const releaseOrderCodeReservation = (codeId) => {
+    const normalizedCodeId = toPositiveInt(codeId, 0)
+    if (!normalizedCodeId) return
+    db.run(
+      `
+        UPDATE redemption_codes
+        SET reserved_for_order_no = NULL,
+            reserved_for_order_email = NULL,
+            reserved_at = NULL,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+          AND COALESCE(is_redeemed, 0) = 0
+          AND reserved_for_order_no = ?
+      `,
+      [normalizedCodeId, reservationNo]
+    )
+  }
+
+  const isCodeAccountEligibleForInvite = (accountEmail) => (
+    isCodeBoundAccountEligible(db, accountEmail, {
+      cache: accountEligibilityCache,
+      capacityLimit,
+      nowMs,
+    })
+  )
 
   const codeIdFromOrder = toPositiveInt(order.redemptionCodeId, 0)
   if (codeIdFromOrder > 0) {
     const existingById = getRedemptionCodeRowById(db, codeIdFromOrder)
     if (!existingById) {
-      throw new AlipayRedpackOrderError('订单关联兑换码不存在，请联系管理员处理', 409, 'alipay_redpack_code_missing')
-    }
-
-    if (!isAlipayRedpackCodeChannel(existingById[5])) {
-      throw new AlipayRedpackOrderError('订单关联兑换码渠道异常，请联系管理员处理', 409, 'alipay_redpack_code_channel_mismatch')
-    }
-
-    const mapped = mapRedemptionCodeRow(existingById)
-    if (mapped.isRedeemed) {
-      return mapped
-    }
-
-    const reservedForOrderNo = String(mapped.reservedForOrderNo || '').trim()
-    if (!isBlank(reservedForOrderNo) && reservedForOrderNo !== reservationNo) {
-      throw new AlipayRedpackOrderError('订单绑定兑换码已被其他订单占用，请联系管理员处理', 409, 'alipay_redpack_code_reserved_by_other')
-    }
-
-    if (!isBlank(mapped.reservedForUid) || Number(mapped.reservedForEntryId || 0) > 0) {
-      throw new AlipayRedpackOrderError('订单绑定兑换码当前不可用，请联系管理员处理', 409, 'alipay_redpack_code_unavailable')
-    }
-
-    if (reservedForOrderNo !== reservationNo) {
-      const reserved = reserveAlipayRedpackCodeById(db, codeIdFromOrder, {
-        reservationNo,
-        orderEmail: normalizedOrderEmail,
-      })
-      if (!reserved) {
-        throw new AlipayRedpackOrderError('订单兑换码占用失败，请稍后重试', 409, 'alipay_redpack_code_reserve_failed')
+      // 旧数据可能残留失效 code_id；自动清空后走库存重绑，避免处理链路被卡死。
+      clearOrderCodeBinding(order.id)
+    } else {
+      if (!isAlipayRedpackCodeChannel(existingById[5], existingById[6])) {
+        clearOrderCodeBinding(order.id)
+      } else {
+        const mapped = mapRedemptionCodeRow(existingById)
+        if (mapped.isRedeemed) {
+          if (isCodeRedeemedByOrder(mapped.redeemedBy, order.id)) {
+            return mapped
+          }
+          clearOrderCodeBinding(order.id)
+        } else {
+          const reservedForOrderNo = String(mapped.reservedForOrderNo || '').trim()
+          if (
+            !isBlank(reservedForOrderNo)
+            && reservedForOrderNo !== reservationNo
+          ) {
+            clearOrderCodeBinding(order.id)
+          } else if (!isBlank(mapped.reservedForUid) || Number(mapped.reservedForEntryId || 0) > 0) {
+            if (reservedForOrderNo === reservationNo) {
+              releaseOrderCodeReservation(mapped.id)
+            }
+            clearOrderCodeBinding(order.id)
+          } else if (!isCodeAccountEligibleForInvite(mapped.accountEmail)) {
+            if (reservedForOrderNo === reservationNo) {
+              releaseOrderCodeReservation(mapped.id)
+            }
+            clearOrderCodeBinding(order.id)
+          } else {
+            if (reservedForOrderNo !== reservationNo) {
+              const reserved = reserveAlipayRedpackCodeById(db, codeIdFromOrder, {
+                reservationNo,
+                orderEmail: normalizedOrderEmail,
+              })
+              if (!reserved) {
+                clearOrderCodeBinding(order.id)
+              } else {
+                const latestRow = getRedemptionCodeRowById(db, codeIdFromOrder)
+                if (latestRow) return mapRedemptionCodeRow(latestRow)
+                clearOrderCodeBinding(order.id)
+              }
+            } else {
+              const latestRow = getRedemptionCodeRowById(db, codeIdFromOrder)
+              if (latestRow) return mapRedemptionCodeRow(latestRow)
+              clearOrderCodeBinding(order.id)
+            }
+          }
+        }
       }
     }
-
-    const latestRow = getRedemptionCodeRowById(db, codeIdFromOrder)
-    if (!latestRow) {
-      throw new AlipayRedpackOrderError('订单兑换码状态异常，请联系管理员处理', 500, 'alipay_redpack_code_missing')
-    }
-    return mapRedemptionCodeRow(latestRow)
   }
 
   let selectedCodeId = 0
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidate = selectAvailableAlipayRedpackCodeRow(db)
-    if (!candidate) break
+  const candidates = listAvailableAlipayRedpackCodeRows(db, 500)
+  for (const candidate of candidates) {
+    const candidateMapped = mapRedemptionCodeRow(candidate)
+    if (!isCodeAccountEligibleForInvite(candidateMapped.accountEmail)) {
+      continue
+    }
 
     const candidateId = Number(candidate[0] || 0)
     if (!candidateId) continue
@@ -666,6 +882,164 @@ const buildStatusClause = (status) => {
   }
 }
 
+const normalizeDateOnly = (value, { fieldName = '日期' } = {}) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+
+  const match = raw.match(DATE_ONLY_REGEX)
+  if (!match) {
+    throw new AlipayRedpackOrderError(`${fieldName}格式无效，请使用 YYYY-MM-DD`, 400, 'alipay_redpack_invalid_date_filter')
+  }
+
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    throw new AlipayRedpackOrderError(`${fieldName}格式无效，请使用 YYYY-MM-DD`, 400, 'alipay_redpack_invalid_date_filter')
+  }
+
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    throw new AlipayRedpackOrderError(`${fieldName}无效，请检查后重试`, 400, 'alipay_redpack_invalid_date_filter')
+  }
+
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    throw new AlipayRedpackOrderError(`${fieldName}无效，请检查后重试`, 400, 'alipay_redpack_invalid_date_filter')
+  }
+
+  return `${year}-${pad2(month)}-${pad2(day)}`
+}
+
+const buildCreatedDateClause = ({ startDate, endDate } = {}) => {
+  const normalizedStartDate = normalizeDateOnly(startDate, { fieldName: '开始日期' })
+  const normalizedEndDate = normalizeDateOnly(endDate, { fieldName: '结束日期' })
+
+  if (normalizedStartDate && normalizedEndDate && normalizedStartDate > normalizedEndDate) {
+    throw new AlipayRedpackOrderError('开始日期不能晚于结束日期', 400, 'alipay_redpack_invalid_date_range')
+  }
+
+  const clauses = []
+  const params = []
+  if (normalizedStartDate) {
+    clauses.push('AND date(created_at) >= date(?)')
+    params.push(normalizedStartDate)
+  }
+  if (normalizedEndDate) {
+    clauses.push('AND date(created_at) <= date(?)')
+    params.push(normalizedEndDate)
+  }
+
+  return {
+    clause: clauses.join(' '),
+    params,
+  }
+}
+
+export const acquireAlipayRedpackOrderSupplementExecution = async (
+  orderId,
+  {
+    attemptWindowSec = getSupplementAttemptWindowSec(),
+    maxAttempts = getSupplementMaxAttemptsPerOrder(),
+    lockSec = getSupplementOrderLockSec(),
+  } = {}
+) => {
+  const normalizedOrderId = toPositiveInt(orderId, 0)
+  if (!normalizedOrderId) {
+    throw new AlipayRedpackOrderError('无效订单ID', 400, 'alipay_redpack_invalid_id')
+  }
+
+  const safeAttemptWindowSec = Math.max(60, Number(attemptWindowSec) || SUPPLEMENT_ATTEMPT_WINDOW_SEC_DEFAULT)
+  const safeMaxAttempts = Math.max(1, Number(maxAttempts) || SUPPLEMENT_MAX_ATTEMPTS_DEFAULT)
+  const safeLockSec = Math.max(10, Number(lockSec) || SUPPLEMENT_LOCK_SEC_DEFAULT)
+
+  const db = await getDatabase()
+  db.run('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    const order = getOrderByIdInternal(db, normalizedOrderId)
+    if (!order) {
+      throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
+    }
+    if (normalizeOrderStatus(order.status) === 'returned') {
+      throw new AlipayRedpackOrderError('该订单已退回，无法补录', 409, 'alipay_redpack_order_returned')
+    }
+
+    const nowMs = Date.now()
+    const lockUntilMs = parseDateTimeToMs(order.supplementLockUntil)
+    if (Number.isFinite(lockUntilMs) && lockUntilMs > nowMs) {
+      throw new AlipayRedpackOrderError('该订单补录处理中，请稍后再试', 409, 'alipay_redpack_supplement_processing')
+    }
+
+    const lastSupplementMs = parseDateTimeToMs(order.lastSupplementAt)
+    const inAttemptWindow = Number.isFinite(lastSupplementMs)
+      && nowMs - lastSupplementMs <= safeAttemptWindowSec * 1000
+    const currentAttempts = inAttemptWindow ? Math.max(0, Number(order.supplementAttemptCount || 0)) : 0
+    if (inAttemptWindow && currentAttempts >= safeMaxAttempts) {
+      throw new AlipayRedpackOrderError('该订单补录过于频繁，请稍后再试', 429, 'alipay_redpack_supplement_attempt_limited')
+    }
+
+    const nextAttempts = currentAttempts + 1
+    const lockToken = crypto.randomBytes(16).toString('hex')
+    db.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET supplement_attempt_count = ?,
+            last_supplement_at = DATETIME('now', 'localtime'),
+            supplement_lock_until = DATETIME('now', 'localtime', ?),
+            supplement_lock_token = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [nextAttempts, `+${safeLockSec} seconds`, lockToken, normalizedOrderId]
+    )
+    db.run('COMMIT')
+    await saveDatabase()
+
+    return {
+      orderId: normalizedOrderId,
+      lockToken,
+      attemptCount: nextAttempts,
+      maxAttempts: safeMaxAttempts,
+      attemptWindowSec: safeAttemptWindowSec,
+      lockSec: safeLockSec,
+    }
+  } catch (error) {
+    try {
+      db.run('ROLLBACK')
+    } catch {
+      // ignore rollback errors
+    }
+    throw error
+  }
+}
+
+export const releaseAlipayRedpackOrderSupplementExecution = async (orderId, lockToken) => {
+  const normalizedOrderId = toPositiveInt(orderId, 0)
+  const normalizedLockToken = String(lockToken || '').trim()
+  if (!normalizedOrderId || !normalizedLockToken) return false
+
+  const db = await getDatabase()
+  db.run(
+    `
+      UPDATE alipay_redpack_orders
+      SET supplement_lock_until = NULL,
+          supplement_lock_token = NULL,
+          updated_at = DATETIME('now', 'localtime')
+      WHERE id = ?
+        AND supplement_lock_token = ?
+    `,
+    [normalizedOrderId, normalizedLockToken]
+  )
+  const released = Number(db.getRowsModified?.() || 0) > 0
+  if (released) {
+    await saveDatabase()
+  }
+  return released
+}
+
 export const getAlipayRedpackOrderById = async (id) => {
   const normalizedId = toPositiveInt(id)
   if (!normalizedId) return null
@@ -766,6 +1140,9 @@ export const getAlipayRedpackSupplementCandidateByOrder = async ({
   const normalizedStatus = normalizeOrderStatus(order.status)
   if (normalizedStatus === 'returned') {
     throw new AlipayRedpackOrderError('该订单已退回，无法补录，请重新提交有效口令', 409, 'alipay_redpack_order_returned')
+  }
+  if (!allowPending && normalizedStatus === 'invited') {
+    throw new AlipayRedpackOrderError('该订单仍处于已邀请状态，暂不支持自动补录', 409, 'alipay_redpack_invited_not_supplementable')
   }
   if (!allowPending && normalizedStatus === 'pending') {
     throw new AlipayRedpackOrderError('该订单仍在待处理中，暂不支持补录', 409, 'alipay_redpack_pending_not_supplementable')
@@ -891,6 +1268,16 @@ export const prepareAlipayRedpackOrderForAutoSupplement = async (
     }
 
     const code = ensureOrderRedemptionCodeLinked(db, refreshed)
+    const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, refreshed)
+    db.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [warrantySnapshotDays, normalizedId]
+    )
     db.run('COMMIT')
     await saveDatabase()
 
@@ -910,23 +1297,38 @@ export const prepareAlipayRedpackOrderForAutoSupplement = async (
 
 export const getAlipayRedpackRedemptionCodeStockSummary = async () => {
   const db = await getDatabase()
+  const capacityLimit = getOpenAccountsCapacityLimit(db)
+  const nowMs = Date.now()
+  const accountEligibilityCache = new Map()
+
+  const availableRowsResult = db.exec(
+    `
+      SELECT account_email
+      FROM redemption_codes
+      WHERE COALESCE(is_redeemed, 0) = 0
+        AND ${ALIPAY_REDPACK_CHANNEL_SQL_CONDITION}
+        AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
+        AND COALESCE(reserved_for_entry_id, 0) = 0
+        AND (reserved_for_order_no IS NULL OR trim(reserved_for_order_no) = '')
+    `
+  )
+  const availableRows = availableRowsResult?.[0]?.values || []
+  let availableCount = 0
+  for (const row of availableRows) {
+    const accountEmail = String(row?.[0] || '').trim().toLowerCase()
+    if (!isCodeBoundAccountEligible(db, accountEmail, { cache: accountEligibilityCache, capacityLimit, nowMs })) {
+      continue
+    }
+    availableCount += 1
+  }
+
   const result = db.exec(
     `
       SELECT
         SUM(
           CASE
             WHEN COALESCE(is_redeemed, 0) = 0
-              AND COALESCE(NULLIF(lower(trim(channel)), ''), '') = ?
-              AND (reserved_for_uid IS NULL OR trim(reserved_for_uid) = '')
-              AND COALESCE(reserved_for_entry_id, 0) = 0
-              AND (reserved_for_order_no IS NULL OR trim(reserved_for_order_no) = '')
-            THEN 1 ELSE 0
-          END
-        ) AS available_count,
-        SUM(
-          CASE
-            WHEN COALESCE(is_redeemed, 0) = 0
-              AND COALESCE(NULLIF(lower(trim(channel)), ''), '') = ?
+              AND ${ALIPAY_REDPACK_CHANNEL_SQL_CONDITION}
               AND reserved_for_order_no LIKE ?
             THEN 1 ELSE 0
           END
@@ -934,7 +1336,7 @@ export const getAlipayRedpackRedemptionCodeStockSummary = async () => {
         SUM(
           CASE
             WHEN COALESCE(is_redeemed, 0) = 0
-              AND COALESCE(NULLIF(lower(trim(channel)), ''), '') = ?
+              AND ${ALIPAY_REDPACK_CHANNEL_SQL_CONDITION}
             THEN 1 ELSE 0
           END
         ) AS total_unused_count
@@ -942,17 +1344,14 @@ export const getAlipayRedpackRedemptionCodeStockSummary = async () => {
     `
     ,
     [
-      ALIPAY_REDPACK_CHANNEL,
-      ALIPAY_REDPACK_CHANNEL,
       `${ALIPAY_REDPACK_ORDER_RESERVE_PREFIX}%`,
-      ALIPAY_REDPACK_CHANNEL,
     ]
   )
   const row = result?.[0]?.values?.[0] || []
   return {
-    availableCount: Number(row[0] || 0),
-    reservedCount: Number(row[1] || 0),
-    totalUnusedCount: Number(row[2] || 0),
+    availableCount: Number(availableCount || 0),
+    reservedCount: Number(row[0] || 0),
+    totalUnusedCount: Number(row[1] || 0),
   }
 }
 
@@ -1221,6 +1620,20 @@ export const createAlipayRedpackOrderPublic = async ({ email, alipayPassphrase, 
     }
 
     ensureOrderRedemptionCodeLinked(db, created)
+    const afterLinked = getOrderByIdInternal(db, createdId)
+    if (!afterLinked) {
+      throw new AlipayRedpackOrderError('订单创建失败，请稍后重试', 500, 'alipay_redpack_create_failed')
+    }
+    const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, afterLinked)
+    db.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [warrantySnapshotDays, createdId]
+    )
     db.run('COMMIT')
     await saveDatabase()
 
@@ -1321,16 +1734,24 @@ export const supplementAlipayRedpackOrderPublic = async ({ email, alipayPassphra
   }
 }
 
-export const listAlipayRedpackOrdersAdmin = async ({ search = '', status = 'all', limit = 200, offset = 0 } = {}) => {
+export const listAlipayRedpackOrdersAdmin = async ({
+  search = '',
+  status = 'all',
+  startDate = '',
+  endDate = '',
+  limit = 200,
+  offset = 0
+} = {}) => {
   const normalizedLimit = Math.min(Math.max(toPositiveInt(limit, 200), 1), 1000)
   const normalizedOffset = Math.max(toPositiveInt(offset, 0), 0)
 
   const statusClause = buildStatusClause(status)
   const searchClause = buildSearchClause(search)
+  const createdDateClause = buildCreatedDateClause({ startDate, endDate })
 
   const db = await getDatabase()
-  const whereSql = `WHERE 1 = 1 ${statusClause.clause} ${searchClause.clause}`
-  const whereParams = [...statusClause.params, ...searchClause.params]
+  const whereSql = `WHERE 1 = 1 ${statusClause.clause} ${searchClause.clause} ${createdDateClause.clause}`
+  const whereParams = [...statusClause.params, ...searchClause.params, ...createdDateClause.params]
 
   const totalResult = db.exec(
     `SELECT COUNT(*) FROM alipay_redpack_orders ${whereSql}`,
@@ -1340,10 +1761,7 @@ export const listAlipayRedpackOrdersAdmin = async ({ search = '', status = 'all'
 
   const rowsResult = db.exec(
     `
-      SELECT id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
-             invited_account_id, invited_account_email, invite_sent_at, redeemed_at,
-             operator_user_id, operator_username, created_at, updated_at,
-             (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+      SELECT ${ORDER_SELECT_COLUMNS}
       FROM alipay_redpack_orders
       ${whereSql}
       ORDER BY datetime(created_at) DESC, id DESC
@@ -1372,6 +1790,9 @@ export const ensureAlipayRedpackOrderRedemptionCode = async (id) => {
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
   }
+  if (normalizeOrderStatus(existing.status) === 'returned') {
+    throw new AlipayRedpackOrderError('该订单已退回，无法消耗兑换码', 409, 'alipay_redpack_order_returned')
+  }
 
   const code = ensureOrderRedemptionCodeLinked(db, existing)
   await saveDatabase()
@@ -1397,6 +1818,9 @@ export const consumeAlipayRedpackOrderRedemptionCode = async (
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
   }
+  if (normalizeOrderStatus(existing.status) === 'returned') {
+    throw new AlipayRedpackOrderError('该订单已退回，无法消耗兑换码', 409, 'alipay_redpack_order_returned')
+  }
 
   const reservationNo = buildOrderReservationNo(normalizedId)
   const linkedCode = ensureOrderRedemptionCodeLinked(db, existing)
@@ -1405,6 +1829,9 @@ export const consumeAlipayRedpackOrderRedemptionCode = async (
   }
 
   if (linkedCode.isRedeemed) {
+    if (!isCodeRedeemedByOrder(linkedCode.redeemedBy, normalizedId)) {
+      throw new AlipayRedpackOrderError('订单占用的兑换码已失效，请重新下单', 409, 'alipay_redpack_code_reservation_lost')
+    }
     const redeemedAt = linkedCode.redeemedAt || new Date().toISOString()
     markOrderRedemptionCodeRedeemedAt(db, normalizedId, redeemedAt)
     await saveDatabase()
@@ -1431,11 +1858,7 @@ export const consumeAlipayRedpackOrderRedemptionCode = async (
           updated_at = DATETIME('now', 'localtime')
       WHERE id = ?
         AND COALESCE(is_redeemed, 0) = 0
-        AND (
-          reserved_for_order_no = ?
-          OR reserved_for_order_no IS NULL
-          OR trim(reserved_for_order_no) = ''
-        )
+        AND reserved_for_order_no = ?
     `,
     [finalRedeemedBy, ALIPAY_REDPACK_CHANNEL, ALIPAY_REDPACK_CHANNEL_NAME, linkedCode.id, reservationNo]
   )
@@ -1444,6 +1867,9 @@ export const consumeAlipayRedpackOrderRedemptionCode = async (
   const latestCodeRow = getRedemptionCodeRowById(db, linkedCode.id)
   const latestCode = latestCodeRow ? mapRedemptionCodeRow(latestCodeRow) : linkedCode
   if (modified <= 0 && latestCode?.isRedeemed) {
+    if (!isCodeRedeemedByOrder(latestCode.redeemedBy, normalizedId)) {
+      throw new AlipayRedpackOrderError('订单占用的兑换码已失效，请重新下单', 409, 'alipay_redpack_code_reservation_lost')
+    }
     const redeemedAt = latestCode.redeemedAt || new Date().toISOString()
     markOrderRedemptionCodeRedeemedAt(db, normalizedId, redeemedAt)
     await saveDatabase()
@@ -1486,12 +1912,20 @@ export const rollbackAlipayRedpackOrderRedemptionCodeConsume = async ({ orderId,
   const db = await getDatabase()
   const order = getOrderByIdInternal(db, normalizedOrderId)
   if (!order || Number(order.redemptionCodeId || 0) !== normalizedCodeId) return null
+  if (normalizeOrderStatus(order.status) === 'returned') {
+    return {
+      order,
+      code: null,
+      rolledBack: false,
+      skipped: true,
+    }
+  }
 
   const reservationNo = buildOrderReservationNo(normalizedOrderId)
   const codeRow = getRedemptionCodeRowById(db, normalizedCodeId)
   if (!codeRow) return null
   const code = mapRedemptionCodeRow(codeRow)
-  if (!isAlipayRedpackCodeChannel(code.channel)) return { order, code, rolledBack: false }
+  if (!isAlipayRedpackCodeChannel(code.channel, code.channelName)) return { order, code, rolledBack: false }
 
   let rolledBack = false
 
@@ -1546,6 +1980,13 @@ export const markAlipayRedpackOrderInviteFailed = async (
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
   }
+  const existingOrder = mapOrderRow(existing)
+  if (normalizeOrderStatus(existingOrder.status) === 'redeemed') {
+    return existingOrder
+  }
+  if (normalizeOrderStatus(existingOrder.status) === 'returned') {
+    return existingOrder
+  }
 
   db.run(
     `
@@ -1588,6 +2029,14 @@ export const markAlipayRedpackOrderInvited = async (
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
   }
+  const existingOrder = mapOrderRow(existing)
+  if (normalizeOrderStatus(existingOrder.status) === 'redeemed') {
+    return existingOrder
+  }
+  if (normalizeOrderStatus(existingOrder.status) === 'returned') {
+    return existingOrder
+  }
+  const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, existingOrder)
 
   db.run(
     `
@@ -1597,6 +2046,8 @@ export const markAlipayRedpackOrderInvited = async (
           invited_account_id = ?,
           invited_account_email = ?,
           invite_sent_at = COALESCE(invite_sent_at, DATETIME('now', 'localtime')),
+          warranty_anchor_at = COALESCE(warranty_anchor_at, DATETIME('now', 'localtime')),
+          warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
           operator_user_id = ?,
           operator_username = ?,
           updated_at = DATETIME('now', 'localtime')
@@ -1606,6 +2057,7 @@ export const markAlipayRedpackOrderInvited = async (
       String(inviteResult ?? '').trim() || '邀请已发送',
       toPositiveInt(invitedAccountId, 0) || null,
       String(invitedAccountEmail ?? '').trim() || null,
+      warrantySnapshotDays,
       toPositiveInt(operatorUserId, 0) || null,
       String(operatorUsername ?? '').trim() || null,
       normalizedId
@@ -1635,6 +2087,11 @@ export const markAlipayRedpackOrderRedeemed = async (
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
   }
+  const existingOrder = mapOrderRow(existing)
+  if (normalizeOrderStatus(existingOrder.status) === 'returned') {
+    return existingOrder
+  }
+  const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, existingOrder)
 
   db.run(
     `
@@ -1645,6 +2102,8 @@ export const markAlipayRedpackOrderRedeemed = async (
           invited_account_email = ?,
           invite_sent_at = COALESCE(invite_sent_at, DATETIME('now', 'localtime')),
           redeemed_at = COALESCE(redeemed_at, DATETIME('now', 'localtime')),
+          warranty_anchor_at = COALESCE(warranty_anchor_at, DATETIME('now', 'localtime')),
+          warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
           operator_user_id = ?,
           operator_username = ?,
           updated_at = DATETIME('now', 'localtime')
@@ -1654,6 +2113,7 @@ export const markAlipayRedpackOrderRedeemed = async (
       String(inviteResult ?? '').trim() || '已兑换',
       toPositiveInt(invitedAccountId, 0) || null,
       String(invitedAccountEmail ?? '').trim() || null,
+      warrantySnapshotDays,
       toPositiveInt(operatorUserId, 0) || null,
       String(operatorUsername ?? '').trim() || null,
       normalizedId
@@ -1744,6 +2204,10 @@ export const updateAlipayRedpackOrderInviteResult = async (
   const existing = getOrderRowById(db, normalizedId)
   if (!existing) {
     throw new AlipayRedpackOrderError('订单不存在', 404, 'alipay_redpack_not_found')
+  }
+  const existingOrder = mapOrderRow(existing)
+  if (normalizeOrderStatus(existingOrder.status) === 'returned') {
+    return existingOrder
   }
 
   db.run(

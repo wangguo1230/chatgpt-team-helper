@@ -23,15 +23,16 @@ const pageError = ref('')
 
 const searchQuery = ref('')
 const statusFilter = ref<'all' | 'pending' | 'invited' | 'redeemed' | 'returned'>('all')
+const startDateFilter = ref('')
+const endDateFilter = ref('')
 
 const quickInvitingId = ref<number | null>(null)
 const savingNoteId = ref<number | null>(null)
 const returningOrderId = ref<number | null>(null)
+const syncingStatusOrderId = ref<number | null>(null)
 const quickInviteAccounts = ref<GptAccount[]>([])
-const quickInviteAccountSelections = ref<Record<number, string>>({})
 const processDialogOpen = ref(false)
 const processingOrder = ref<AlipayRedpackOrder | null>(null)
-const processAccountSelection = ref('auto')
 
 const noteDrafts = ref<Record<number, string>>({})
 const noteSavedSnapshots = ref<Record<number, string>>({})
@@ -42,6 +43,18 @@ const dateFormatOptions = computed(() => ({
   locale: appConfigStore.locale,
 }))
 const formatDate = (value?: string | null) => formatShanghaiDate(value, dateFormatOptions.value)
+const parseAccountExpireAtMs = (value?: string | null) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const match = raw.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/)
+  if (match) {
+    const iso = `${match[1]}-${String(Number(match[2])).padStart(2, '0')}-${String(Number(match[3])).padStart(2, '0')}T${String(Number(match[4])).padStart(2, '0')}:${match[5]}:${String(Number(match[6] || 0)).padStart(2, '0')}+08:00`
+    const parsed = Date.parse(iso)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  const parsed = Date.parse(raw)
+  return Number.isFinite(parsed) ? parsed : null
+}
 
 const statusText = (status?: string) => {
   if (status === 'pending') return '待处理'
@@ -65,6 +78,46 @@ const redemptionCodeStateText = (order: AlipayRedpackOrder) => {
   return '未关联'
 }
 
+const accountById = computed(() => {
+  const map = new Map<number, GptAccount>()
+  for (const account of quickInviteAccounts.value) {
+    const id = Number(account?.id || 0)
+    if (id > 0) map.set(id, account)
+  }
+  return map
+})
+const resolveInvitedAccountStatus = (order?: AlipayRedpackOrder | null) => {
+  const accountId = Number(order?.invitedAccountId || 0)
+  if (!Number.isFinite(accountId) || accountId <= 0) {
+    return { text: '未绑定邀请账号', className: 'text-gray-400' }
+  }
+  const account = accountById.value.get(accountId)
+  if (!account) {
+    return { text: '账号状态未知（待同步）', className: 'text-amber-600' }
+  }
+  if (Boolean(account.isBanned)) {
+    return { text: '账号已封禁', className: 'text-rose-600' }
+  }
+  const expireAtMs = parseAccountExpireAtMs(account.expireAt || null)
+  if (typeof expireAtMs === 'number' && Number.isFinite(expireAtMs) && expireAtMs < Date.now()) {
+    return { text: '账号已过期', className: 'text-rose-600' }
+  }
+  if (!Boolean(account.isOpen)) {
+    return { text: '账号未开放', className: 'text-amber-600' }
+  }
+  return { text: '账号正常', className: 'text-emerald-600' }
+}
+const invitedAccountStatusText = (order?: AlipayRedpackOrder | null) => resolveInvitedAccountStatus(order).text
+const invitedAccountStatusClass = (order?: AlipayRedpackOrder | null) => resolveInvitedAccountStatus(order).className
+const formatOperatorDisplay = (operatorUsername?: string | null) => {
+  const raw = String(operatorUsername || '').trim()
+  if (!raw) return '-'
+  if (raw === 'system:alipay_redpack_invited_sync') return '系统任务：邀请状态同步'
+  if (raw === 'system:alipay_redpack') return '系统任务：支付宝红包流程'
+  if (raw.startsWith('system:alipay_redpack')) return '系统任务：支付宝红包流程'
+  return raw
+}
+
 const handleAuthError = (err: any) => {
   if (err?.response?.status === 401 || err?.response?.status === 403) {
     authService.logout()
@@ -74,34 +127,15 @@ const handleAuthError = (err: any) => {
   return false
 }
 
-const quickInviteAccountOptions = computed(() => {
-  return [...quickInviteAccounts.value]
-    .filter((account) => {
-      if (!Boolean(account?.isOpen) || Boolean(account?.isBanned)) return false
-
-      if (typeof account?.quickInviteEligible === 'boolean') {
-        return account.quickInviteEligible
-      }
-
-      const occupancy = Number(account?.userCount || 0) + Number(account?.inviteCount || 0)
-      const capacityLimit = Number(account?.quickInviteCapacityLimit || 0)
-      const underCapacity = !Number.isFinite(capacityLimit) || capacityLimit <= 0 || occupancy < capacityLimit
-      const codeTotal = Number(account?.directInviteCodeTotal || 0)
-      const codeAvailable = Number(account?.directInviteCodeAvailable || 0)
-      const codeEligible = codeTotal <= 0 || codeAvailable > 0
-      return underCapacity && codeEligible
-    })
-    .sort((a, b) => {
-      const aLoad = Number(a.userCount || 0) + Number(a.inviteCount || 0)
-      const bLoad = Number(b.userCount || 0) + Number(b.inviteCount || 0)
-      if (aLoad !== bLoad) return aLoad - bLoad
-      return Number(a.id || 0) - Number(b.id || 0)
-    })
-})
-
 const canProcessOrder = (order?: AlipayRedpackOrder | null) => {
   const status = String(order?.status || '').trim().toLowerCase()
   return status !== 'redeemed' && status !== 'returned'
+}
+const canSyncOrderStatus = (order?: AlipayRedpackOrder | null) => {
+  const status = String(order?.status || '').trim().toLowerCase()
+  const accountId = Number(order?.invitedAccountId || 0)
+  if (status === 'redeemed' || status === 'returned') return false
+  return Number.isFinite(accountId) && accountId > 0
 }
 
 const applyOrder = (updated: AlipayRedpackOrder) => {
@@ -114,17 +148,23 @@ const applyOrder = (updated: AlipayRedpackOrder) => {
   }
   noteDrafts.value[updated.id] = String(updated.note || '')
   noteSavedSnapshots.value[updated.id] = String(updated.note || '')
-  if (!quickInviteAccountSelections.value[updated.id]) {
-    quickInviteAccountSelections.value[updated.id] = 'auto'
-  }
 }
 
 const fetchOrders = async () => {
+  if (startDateFilter.value && endDateFilter.value && startDateFilter.value > endDateFilter.value) {
+    pageError.value = '开始日期不能晚于结束日期'
+    orders.value = []
+    total.value = 0
+    return
+  }
+
   loading.value = true
   try {
     const response = await alipayRedpackService.adminListOrders({
       search: searchQuery.value.trim() || undefined,
       status: statusFilter.value,
+      startDate: startDateFilter.value || undefined,
+      endDate: endDateFilter.value || undefined,
       limit: 1000,
       offset: 0,
     })
@@ -140,12 +180,6 @@ const fetchOrders = async () => {
     }
     noteDrafts.value = drafts
     noteSavedSnapshots.value = snapshots
-
-    const nextSelections: Record<number, string> = {}
-    for (const item of orders.value) {
-      nextSelections[item.id] = quickInviteAccountSelections.value[item.id] || 'auto'
-    }
-    quickInviteAccountSelections.value = nextSelections
 
     pageError.value = ''
   } catch (err: any) {
@@ -166,7 +200,6 @@ const loadQuickInviteAccounts = async ({ silent = false } = {}) => {
     const response = await gptAccountService.getAll({
       page: 1,
       pageSize: 1000,
-      openStatus: 'open'
     })
     quickInviteAccounts.value = response?.accounts || []
   } catch (err: any) {
@@ -190,6 +223,13 @@ const refreshAll = async () => {
   } finally {
     refreshing.value = false
   }
+}
+
+const clearDateFilter = async () => {
+  if (!startDateFilter.value && !endDateFilter.value) return
+  startDateFilter.value = ''
+  endDateFilter.value = ''
+  await fetchOrders()
 }
 
 watch(searchQuery, () => {
@@ -218,7 +258,6 @@ const openProcessDialog = (order: AlipayRedpackOrder) => {
   }
 
   processingOrder.value = order
-  processAccountSelection.value = String(quickInviteAccountSelections.value[order.id] || 'auto')
   processDialogOpen.value = true
 }
 
@@ -226,7 +265,6 @@ const closeProcessDialog = () => {
   if (quickInvitingId.value) return
   processDialogOpen.value = false
   processingOrder.value = null
-  processAccountSelection.value = 'auto'
 }
 
 const runAutoSyncAfterProcess = async (orderId: number, order: AlipayRedpackOrder | null) => {
@@ -270,15 +308,9 @@ const handleProcessOrder = async () => {
   }
 
   quickInvitingId.value = order.id
+  let shouldCloseDialog = false
   try {
-    quickInviteAccountSelections.value[order.id] = processAccountSelection.value
-    const selectedAccount = String(processAccountSelection.value || 'auto')
-    const selectedAccountId = selectedAccount !== 'auto' ? Number(selectedAccount) : NaN
-    const payload = Number.isFinite(selectedAccountId) && selectedAccountId > 0
-      ? { accountId: selectedAccountId }
-      : undefined
-
-    const response = await alipayRedpackService.adminQuickInvite(order.id, payload)
+    const response = await alipayRedpackService.adminQuickInvite(order.id)
     let latestOrder: AlipayRedpackOrder | null = response?.order || null
     if (latestOrder) {
       applyOrder(latestOrder)
@@ -290,7 +322,7 @@ const handleProcessOrder = async () => {
     }
 
     showSuccessToast('处理完成，已自动同步状态并执行账号同步自查')
-    closeProcessDialog()
+    shouldCloseDialog = true
   } catch (err: any) {
     if (handleAuthError(err)) {
       showErrorToast('登录状态已过期，请重新登录')
@@ -303,6 +335,9 @@ const handleProcessOrder = async () => {
     showErrorToast(message)
   } finally {
     quickInvitingId.value = null
+    if (shouldCloseDialog) {
+      closeProcessDialog()
+    }
   }
 }
 
@@ -345,6 +380,58 @@ const handleReturnOrder = async (order: AlipayRedpackOrder) => {
     showErrorToast(message)
   } finally {
     returningOrderId.value = null
+  }
+}
+
+const handleSyncOrderStatus = async (order: AlipayRedpackOrder) => {
+  if (!order?.id) return
+  if (!canSyncOrderStatus(order)) {
+    showInfoToast('该订单当前不可同步状态')
+    return
+  }
+
+  syncingStatusOrderId.value = order.id
+  try {
+    const response = await alipayRedpackService.adminSyncStatus(order.id)
+    const updatedOrder = response?.order || null
+    if (updatedOrder) {
+      applyOrder(updatedOrder)
+    }
+
+    const currentOrder = updatedOrder || order
+    const accountId = Number(currentOrder?.invitedAccountId || 0)
+    if (Number.isFinite(accountId) && accountId > 0) {
+      try {
+        await gptAccountService.syncUserCount(accountId)
+        await loadQuickInviteAccounts({ silent: true })
+      } catch (syncErr: any) {
+        if (!handleAuthError(syncErr)) {
+          const warningMessage = syncErr?.response?.data?.error || '账号同步失败，已保留订单最新状态'
+          showWarningToast(warningMessage)
+        }
+      }
+    }
+
+    const queueState = response?.queueState
+    if (queueState?.isMember) {
+      showSuccessToast('同步完成：该邮箱已在母账号内（已上车）')
+    } else if (queueState?.isInvited) {
+      showSuccessToast('同步完成：该邮箱仍处于邀请中')
+    } else {
+      showSuccessToast('同步完成：未检索到邀请或成员记录')
+    }
+  } catch (err: any) {
+    if (handleAuthError(err)) {
+      showErrorToast('登录状态已过期，请重新登录')
+      return
+    }
+    if (err?.response?.data?.order) {
+      applyOrder(err.response.data.order)
+    }
+    const message = err?.response?.data?.error || '同步订单状态失败'
+    showErrorToast(message)
+  } finally {
+    syncingStatusOrderId.value = null
   }
 }
 
@@ -423,6 +510,35 @@ onUnmounted(() => {
           </select>
         </div>
 
+        <div class="space-y-1">
+          <Label class="text-xs text-gray-500">开始日期</Label>
+          <Input
+            v-model="startDateFilter"
+            type="date"
+            class="w-[165px]"
+            @change="fetchOrders"
+          />
+        </div>
+
+        <div class="space-y-1">
+          <Label class="text-xs text-gray-500">结束日期</Label>
+          <Input
+            v-model="endDateFilter"
+            type="date"
+            class="w-[165px]"
+            @change="fetchOrders"
+          />
+        </div>
+
+        <Button
+          variant="outline"
+          class="h-10"
+          :disabled="!startDateFilter && !endDateFilter"
+          @click="clearDateFilter"
+        >
+          清空日期
+        </Button>
+
         <Button variant="outline" :disabled="refreshing" @click="refreshAll" class="h-10">
           <RefreshCw class="w-4 h-4 mr-2" :class="{ 'animate-spin': refreshing }" />
           刷新
@@ -434,7 +550,7 @@ onUnmounted(() => {
       {{ pageError }}
     </div>
 
-    <div class="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
       <div v-if="loading" class="py-16 flex flex-col items-center justify-center text-gray-500">
         <Loader2 class="w-6 h-6 animate-spin" />
         <p class="mt-3 text-sm">加载中...</p>
@@ -446,50 +562,80 @@ onUnmounted(() => {
       </div>
 
       <div v-else class="overflow-x-auto">
-        <table class="w-full min-w-[1180px]">
-          <thead>
-            <tr class="bg-gray-50 border-b border-gray-100 text-xs uppercase tracking-wide text-gray-400">
-              <th class="px-4 py-3 text-left">邮箱</th>
-              <th class="px-4 py-3 text-left">支付宝口令</th>
-              <th class="px-4 py-3 text-left">兑换码记录</th>
-              <th class="px-4 py-3 text-left">状态</th>
-              <th class="px-4 py-3 text-left">邀请结果</th>
-              <th class="px-4 py-3 text-left">备注</th>
-              <th class="px-4 py-3 text-left">操作人</th>
-              <th class="px-4 py-3 text-left">时间</th>
-              <th class="px-4 py-3 text-left">操作</th>
+        <table class="w-full min-w-[1840px] table-fixed">
+          <colgroup>
+            <col class="w-[220px]" />
+            <col class="w-[180px]" />
+            <col class="w-[260px]" />
+            <col class="w-[120px]" />
+            <col class="w-[320px]" />
+            <col class="w-[210px]" />
+            <col class="w-[220px]" />
+            <col class="w-[170px]" />
+            <col class="w-[140px]" />
+          </colgroup>
+          <thead class="sticky top-0 z-10">
+            <tr class="bg-slate-50 border-b border-slate-200 text-xs font-semibold tracking-wide text-slate-600">
+              <th class="px-4 py-3 text-left whitespace-nowrap">邮箱</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">支付宝口令</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">兑换码记录</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">状态</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">邀请结果</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">时间</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">备注</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">操作人</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap sticky right-0 z-30 bg-slate-50 border-l border-slate-200 shadow-[-4px_0_8px_-8px_rgba(15,23,42,0.5)]">操作</th>
             </tr>
           </thead>
-          <tbody class="divide-y divide-gray-50 text-sm">
-            <tr v-for="order in orders" :key="order.id" class="hover:bg-gray-50/60">
-              <td class="px-4 py-3">
-                <div class="font-medium text-gray-900">{{ order.email }}</div>
+          <tbody class="divide-y divide-slate-100 text-sm">
+            <tr v-for="order in orders" :key="order.id" class="group hover:bg-cyan-50/40 transition-colors">
+              <td class="px-4 py-3 align-top">
+                <div class="font-medium text-gray-900 truncate" :title="order.email">{{ order.email }}</div>
                 <div class="text-xs text-gray-400">ID: {{ order.id }}</div>
               </td>
-              <td class="px-4 py-3">
-                <span class="font-mono text-gray-800">{{ order.alipayPassphrase }}</span>
+              <td class="px-4 py-3 align-top">
+                <span class="font-mono text-gray-800 break-all" :title="order.alipayPassphrase">{{ order.alipayPassphrase }}</span>
               </td>
-              <td class="px-4 py-3 text-xs">
-                <p class="text-gray-700">兑换码Code：{{ order.redemptionCode || '-' }}</p>
-                <p class="text-gray-500 mt-1">兑换码ID：{{ order.redemptionCodeId || '-' }}</p>
-                <p class="text-gray-500 mt-1">状态：{{ redemptionCodeStateText(order) }}</p>
-                <p v-if="order.redemptionCodeRedeemedAt" class="text-gray-400 mt-1">消耗：{{ formatDate(order.redemptionCodeRedeemedAt) }}</p>
+              <td class="px-4 py-3 text-xs leading-5 align-top">
+                <div class="rounded-lg border border-slate-100 bg-slate-50 p-2.5">
+                  <p class="text-slate-700">兑换码Code：{{ order.redemptionCode || '-' }}</p>
+                  <p class="text-slate-500">兑换码ID：{{ order.redemptionCodeId || '-' }}</p>
+                  <p class="text-slate-500">状态：{{ redemptionCodeStateText(order) }}</p>
+                  <p v-if="order.redemptionCodeRedeemedAt" class="text-slate-400">消耗：{{ formatDate(order.redemptionCodeRedeemedAt) }}</p>
+                </div>
               </td>
-              <td class="px-4 py-3">
-                <span class="inline-flex px-2.5 py-1 rounded-full border text-xs font-semibold" :class="statusClass(order.status)">
+              <td class="px-4 py-3 align-top">
+                <span class="inline-flex items-center px-2.5 py-1 rounded-full border text-[11px] font-semibold" :class="statusClass(order.status)">
                   {{ statusText(order.status) }}
                 </span>
               </td>
-              <td class="px-4 py-3 max-w-[300px]">
-                <p class="text-gray-700 break-words">{{ order.inviteResult || '-' }}</p>
+              <td class="px-4 py-3 align-top">
+                <p class="text-gray-700 leading-5 break-words">{{ order.inviteResult || '-' }}</p>
                 <p v-if="order.invitedAccountEmail" class="text-xs text-gray-400 mt-1">账号：{{ order.invitedAccountEmail }}</p>
+                <p v-if="order.invitedAccountId" class="text-xs mt-1" :class="invitedAccountStatusClass(order)">状态：{{ invitedAccountStatusText(order) }}</p>
+                <div v-if="order.invitedAccountId" class="mt-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    class="h-7 px-2 text-xs"
+                    :disabled="syncingStatusOrderId === order.id || !canSyncOrderStatus(order)"
+                    @click="handleSyncOrderStatus(order)"
+                  >
+                    <Loader2 v-if="syncingStatusOrderId === order.id" class="w-3 h-3 animate-spin mr-1" />
+                    同步状态
+                  </Button>
+                </div>
               </td>
-              <td class="px-4 py-3 w-[220px]">
+              <td class="px-4 py-3 text-xs text-gray-500 leading-5 align-top">
+                <p class="whitespace-nowrap">创建：{{ formatDate(order.createdAt) }}</p>
+                <p class="whitespace-nowrap">更新：{{ formatDate(order.updatedAt) }}</p>
+              </td>
+              <td class="px-4 py-3 align-top">
                 <div class="relative">
                   <Input
                     v-model="noteDrafts[order.id]"
                     placeholder="填写备注"
-                    class="h-9"
+                    class="h-9 bg-slate-50 border-slate-200"
                     :disabled="savingNoteId === order.id"
                     @blur="handleNoteBlur(order)"
                   />
@@ -499,18 +645,17 @@ onUnmounted(() => {
                   />
                 </div>
               </td>
-              <td class="px-4 py-3">
-                {{ order.operatorUsername || '-' }}
+              <td class="px-4 py-3 text-xs text-slate-700 leading-5 align-top">
+                <p class="truncate" :title="order.operatorUsername || '-'">
+                  {{ formatOperatorDisplay(order.operatorUsername) }}
+                </p>
               </td>
-              <td class="px-4 py-3 text-xs text-gray-500">
-                <p>创建：{{ formatDate(order.createdAt) }}</p>
-                <p>更新：{{ formatDate(order.updatedAt) }}</p>
-              </td>
-              <td class="px-4 py-3">
-                <div class="flex items-center gap-2">
+              <td class="px-4 py-3 align-top sticky right-0 z-20 bg-white border-l border-slate-100 group-hover:bg-cyan-50/40">
+                <div class="flex flex-col items-start gap-2">
                   <Button
                     size="sm"
                     variant="outline"
+                    class="w-[96px] whitespace-nowrap"
                     :disabled="quickInvitingId === order.id || !canProcessOrder(order)"
                     @click="openProcessDialog(order)"
                   >
@@ -521,6 +666,7 @@ onUnmounted(() => {
                   <Button
                     size="sm"
                     variant="outline"
+                    class="w-[96px] whitespace-nowrap"
                     :disabled="returningOrderId === order.id || order.status === 'redeemed' || order.status === 'returned'"
                     @click="handleReturnOrder(order)"
                   >
@@ -551,22 +697,10 @@ onUnmounted(() => {
             <p>当前状态：{{ statusText(processingOrder.status) }}</p>
           </div>
 
-          <div class="space-y-2">
-            <Label class="text-xs text-gray-500">邀请账号</Label>
-            <select
-              v-model="processAccountSelection"
-              class="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              :disabled="quickInvitingId === processingOrder.id"
-            >
-              <option value="auto">自动选择可邀请账号（推荐）</option>
-              <option
-                v-for="account in quickInviteAccountOptions"
-                :key="account.id"
-                :value="String(account.id)"
-              >
-                {{ account.email }}（邀请码 {{ Number(account.directInviteCodeAvailable || 0) }}/{{ Number(account.directInviteCodeTotal || 0) }}）
-              </option>
-            </select>
+          <div class="rounded-lg border border-cyan-100 bg-cyan-50 p-3 text-xs leading-6 text-cyan-800">
+            系统将按订单绑定兑换码自动定位邀请账号。
+            若当前绑定兑换码失效，会自动尝试重绑可用兑换码后继续处理；
+            若仍失败，将直接报错并提示先补充兑换码再处理。
           </div>
         </div>
 

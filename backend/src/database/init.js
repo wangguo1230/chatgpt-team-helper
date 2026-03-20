@@ -282,12 +282,29 @@ const ensureRbacTables = (database) => {
         email TEXT NOT NULL,
         purpose TEXT NOT NULL,
         code_hash TEXT NOT NULL,
+        failed_attempt_count INTEGER DEFAULT 0,
         expires_at DATETIME NOT NULL,
         consumed_at DATETIME,
         created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
       )
     `)
     if (!emailCodesExists) changed = true
+    const emailCodesInfo = database.exec('PRAGMA table_info(email_verification_codes)')
+    if (emailCodesInfo[0]?.values?.length) {
+      const emailCodeColumns = new Set(emailCodesInfo[0].values.map(row => String(row[1] || '').trim()))
+      if (!emailCodeColumns.has('failed_attempt_count')) {
+        database.run('ALTER TABLE email_verification_codes ADD COLUMN failed_attempt_count INTEGER DEFAULT 0')
+        changed = true
+      }
+      database.run(
+        `
+          UPDATE email_verification_codes
+          SET failed_attempt_count = COALESCE(failed_attempt_count, 0)
+          WHERE failed_attempt_count IS NULL
+        `
+      )
+      if (Number(database.getRowsModified?.() || 0) > 0) changed = true
+    }
 
     if (!indexExists('idx_user_roles_user_id')) {
       database.run('CREATE INDEX idx_user_roles_user_id ON user_roles(user_id)')
@@ -1173,6 +1190,12 @@ const ensureAlipayRedpackOrdersTable = (database) => {
           redeemed_at DATETIME,
           operator_user_id INTEGER,
           operator_username TEXT,
+          warranty_anchor_at DATETIME,
+          warranty_service_days_snapshot INTEGER,
+          supplement_attempt_count INTEGER DEFAULT 0,
+          last_supplement_at DATETIME,
+          supplement_lock_until DATETIME,
+          supplement_lock_token TEXT,
           created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
           updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
         )
@@ -1226,8 +1249,81 @@ const ensureAlipayRedpackOrdersTable = (database) => {
           database.run("ALTER TABLE alipay_redpack_orders ADD COLUMN updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
           changed = true
         }
+        if (!columns.includes('warranty_anchor_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN warranty_anchor_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('warranty_service_days_snapshot')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN warranty_service_days_snapshot INTEGER')
+          changed = true
+        }
+        if (!columns.includes('supplement_attempt_count')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN supplement_attempt_count INTEGER DEFAULT 0')
+          changed = true
+        }
+        if (!columns.includes('last_supplement_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN last_supplement_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('supplement_lock_until')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN supplement_lock_until DATETIME')
+          changed = true
+        }
+        if (!columns.includes('supplement_lock_token')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN supplement_lock_token TEXT')
+          changed = true
+        }
       }
     }
+
+    const defaultWarrantyDaysRaw = Number.parseInt(String(process.env.PURCHASE_SERVICE_DAYS ?? ''), 10)
+    const defaultWarrantyDays = Number.isFinite(defaultWarrantyDaysRaw) && defaultWarrantyDaysRaw > 0
+      ? defaultWarrantyDaysRaw
+      : 30
+
+    database.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET warranty_anchor_at = COALESCE(redeemed_at, invite_sent_at, created_at)
+        WHERE warranty_anchor_at IS NULL
+          AND (
+            redeemed_at IS NOT NULL
+            OR invite_sent_at IS NOT NULL
+            OR created_at IS NOT NULL
+          )
+      `
+    )
+    if (Number(database.getRowsModified?.() || 0) > 0) changed = true
+
+    database.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET warranty_service_days_snapshot = COALESCE(
+          warranty_service_days_snapshot,
+          (
+            SELECT rc.service_days
+            FROM redemption_codes rc
+            WHERE rc.id = alipay_redpack_orders.redemption_code_id
+              AND rc.service_days IS NOT NULL
+              AND rc.service_days > 0
+            LIMIT 1
+          ),
+          ?
+        )
+        WHERE warranty_service_days_snapshot IS NULL
+      `,
+      [defaultWarrantyDays]
+    )
+    if (Number(database.getRowsModified?.() || 0) > 0) changed = true
+
+    database.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET supplement_attempt_count = COALESCE(supplement_attempt_count, 0)
+        WHERE supplement_attempt_count IS NULL
+      `
+    )
+    if (Number(database.getRowsModified?.() || 0) > 0) changed = true
 
     changed = ensureIndex(
       database,
@@ -1248,6 +1344,16 @@ const ensureAlipayRedpackOrdersTable = (database) => {
       database,
       'idx_alipay_redpack_orders_redemption_code_id',
       'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_redemption_code_id ON alipay_redpack_orders(redemption_code_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_supplement_lock_until',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_supplement_lock_until ON alipay_redpack_orders(supplement_lock_until)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_warranty_anchor_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_warranty_anchor_at ON alipay_redpack_orders(warranty_anchor_at)'
     ) || changed
   } catch (error) {
     console.warn('[DB] 无法初始化 alipay_redpack_orders 表:', error)
@@ -1337,6 +1443,73 @@ const ensureAlipayRedpackSupplementsTable = (database) => {
     ) || changed
   } catch (error) {
     console.warn('[DB] 无法初始化 alipay_redpack_supplements 表:', error)
+  }
+
+  return changed
+}
+
+const ensureAlipayRedpackSupplementTicketsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'alipay_redpack_supplement_tickets')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS alipay_redpack_supplement_tickets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL,
+          ticket_hash TEXT NOT NULL UNIQUE,
+          bind_ip TEXT NOT NULL,
+          bind_ua TEXT NOT NULL,
+          use_count INTEGER DEFAULT 0,
+          max_uses INTEGER DEFAULT 6,
+          last_used_at DATETIME,
+          expires_at DATETIME NOT NULL,
+          revoked_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+        )
+      `)
+      changed = true
+    } else {
+      const tableInfo = database.exec('PRAGMA table_info(alipay_redpack_supplement_tickets)')
+      if (tableInfo.length > 0) {
+        const columns = tableInfo[0].values.map(row => row[1])
+        const addColumn = (name, ddl) => {
+          if (columns.includes(name)) return
+          database.run(`ALTER TABLE alipay_redpack_supplement_tickets ADD COLUMN ${ddl}`)
+          changed = true
+        }
+
+        addColumn('email', 'email TEXT')
+        addColumn('ticket_hash', 'ticket_hash TEXT')
+        addColumn('bind_ip', "bind_ip TEXT NOT NULL DEFAULT ''")
+        addColumn('bind_ua', "bind_ua TEXT NOT NULL DEFAULT ''")
+        addColumn('use_count', 'use_count INTEGER DEFAULT 0')
+        addColumn('max_uses', 'max_uses INTEGER DEFAULT 6')
+        addColumn('last_used_at', 'last_used_at DATETIME')
+        addColumn('expires_at', 'expires_at DATETIME')
+        addColumn('revoked_at', 'revoked_at DATETIME')
+        addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      }
+    }
+
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplement_tickets_email_created_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplement_tickets_email_created_at ON alipay_redpack_supplement_tickets(email, created_at)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplement_tickets_ticket_hash',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_alipay_redpack_supplement_tickets_ticket_hash ON alipay_redpack_supplement_tickets(ticket_hash)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_supplement_tickets_expires_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_supplement_tickets_expires_at ON alipay_redpack_supplement_tickets(expires_at)'
+    ) || changed
+  } catch (error) {
+    console.warn('[DB] 无法初始化 alipay_redpack_supplement_tickets 表:', error)
   }
 
   return changed
@@ -2559,6 +2732,7 @@ export async function initDatabase() {
         const xianyuTablesCreated = ensureXianyuTables(database)
         const alipayRedpackOrdersCreated = ensureAlipayRedpackOrdersTable(database)
         const alipayRedpackSupplementsCreated = ensureAlipayRedpackSupplementsTable(database)
+        const alipayRedpackSupplementTicketsCreated = ensureAlipayRedpackSupplementTicketsTable(database)
         const linuxDoUsersCreated = ensureLinuxDoUsersTable(database)
         const accountRecoveryCreated = ensureAccountRecoveryTable(database)
         const purchaseOrdersCreated = ensurePurchaseOrdersTable(database)
@@ -2579,6 +2753,7 @@ export async function initDatabase() {
           xianyuTablesCreated ||
           alipayRedpackOrdersCreated ||
           alipayRedpackSupplementsCreated ||
+          alipayRedpackSupplementTicketsCreated ||
           linuxDoUsersCreated ||
           accountRecoveryCreated ||
           purchaseOrdersCreated ||
@@ -2860,6 +3035,7 @@ export async function initDatabase() {
   const xianyuTablesInitialized = ensureXianyuTables(database)
   const alipayRedpackOrdersInitialized = ensureAlipayRedpackOrdersTable(database)
   const alipayRedpackSupplementsInitialized = ensureAlipayRedpackSupplementsTable(database)
+  const alipayRedpackSupplementTicketsInitialized = ensureAlipayRedpackSupplementTicketsTable(database)
   const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
   const accountRecoveryInitialized = ensureAccountRecoveryTable(database)
   const purchaseOrdersInitialized = ensurePurchaseOrdersTable(database)
@@ -2879,6 +3055,7 @@ export async function initDatabase() {
     xianyuTablesInitialized ||
     alipayRedpackOrdersInitialized ||
     alipayRedpackSupplementsInitialized ||
+    alipayRedpackSupplementTicketsInitialized ||
     linuxDoUsersInitialized ||
     accountRecoveryInitialized ||
     purchaseOrdersInitialized ||

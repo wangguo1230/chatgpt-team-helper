@@ -170,6 +170,11 @@ const readEnvEntriesFromFile = (envFilePath) => {
   return parseEnvEntriesFromText(content)
 }
 
+const readEnvRawTextFromFile = (envFilePath) => {
+  if (!envFilePath || !fs.existsSync(envFilePath)) return ''
+  return fs.readFileSync(envFilePath, 'utf-8')
+}
+
 const escapeEnvValue = (value) => {
   const sanitized = String(value ?? '').replace(/\r?\n/g, '\\n')
   if (!sanitized) return ''
@@ -614,11 +619,13 @@ router.get('/env-configs', async (req, res) => {
     const payload = await withLocks([`admin:env-config:${envFilePath}`], async () => {
       const entries = readEnvEntriesFromFile(envFilePath)
       const items = buildEnvConfigItems({ entries })
+      const rawText = readEnvRawTextFromFile(envFilePath)
       return {
         envFilePath,
         exists: fs.existsSync(envFilePath),
         count: items.length,
-        items
+        items,
+        rawText
       }
     })
     return res.json(payload)
@@ -665,6 +672,7 @@ router.put('/env-configs', async (req, res) => {
         ? replaceEnvEntriesInFile(envFilePath, normalizedEntries)
         : upsertEnvEntriesToFile(envFilePath, normalizedEntries)
       const latestEntries = readEnvEntriesFromFile(envFilePath)
+      const rawText = readEnvRawTextFromFile(envFilePath)
       const syncResult = syncEnvEntriesToRuntime(envFilePath, latestEntries, { clearMissing: true })
       invalidateAdminSettingsCaches()
 
@@ -677,7 +685,8 @@ router.put('/env-configs', async (req, res) => {
         count: items.length,
         syncedCount: syncResult.keys.length,
         removedRuntimeKeys: syncResult.removedKeys,
-        items
+        items,
+        rawText
       })
     })
   } catch (error) {

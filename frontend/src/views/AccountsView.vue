@@ -86,19 +86,19 @@ const quickInviteAccountOptions = computed(() => {
   return [...accounts.value]
     .filter(account => {
       if (!Boolean(account?.isOpen) || Boolean(account?.isBanned)) return false
+      const codeTotal = Number(account?.directInviteCodeTotal || 0)
+      const codeAvailable = Number(account?.directInviteCodeAvailable || 0)
+      const hasAvailableCodes = codeTotal > 0 && codeAvailable > 0
 
       if (typeof account?.quickInviteEligible === 'boolean') {
-        return account.quickInviteEligible
+        return account.quickInviteEligible && hasAvailableCodes
       }
 
       const occupancy = Number(account?.userCount || 0) + Number(account?.inviteCount || 0)
       const capacityLimit = Number(account?.quickInviteCapacityLimit || 0)
       const underCapacity = !Number.isFinite(capacityLimit) || capacityLimit <= 0 || occupancy < capacityLimit
-      const codeTotal = Number(account?.directInviteCodeTotal || 0)
-      const codeAvailable = Number(account?.directInviteCodeAvailable || 0)
-      const codeEligible = codeTotal <= 0 || codeAvailable > 0
 
-      return underCapacity && codeEligible
+      return underCapacity && hasAvailableCodes
     })
     .sort((a, b) => {
       const aLoad = Number(a.userCount || 0) + Number(a.inviteCount || 0)
@@ -129,6 +129,9 @@ const banningAccountId = ref<number | null>(null)
 const deletingBannedBatch = ref(false)
 const deletingExpiredBatch = ref(false)
 const syncingZeroJoinedBatch = ref(false)
+const savingRiskNoteId = ref<number | null>(null)
+const riskNoteDrafts = ref<Record<number, string>>({})
+const riskNoteSavedSnapshots = ref<Record<number, string>>({})
 
 // 批量检查相关状态
 type CheckResultFilter = 'all' | 'abnormal' | 'banned' | 'expired' | 'normal' | 'failed'
@@ -791,6 +794,15 @@ const loadAccounts = async () => {
     const response = await gptAccountService.getAll(params)
     accounts.value = response.accounts || []
     paginationMeta.value = response.pagination || { page: 1, pageSize: 10, total: 0 }
+    const drafts: Record<number, string> = {}
+    const snapshots: Record<number, string> = {}
+    for (const item of accounts.value) {
+      const noteValue = String(item?.riskNote || '')
+      drafts[item.id] = noteValue
+      snapshots[item.id] = noteValue
+    }
+    riskNoteDrafts.value = drafts
+    riskNoteSavedSnapshots.value = snapshots
 
     const syncAccountId = parseSyncAccountIdFromQuery()
     if (
@@ -824,6 +836,49 @@ const loadAccounts = async () => {
   } finally {
     loading.value = false
   }
+}
+
+const applyAccountToList = (account: GptAccount | null | undefined) => {
+  if (!account?.id) return
+  const index = accounts.value.findIndex(item => Number(item?.id) === Number(account.id))
+  if (index === -1) return
+  accounts.value[index] = {
+    ...accounts.value[index],
+    ...account,
+  }
+}
+
+const handleSaveRiskNote = async (account: GptAccount, { showSuccess = false } = {}) => {
+  const accountId = Number(account?.id || 0)
+  if (!accountId) return
+
+  const noteValue = String(riskNoteDrafts.value[accountId] || '').trim()
+  const savedValue = String(riskNoteSavedSnapshots.value[accountId] || '')
+  if (noteValue === savedValue) return
+
+  savingRiskNoteId.value = accountId
+  try {
+    const response = await gptAccountService.updateRiskNote(accountId, noteValue)
+    const updatedAccount = response?.account || null
+    applyAccountToList(updatedAccount)
+
+    const persistedNote = String(updatedAccount?.riskNote || noteValue || '')
+    riskNoteDrafts.value[accountId] = persistedNote
+    riskNoteSavedSnapshots.value[accountId] = persistedNote
+
+    if (showSuccess) {
+      showSuccessToast(response?.message || '备注已更新')
+    }
+  } catch (err: any) {
+    const message = err?.response?.data?.error || '备注保存失败'
+    showErrorToast(message)
+  } finally {
+    savingRiskNoteId.value = null
+  }
+}
+
+const handleRiskNoteBlur = (account: GptAccount) => {
+  handleSaveRiskNote(account, { showSuccess: false })
 }
 
 const handleRefresh = () => {
@@ -1890,19 +1945,33 @@ const handleQuickInviteSubmit = async () => {
       <div v-else>
         <!-- Desktop Table -->
         <div class="hidden md:block overflow-x-auto">
-          <table class="w-full">
+          <table class="w-full min-w-[1680px] table-fixed">
+            <colgroup>
+              <col class="w-[84px]">
+              <col class="w-[280px]">
+              <col class="w-[240px]">
+              <col class="w-[96px]">
+              <col class="w-[160px]">
+              <col class="w-[110px]">
+              <col class="w-[96px]">
+              <col class="w-[96px]">
+              <col class="w-[170px]">
+              <col class="w-[170px]">
+              <col class="w-[220px]">
+            </colgroup>
             <thead>
 	              <tr class="border-b border-gray-100 bg-gray-50/50">
 	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">ID</th>
 		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">邮箱</th>
+		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">备注（可编辑）</th>
 		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">状态</th>
 		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">封禁时间</th>
 		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">封禁天数</th>
 		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">已加入</th>
-		                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
+	                <th class="px-6 py-5 text-center text-xs font-semibold text-gray-400 uppercase tracking-wider">待加入</th>
 		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">过期时间</th>
-	                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
-	                <th class="px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">操作</th>
+		                <th class="px-6 py-5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">创建时间</th>
+	                <th class="sticky right-0 z-20 border-l border-gray-100 bg-gray-50/95 px-6 py-5 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider whitespace-nowrap">操作</th>
 	              </tr>
             </thead>
             <tbody class="divide-y divide-gray-50">
@@ -1929,6 +1998,21 @@ const handleQuickInviteSubmit = async () => {
                       </div>
 	                  </div>
 	                </td>
+		                <td class="px-6 py-5 align-top">
+		                  <div class="relative min-w-[180px]">
+		                    <Input
+		                      v-model="riskNoteDrafts[account.id]"
+		                      placeholder="填写备注"
+		                      class="h-9 bg-gray-50 border-gray-200"
+		                      :disabled="savingRiskNoteId === account.id"
+		                      @blur="handleRiskNoteBlur(account)"
+		                    />
+		                    <RefreshCw
+		                      v-if="savingRiskNoteId === account.id"
+		                      class="absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-gray-400"
+		                    />
+		                  </div>
+		                </td>
 		                <td class="px-6 py-5 text-center">
 		                  <span
 		                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border"
@@ -1957,9 +2041,9 @@ const handleQuickInviteSubmit = async () => {
 	                    {{ account.inviteCount ?? 0 }} 人
 	                  </span>
 	                </td>
-	                <td class="px-6 py-5 text-sm text-gray-500 font-mono">{{ account.expireAt || '-' }}</td>
-	                <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(account.createdAt, dateFormatOptions) }}</td>
-	                <td class="px-6 py-5 text-right">
+		                <td class="px-6 py-5 text-sm text-gray-500 font-mono">{{ account.expireAt || '-' }}</td>
+		                <td class="px-6 py-5 text-sm text-gray-500">{{ formatShanghaiDate(account.createdAt, dateFormatOptions) }}</td>
+	                <td class="sticky right-0 z-10 border-l border-gray-100 bg-white px-6 py-5 text-right group-hover:bg-blue-50/30">
                   <div class="flex items-center justify-end gap-1">
                     <!-- Toggle Open -->
                     <Button 
@@ -2085,6 +2169,22 @@ const handleQuickInviteSubmit = async () => {
 	                  <p :class="account.isBanned ? 'text-red-600 font-semibold' : 'text-gray-700'">
 	                    {{ getAccountBannedDays(account) != null ? `${getAccountBannedDays(account)} 天` : '-' }}
 	                  </p>
+	               </div>
+	               <div class="col-span-2">
+	                  <p class="mb-1 text-gray-400">备注</p>
+	                  <div class="relative">
+	                    <Input
+	                      v-model="riskNoteDrafts[account.id]"
+	                      placeholder="填写备注"
+	                      class="h-9 bg-white border-gray-200 text-xs"
+	                      :disabled="savingRiskNoteId === account.id"
+	                      @blur="handleRiskNoteBlur(account)"
+	                    />
+	                    <RefreshCw
+	                      v-if="savingRiskNoteId === account.id"
+	                      class="absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin text-gray-400"
+	                    />
+	                  </div>
 	               </div>
 	            </div>
 

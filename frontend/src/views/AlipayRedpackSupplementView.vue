@@ -24,13 +24,49 @@
             helperText="请输入提交支付宝口令订单时使用的邮箱"
           />
 
+          <div class="grid gap-3 sm:grid-cols-2">
+            <AppleButton
+              type="button"
+              variant="secondary"
+              size="lg"
+              :loading="sendingCode"
+              :disabled="sendingCode || submitting || loadingCandidates || !email || !isValidEmail"
+              @click="sendAuthCode"
+            >
+              发送验证码
+            </AppleButton>
+            <AppleButton
+              type="button"
+              variant="secondary"
+              size="lg"
+              :loading="verifyingCode"
+              :disabled="verifyingCode || sendingCode || submitting || !authCode"
+              @click="verifyAuthCode"
+            >
+              验证邮箱
+            </AppleButton>
+          </div>
+
+          <AppleInput
+            v-model.trim="authCode"
+            label="邮箱验证码"
+            placeholder="请输入6位验证码"
+            type="text"
+            :disabled="verifyingCode || submitting || loadingCandidates"
+            helperText="需先完成邮箱验证码校验，才能查询并提交补录"
+          />
+
+          <p v-if="authVerified" class="text-xs text-emerald-600">
+            邮箱已验证{{ ticketExpiresAt ? `（有效期至 ${formatDate(ticketExpiresAt)}）` : '' }}
+          </p>
+
           <AppleButton
             type="submit"
             variant="primary"
             size="lg"
             class="w-full"
             :loading="loadingCandidates"
-            :disabled="loadingCandidates || submitting"
+            :disabled="loadingCandidates || submitting || (otpRequired && !authVerified)"
           >
             查询订单
           </AppleButton>
@@ -121,7 +157,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import AppleButton from '@/components/ui/apple/Button.vue'
 import AppleCard from '@/components/ui/apple/Card.vue'
 import AppleInput from '@/components/ui/apple/Input.vue'
@@ -134,6 +170,12 @@ import {
 import { EMAIL_REGEX } from '@/lib/validation'
 
 const email = ref('')
+const authCode = ref('')
+const otpRequired = ref(true)
+const supplementTicket = ref('')
+const ticketExpiresAt = ref<string | null>(null)
+const sendingCode = ref(false)
+const verifyingCode = ref(false)
 const loadingCandidates = ref(false)
 const submitting = ref(false)
 const errorMessage = ref('')
@@ -150,6 +192,14 @@ const isValidEmail = computed(() => {
   if (!email.value) return true
   return EMAIL_REGEX.test(email.value)
 })
+const authVerified = computed(() => {
+  if (!otpRequired.value) return true
+  if (!supplementTicket.value) return false
+  if (!ticketExpiresAt.value) return true
+  const expiresMs = Date.parse(ticketExpiresAt.value)
+  if (!Number.isFinite(expiresMs)) return true
+  return expiresMs > Date.now()
+})
 
 const statusText = (status?: string) => {
   if (status === 'pending') return '待处理'
@@ -160,7 +210,7 @@ const statusText = (status?: string) => {
 }
 const isOrderSelectable = (item?: AlipayRedpackSupplementCandidateOrder | null) => {
   const status = String(item?.status || '').trim().toLowerCase()
-  return status === 'invited' || status === 'redeemed'
+  return status === 'redeemed' && Boolean(item?.withinWarranty)
 }
 const resolveCandidateCardClass = (item: AlipayRedpackSupplementCandidateOrder) => {
   if (!isOrderSelectable(item)) {
@@ -189,26 +239,102 @@ const formatWarrantyDays = (value?: number | null) => {
   return `${Math.floor(days)} 天`
 }
 
-const loadCandidates = async () => {
+watch(email, () => {
+  authCode.value = ''
+  supplementTicket.value = ''
+  ticketExpiresAt.value = null
+  candidates.value = []
+  selectedOrderId.value = null
+})
+
+const sendAuthCode = async () => {
   if (!email.value || !EMAIL_REGEX.test(email.value)) {
     errorMessage.value = '请输入有效邮箱地址'
     return
   }
 
-  loadingCandidates.value = true
+  sendingCode.value = true
   errorMessage.value = ''
   successMessage.value = ''
+  try {
+    const response = await alipayRedpackService.sendSupplementAuthCode(email.value)
+    otpRequired.value = Boolean(response?.otpRequired)
+    successMessage.value = response?.message || '验证码已发送，请检查邮箱'
+  } catch (err: any) {
+    errorMessage.value = err?.response?.data?.error || '验证码发送失败，请稍后重试'
+  } finally {
+    sendingCode.value = false
+  }
+}
+
+const verifyAuthCode = async () => {
+  if (!email.value || !EMAIL_REGEX.test(email.value)) {
+    errorMessage.value = '请输入有效邮箱地址'
+    return
+  }
+  if (!/^[0-9]{6}$/.test(authCode.value)) {
+    errorMessage.value = '请输入6位数字验证码'
+    return
+  }
+
+  verifyingCode.value = true
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const response = await alipayRedpackService.verifySupplementAuthCode({
+      email: email.value,
+      code: authCode.value,
+    })
+    otpRequired.value = Boolean(response?.otpRequired)
+    supplementTicket.value = String(response?.ticket || '')
+    ticketExpiresAt.value = response?.expiresAt || null
+    if (otpRequired.value && !supplementTicket.value) {
+      errorMessage.value = '邮箱验证失败，请重新发送验证码'
+      return
+    }
+    successMessage.value = response?.message || '邮箱验证成功'
+  } catch (err: any) {
+    supplementTicket.value = ''
+    ticketExpiresAt.value = null
+    errorMessage.value = err?.response?.data?.error || '邮箱验证失败，请稍后重试'
+  } finally {
+    verifyingCode.value = false
+  }
+}
+
+const loadCandidatesInternal = async ({ preserveMessages = false } = {}) => {
+  if (!email.value || !EMAIL_REGEX.test(email.value)) {
+    errorMessage.value = '请输入有效邮箱地址'
+    return
+  }
+  if (otpRequired.value && !authVerified.value) {
+    errorMessage.value = '请先完成邮箱验证码验证'
+    return
+  }
+
+  loadingCandidates.value = true
+  if (!preserveMessages) {
+    errorMessage.value = ''
+    successMessage.value = ''
+  }
   lastOrder.value = null
   try {
-    const response = await alipayRedpackService.getSupplementCandidatesByEmail(email.value)
+    const response = await alipayRedpackService.getSupplementCandidatesByEmail(
+      email.value,
+      supplementTicket.value || undefined
+    )
     candidates.value = response.orders || []
     selectedOrderId.value = pickFirstSelectableOrderId(candidates.value)
     if (!candidates.value.length) {
       errorMessage.value = '该邮箱暂无订单'
     } else if (!selectedOrderId.value) {
-      errorMessage.value = '该邮箱订单存在，但当前状态不可补录（待处理/已退回）'
+      errorMessage.value = '该邮箱暂无可补录订单'
     }
   } catch (err: any) {
+    if (err?.response?.data?.code === 'alipay_redpack_supplement_auth_required') {
+      supplementTicket.value = ''
+      ticketExpiresAt.value = null
+    }
     candidates.value = []
     selectedOrderId.value = null
     errorMessage.value = err?.response?.data?.error || '查询订单失败，请稍后重试'
@@ -216,6 +342,7 @@ const loadCandidates = async () => {
     loadingCandidates.value = false
   }
 }
+const loadCandidates = async () => loadCandidatesInternal()
 
 const handleSubmit = async () => {
   if (!email.value || !EMAIL_REGEX.test(email.value)) {
@@ -227,7 +354,11 @@ const handleSubmit = async () => {
     return
   }
   if (!selectedOrder.value || !isOrderSelectable(selectedOrder.value)) {
-    errorMessage.value = '当前订单状态不可补录，请选择已邀请或已兑换订单'
+    errorMessage.value = '当前订单状态不可补录，请选择已兑换且质保内订单'
+    return
+  }
+  if (otpRequired.value && !authVerified.value) {
+    errorMessage.value = '补录认证已失效，请重新验证邮箱'
     return
   }
 
@@ -238,12 +369,22 @@ const handleSubmit = async () => {
     const response = await alipayRedpackService.supplementPublic({
       email: email.value,
       orderId: selectedOrderId.value,
-    })
-    lastOrder.value = response.order || null
-    successMessage.value = response.message || '补录成功'
-    await loadCandidates()
+    }, supplementTicket.value || undefined)
+    if (response?.error) {
+      const manualRequired = Boolean(response?.manualInterventionRequired)
+      errorMessage.value = manualRequired ? `${response.error}（已进入人工介入队列）` : response.error
+      lastOrder.value = response?.order || null
+      return
+    }
+    lastOrder.value = response?.order || null
+    successMessage.value = response?.message || '补录成功'
+    await loadCandidatesInternal({ preserveMessages: true })
   } catch (err: any) {
     const message = err?.response?.data?.error || '补录失败，请稍后重试'
+    if (err?.response?.data?.code === 'alipay_redpack_supplement_auth_required') {
+      supplementTicket.value = ''
+      ticketExpiresAt.value = null
+    }
     const manualRequired = Boolean(err?.response?.data?.manualInterventionRequired)
     errorMessage.value = manualRequired ? `${message}（已进入人工介入队列）` : message
     lastOrder.value = err?.response?.data?.order || null

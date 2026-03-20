@@ -586,6 +586,7 @@ export interface AppRuntimeConfig {
   turnstileSiteKey?: string | null
   turnstileEnabled?: boolean
   redemptionBatchCreateMaxCount?: number
+  openAccountsCapacityLimit?: number
   channels?: Channel[]
   features?: {
     xhs?: boolean
@@ -878,7 +879,7 @@ export interface XianyuStatus {
 export interface AlipayRedpackOrder {
   id: number
   email: string
-  alipayPassphrase: string
+  alipayPassphrase?: string
   redemptionCodeId?: number | null
   redemptionCode?: string | null
   redemptionCodeRedeemedAt?: string | null
@@ -893,6 +894,15 @@ export interface AlipayRedpackOrder {
   operatorUsername?: string | null
   createdAt?: string | null
   updatedAt?: string | null
+}
+
+export interface AlipayRedpackAdminOrdersParams {
+  search?: string
+  status?: string
+  startDate?: string
+  endDate?: string
+  limit?: number
+  offset?: number
 }
 
 export interface AlipayRedpackStock {
@@ -935,6 +945,20 @@ export interface AlipayRedpackSupplementRecord {
   processedAt?: string | null
   createdAt?: string | null
   updatedAt?: string | null
+}
+
+export interface AlipayRedpackSupplementAuthSendCodeResponse {
+  message: string
+  otpRequired: boolean
+  email?: string
+  expiresInSeconds?: number
+}
+
+export interface AlipayRedpackSupplementAuthVerifyCodeResponse {
+  message: string
+  otpRequired: boolean
+  ticket?: string
+  expiresAt?: string
 }
 
 export interface LinuxDoUser {
@@ -1204,6 +1228,7 @@ export interface AdminEnvConfigsResponse {
   exists: boolean
   count: number
   items: AdminEnvConfigItem[]
+  rawText?: string
 }
 
 export interface AdminEnvConfigsUpdateResponse extends AdminEnvConfigsResponse {
@@ -2032,6 +2057,11 @@ export interface DeleteExpiredAccountsBatchResponse {
   requestedIds: number[] | null
 }
 
+export interface UpdateGptAccountRiskNoteResponse {
+  message: string
+  account: GptAccount
+}
+
 export const gptAccountService = {
   async getAll(params?: GptAccountsListParams): Promise<GptAccountsListResponse> {
     const response = await api.get('/gpt-accounts', { params })
@@ -2133,6 +2163,11 @@ export const gptAccountService = {
 
   async ban(id: number): Promise<GptAccount> {
     const response = await api.patch(`/gpt-accounts/${id}/ban`)
+    return response.data
+  },
+
+  async updateRiskNote(id: number, riskNote: string): Promise<UpdateGptAccountRiskNoteResponse> {
+    const response = await api.patch(`/gpt-accounts/${id}/risk-note`, { riskNote })
     return response.data
   },
 
@@ -2623,82 +2658,114 @@ export const redemptionCodeService = {
 }
 
 export interface AdminStatsOverviewResponse {
-  range: { from: string; to: string }
-  users: {
-    total: number
-    created: number
-    pointsTotal: number
-    inviteEnabled: number
+  generatedAt: string
+  alipayRedpackOrders: {
+    counts: {
+      total: number
+      today: number
+      yesterday: number
+    }
+    status: {
+      pending: { total: number; today: number; yesterday: number }
+      invited: { total: number; today: number; yesterday: number }
+      redeemed: { total: number; today: number; yesterday: number }
+      returned: { total: number; today: number; yesterday: number }
+    }
+  }
+  redemptionCodes: {
+    total: { total: number; today: number; yesterday: number }
+    unused: { total: number; today: number; yesterday: number }
+    used: { total: number; today: number; yesterday: number }
+    reserved: { total: number; today: number; yesterday: number }
   }
   gptAccounts: {
     total: number
     open: number
+    banned: number
+    active: number
+    capacityLimit: number
     usedSeats: number
+    invitePending: number
     totalSeats: number
     seatUtilization: number
-    invitePending: number
-  }
-  redemptionCodes: {
-    total: number
-    unused: number
-    byChannel: Array<{ channel: string; total: number; unused: number }>
-    todayCommon: { total: number; unused: number }
-    todayXhs: { total: number; unused: number }
-    todayXianyu: { total: number; unused: number }
-  }
-  xhsOrders: {
-    total: number
-    used: number
-    pending: number
-    amount: {
-      range: number
-      today: number
+    invitableAccounts: number
+    invitableRemainingSeats: number
+    codeLinked: {
+      availableCodesTotal: number
+      accountWithAvailableCodes: number
+      availableCodesOnInvitableAccounts: number
+      invitableAccountsWithAvailableCodes: number
     }
-    today: { total: number; used: number; pending: number }
-  }
-  xianyuOrders: {
-    total: number
-    used: number
-    pending: number
-    amount: {
-      range: number
-      today: number
-    }
-    today: { total: number; used: number; pending: number }
-  }
-  purchaseOrders: {
-    total: number
-    paid: number
-    pending: number
-    refunded: number
-    paidAmount: number
-    refundAmount: number
-    today: {
-      total: number
-      paid: number
-      pending: number
-      refunded: number
-      paidAmount: number
-      refundAmount: number
-    }
-  }
-  creditOrders: {
-    total: number
-    paid: number
-    refunded: number
-    paidAmount: number
-  }
-  pointsWithdrawals: {
-    pending: number
-    pendingPoints: number
-    pendingCash: number
   }
 }
 
+const isStatsTriad = (value: any): boolean => {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof value.total === 'number' &&
+      typeof value.today === 'number' &&
+      typeof value.yesterday === 'number'
+  )
+}
+
+const isAdminStatsOverviewResponse = (value: any): value is AdminStatsOverviewResponse => {
+  if (!value || typeof value !== 'object') return false
+  if (typeof value.generatedAt !== 'string') return false
+
+  const orders = value.alipayRedpackOrders
+  if (!orders || typeof orders !== 'object') return false
+  if (!isStatsTriad(orders.counts)) return false
+  if (!orders.status || typeof orders.status !== 'object') return false
+  if (!isStatsTriad(orders.status.pending)) return false
+  if (!isStatsTriad(orders.status.invited)) return false
+  if (!isStatsTriad(orders.status.redeemed)) return false
+  if (!isStatsTriad(orders.status.returned)) return false
+
+  const codes = value.redemptionCodes
+  if (!codes || typeof codes !== 'object') return false
+  if (!isStatsTriad(codes.total)) return false
+  if (!isStatsTriad(codes.unused)) return false
+  if (!isStatsTriad(codes.used)) return false
+  if (!isStatsTriad(codes.reserved)) return false
+
+  const accounts = value.gptAccounts
+  if (!accounts || typeof accounts !== 'object') return false
+  const accountNumberKeys = [
+    'total',
+    'open',
+    'banned',
+    'active',
+    'capacityLimit',
+    'usedSeats',
+    'invitePending',
+    'totalSeats',
+    'seatUtilization',
+    'invitableAccounts',
+    'invitableRemainingSeats'
+  ]
+  for (const key of accountNumberKeys) {
+    if (typeof accounts[key] !== 'number') return false
+  }
+
+  const codeLinked = accounts.codeLinked
+  if (!codeLinked || typeof codeLinked !== 'object') return false
+  return (
+    typeof codeLinked.availableCodesTotal === 'number' &&
+    typeof codeLinked.accountWithAvailableCodes === 'number' &&
+    typeof codeLinked.availableCodesOnInvitableAccounts === 'number' &&
+    typeof codeLinked.invitableAccountsWithAvailableCodes === 'number'
+  )
+}
+
 export const adminStatsService = {
-  async getOverview(params?: { from?: string; to?: string }): Promise<AdminStatsOverviewResponse> {
-    const response = await api.get('/admin/stats/overview', { params })
-    return response.data
+  async getOverview(): Promise<AdminStatsOverviewResponse> {
+    const response = await api.get('/admin/stats/overview')
+    const data = response.data
+    if (!isAdminStatsOverviewResponse(data)) {
+      throw new Error('统计接口返回格式异常')
+    }
+    return data
   }
 }
 
@@ -2909,26 +2976,46 @@ export const alipayRedpackService = {
     return response.data
   },
 
-  async getSupplementCandidatesByEmail(email: string): Promise<AlipayRedpackSupplementCandidateResponse> {
+  async sendSupplementAuthCode(email: string): Promise<AlipayRedpackSupplementAuthSendCodeResponse> {
+    const response = await axios.post(`${API_URL}/alipay-redpack/orders/supplement/auth/send-code`, { email }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async verifySupplementAuthCode(payload: { email: string; code: string }): Promise<AlipayRedpackSupplementAuthVerifyCodeResponse> {
+    const response = await axios.post(`${API_URL}/alipay-redpack/orders/supplement/auth/verify-code`, payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async getSupplementCandidatesByEmail(email: string, supplementTicket?: string): Promise<AlipayRedpackSupplementCandidateResponse> {
     const response = await axios.get(`${API_URL}/alipay-redpack/orders/supplement/candidates`, {
       params: { email },
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...(supplementTicket ? { 'X-Alipay-Redpack-Ticket': supplementTicket } : {})
       }
     })
     return response.data
   },
 
-  async supplementPublic(payload: { email: string; orderId: number; note?: string }): Promise<{ message: string; order: AlipayRedpackOrder; windowEndsAt?: string | null; supplement?: AlipayRedpackSupplementRecord; manualInterventionRequired?: boolean }> {
+  async supplementPublic(payload: { email: string; orderId: number; note?: string }, supplementTicket?: string): Promise<{ message?: string; error?: string; code?: string; order?: AlipayRedpackOrder; windowEndsAt?: string | null; supplement?: AlipayRedpackSupplementRecord; manualInterventionRequired?: boolean }> {
     const response = await axios.post(`${API_URL}/alipay-redpack/orders/supplement`, payload, {
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...(supplementTicket ? { 'X-Alipay-Redpack-Ticket': supplementTicket } : {})
       }
     })
     return response.data
   },
 
-  async adminListOrders(params?: { search?: string; status?: string; limit?: number; offset?: number }): Promise<{ orders: AlipayRedpackOrder[]; total: number; limit: number; offset: number }> {
+  async adminListOrders(params?: AlipayRedpackAdminOrdersParams): Promise<{ orders: AlipayRedpackOrder[]; total: number; limit: number; offset: number }> {
     const response = await api.get('/alipay-redpack/admin/orders', { params })
     return response.data
   },

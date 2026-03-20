@@ -216,11 +216,32 @@ const redemptionCodeSettingsLoading = ref(false)
 
 // ENV 配置同步（仅超级管理员）
 const envConfigRawText = ref('')
+const envConfigSourceText = ref('')
 const envConfigFilePath = ref('')
 const envConfigError = ref('')
 const envConfigSuccess = ref('')
 const envConfigLoading = ref(false)
 const envConfigSyncing = ref(false)
+const alipayRedpackEnvTemplate = [
+  'ALIPAY_REDPACK_PUBLIC_RATE_LIMIT_WINDOW_SEC=60',
+  'ALIPAY_REDPACK_PUBLIC_RATE_LIMIT_MAX=30',
+  'ALIPAY_REDPACK_ADMIN_ALERT_SUMMARY_INTERVAL_SEC=600',
+  'ALIPAY_REDPACK_ADMIN_ALERT_SUMMARY_MAX_EVENTS=500',
+  'ALIPAY_REDPACK_SUPPLEMENT_REQUIRE_OTP=true',
+  'ALIPAY_REDPACK_SUPPLEMENT_OTP_TTL_SEC=300',
+  'ALIPAY_REDPACK_SUPPLEMENT_OTP_SEND_COOLDOWN_SEC=60',
+  'ALIPAY_REDPACK_SUPPLEMENT_OTP_MAX_VERIFY_FAILS=6',
+  'ALIPAY_REDPACK_SUPPLEMENT_TICKET_TTL_SEC=900',
+  'ALIPAY_REDPACK_SUPPLEMENT_TICKET_MAX_USES=8',
+  'ALIPAY_REDPACK_SUPPLEMENT_MAX_ATTEMPTS_PER_ORDER=3',
+  'ALIPAY_REDPACK_SUPPLEMENT_ATTEMPT_WINDOW_SEC=86400',
+  'ALIPAY_REDPACK_SUPPLEMENT_ORDER_LOCK_SEC=120',
+  'ALIPAY_REDPACK_INVITED_SYNC_ENABLED=true',
+  'ALIPAY_REDPACK_INVITED_SYNC_INTERVAL_MINUTES=60',
+  'ALIPAY_REDPACK_INVITED_SYNC_BATCH_SIZE=100',
+  'ALIPAY_REDPACK_INVITED_SYNC_RETRY_ON_MISSING=true',
+  'ALIPAY_REDPACK_INVITED_SYNC_RETRY_DELAY_MS=1200',
+].join('\n')
 
 // 积分提现设置（仅超级管理员）
 const pointsWithdrawRatePoints = ref('1')
@@ -1097,10 +1118,14 @@ const loadEnvConfigs = async () => {
   envConfigLoading.value = true
   try {
     const response = await adminService.getEnvConfigs()
-    envConfigFilePath.value = String(response.envFilePath || '')
-    envConfigRawText.value = (response.items || [])
+    const normalizedText = (response.items || [])
       .map(item => `${item.key}=${item.value}`)
       .join('\n')
+    envConfigFilePath.value = String(response.envFilePath || '')
+    envConfigRawText.value = normalizedText
+    envConfigSourceText.value = typeof response.rawText === 'string'
+      ? response.rawText
+      : normalizedText
   } catch (err: any) {
     envConfigError.value = err.response?.data?.error || '加载 ENV 配置失败'
   } finally {
@@ -1115,10 +1140,14 @@ const saveEnvConfigs = async () => {
   try {
     const entries = parseEnvConfigTextToEntries(envConfigRawText.value)
     const response = await adminService.updateEnvConfigs({ entries })
-    envConfigFilePath.value = String(response.envFilePath || envConfigFilePath.value || '')
-    envConfigRawText.value = (response.items || [])
+    const normalizedText = (response.items || [])
       .map(item => `${item.key}=${item.value}`)
       .join('\n')
+    envConfigFilePath.value = String(response.envFilePath || envConfigFilePath.value || '')
+    envConfigRawText.value = normalizedText
+    envConfigSourceText.value = typeof response.rawText === 'string'
+      ? response.rawText
+      : normalizedText
     envConfigSuccess.value = `已保存 ${response.updatedKeys?.length || 0} 项配置`
     setTimeout(() => (envConfigSuccess.value = ''), 3000)
   } catch (err: any) {
@@ -2002,7 +2031,25 @@ const savePointsWithdrawSettings = async () => {
               class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-xs leading-5 focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none"
               placeholder="例如：REDEMPTION_LOW_STOCK_THRESHOLD=10"
             />
-            <p class="text-xs text-gray-400">支持注释行（`#` 开头）；重复 key 以后者为准。</p>
+            <p class="text-xs text-gray-400">该编辑区仅保存合法 `KEY=VALUE` 项；注释、空行和格式请在下方“原始回显”查看。</p>
+          </div>
+
+          <div class="space-y-2">
+            <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">原始 .env 全量回显（只读）</Label>
+            <textarea
+              :model-value="envConfigSourceText"
+              rows="10"
+              readonly
+              class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-xs leading-5 text-gray-600"
+              placeholder=".env 原始内容"
+            />
+            <p class="text-xs text-gray-400">用于核对注释、空行、行序和重复键历史定义。</p>
+          </div>
+
+          <div class="rounded-xl border border-blue-100 bg-blue-50/40 p-4 space-y-2">
+            <p class="text-xs font-semibold text-blue-800">支付宝口令红包推荐参数模板</p>
+            <p class="text-xs text-blue-700">可复制后直接粘贴到上方文本框，再按需调整并保存。</p>
+            <pre class="max-h-56 overflow-auto rounded-lg border border-blue-100 bg-white/80 p-3 text-[11px] leading-5 font-mono text-blue-900">{{ alipayRedpackEnvTemplate }}</pre>
           </div>
 
           <div v-if="envConfigError" class="rounded-xl bg-red-50 p-4 text-red-600 border border-red-100 text-sm font-medium">

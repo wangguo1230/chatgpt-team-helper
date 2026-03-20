@@ -15,7 +15,7 @@ import { getFeatureFlags, isFeatureEnabled } from '../utils/feature-flags.js'
 
 const DEFAULT_INTERVAL_HOURS = 1
 const DEFAULT_INTERVAL_MINUTES = 60
-const DEFAULT_CREATED_WITHIN_DAYS = 15
+const DEFAULT_CREATED_WITHIN_DAYS = 0
 const DEFAULT_SCHEDULE_MINUTE = 0
 
 const toInt = (value, fallback) => {
@@ -34,7 +34,7 @@ const isEnabledFlag = (value, defaultValue = false) => {
   return raw !== '0' && raw !== 'false' && raw !== 'off'
 }
 
-const runOnStartup = () => isEnabledFlag(process.env.OPEN_ACCOUNTS_SWEEPER_RUN_ON_STARTUP, false)
+const runOnStartup = () => isEnabledFlag(process.env.OPEN_ACCOUNTS_SWEEPER_RUN_ON_STARTUP, true)
 
 // 间隔小时数，默认1小时
 const intervalHours = () => Math.max(1, toInt(process.env.OPEN_ACCOUNTS_SWEEPER_INTERVAL_HOURS, DEFAULT_INTERVAL_HOURS))
@@ -213,7 +213,10 @@ export const startOpenAccountsOvercapacitySweeper = () => {
     const startedAt = new Date()
     try {
       const features = await getFeatureFlags()
-      if (!isFeatureEnabled(features, 'openAccounts')) return
+      if (!isFeatureEnabled(features, 'openAccounts')) {
+        console.log('[OpenAccountsSweeper] skipped: openAccounts feature disabled')
+        return
+      }
 
       const db = await getDatabase()
       const max = getOpenAccountsCapacityLimit(db)
@@ -232,7 +235,12 @@ export const startOpenAccountsOvercapacitySweeper = () => {
           return Number.isFinite(id) ? { id, emailPrefix } : null
         })
         .filter(Boolean)
-      if (accountRows.length === 0) return
+      if (accountRows.length === 0) {
+        console.log('[OpenAccountsSweeper] skipped: no candidate open accounts', {
+          createdWithinDays: windowDays
+        })
+        return
+      }
 
 	      const workerCount = Math.min(concurrency(), accountRows.length)
 	      const queue = [...accountRows]
@@ -372,7 +380,7 @@ export const startOpenAccountsOvercapacitySweeper = () => {
     }, delay)
   }
 
-  // 直接开始整点调度，不在启动时执行
+  // 先启动定时调度，再按 runOnStartup 决定是否立即执行一次
   scheduleNext()
 
   if (runOnStartup()) {

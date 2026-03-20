@@ -2,12 +2,15 @@ version: '3.8'
 
 services:
   app:
-    image:  ghcr.io/wangguo1230/auto-gpt-team
-    # 或使用本地构建: image: auto-gpt-team:latest
-    # image: auto-gpt-team:latest
+    build:
+      context: .
+    image: auto-gpt-team:latest
+    # 如需强制使用远程镜像，可改回：
+    # image: ghcr.io/wangguo1230/auto-gpt-team
     container_name: auto-gpt-team
     ports:
-      - "18008:5173" # 前端 Web 端口（API 通过 nginx 代理，无需暴露 3000）
+      - "${APP_HTTP_PORT:-18008}:80"   # HTTP（会 301 跳转到 HTTPS）
+      - "${APP_HTTPS_PORT:-18443}:443" # HTTPS
     volumes:
       # 持久化数据库文件
       - ./data:/app/backend/db
@@ -19,7 +22,7 @@ services:
       DATABASE_PATH: ${DATABASE_PATH:-/app/backend/db/database.sqlite}
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5173/" ]
+      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/" ]
       interval: 30s
       timeout: 10s
       retries: 3

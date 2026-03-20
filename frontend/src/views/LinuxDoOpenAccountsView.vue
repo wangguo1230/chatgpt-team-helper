@@ -47,7 +47,7 @@
               </div>
               <h1 class="text-4xl sm:text-5xl font-extrabold tracking-tight text-[#1d1d1f] dark:text-white font-display">
                 <span class="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 via-purple-600 to-pink-600 dark:from-blue-400 dark:via-purple-400 dark:to-pink-400">
-                  栗子LDC
+                  栗子小店
                 </span>
               </h1>
               <p class="text-lg text-[#86868b] max-w-lg leading-relaxed">
