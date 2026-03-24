@@ -401,6 +401,7 @@ const parseJsonOrThrow = (text, { logContext, message }) => {
 }
 
 const INVALID_ACCOUNT_EXPIRE_AT = '1970/01/01 00:00:00'
+const INVALID_ACCOUNT_EXPIRE_AT_ALT = '1970-01-01 00:00:00'
 const shouldSendAlertEmail = (options = {}) => {
   if (options?.sendAlertEmail === undefined || options?.sendAlertEmail === null) return true
   return Boolean(options.sendAlertEmail)
@@ -529,37 +530,67 @@ export const markAccountAsBannedAndCleanup = async (db, accountId, reason, optio
  */
 export const markAccountAsInvalid = async (db, accountId, reason, options = {}) => {
   const sendAlertEmail = shouldSendAlertEmail(options)
+  const alertEmailSender = typeof options?.alertEmailSender === 'function' ? options.alertEmailSender : sendAdminAlertEmail
+  const normalizedAccountId = Number(accountId)
+  const lockKey = Number.isFinite(normalizedAccountId) ? `acct:${normalizedAccountId}` : `acct:${String(accountId)}`
   let account = null
   let cleanup = { accountId: Number(accountId), accountEmail: '', deletedCount: 0 }
+  let newlyInvalid = false
+  let alertEmailSent = false
   try {
-    db.run(
-      `
-        UPDATE gpt_accounts
-        SET is_open = 0,
-            expire_at = ?,
-            updated_at = DATETIME('now', 'localtime')
-        WHERE id = ?
-      `,
-      [INVALID_ACCOUNT_EXPIRE_AT, accountId]
-    )
-    await saveDatabase()
-    console.warn(`[AccountSync] 账号已标记为失效并下架: ID=${accountId}, 原因=${reason}`)
+    await withLocks([lockKey], async () => {
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 0,
+              expire_at = ?,
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id = ?
+            AND (
+              COALESCE(is_open, 1) != 0
+              OR COALESCE(expire_at, '') NOT IN (?, ?)
+            )
+        `,
+        [INVALID_ACCOUNT_EXPIRE_AT, accountId, INVALID_ACCOUNT_EXPIRE_AT, INVALID_ACCOUNT_EXPIRE_AT_ALT]
+      )
+      const changedRows = typeof db.getRowsModified === 'function' ? Number(db.getRowsModified() || 0) : 0
+      newlyInvalid = changedRows > 0
 
-    // 清理该账号关联的未使用兑换码
-    cleanup = await deleteUnusedCodesByAccountId(db, accountId)
-    account = await fetchAccountById(db, accountId)
+      if (newlyInvalid) {
+        await saveDatabase()
+        console.warn(`[AccountSync] 账号已标记为失效并下架: ID=${accountId}, 原因=${reason}`)
 
-    // 触发即时邮件告警
-    try {
-      if (sendAlertEmail && account) {
-        await sendAdminAlertEmail({
-          subject: `[账号失效] ${account.email}`,
-          text: `账号已标记为失效并自动下架。\n账号 ID: ${accountId}\n邮箱: ${account.email}\n失效原因: ${reason}\n已删除未使用兑换码: ${cleanup.deletedCount || 0}\n\n该操作会重置到期日期为 1970 年，前端管理列表将显示为“过期”状态。`
+        // 清理该账号关联的未使用兑换码
+        cleanup = await deleteUnusedCodesByAccountId(db, accountId)
+      }
+
+      account = await fetchAccountById(db, accountId)
+      if (!newlyInvalid) {
+        cleanup = {
+          accountId: Number(accountId),
+          accountEmail: account?.email || '',
+          deletedCount: 0
+        }
+        console.info('[AccountSync] 账号已处于失效状态，跳过重复通知', {
+          accountId,
+          reason
         })
       }
-    } catch (mailError) {
-      console.error('[AccountSync] 发送账号失效告警邮件失败', mailError)
-    }
+
+      // 触发即时邮件告警（仅首次失效触发）
+      try {
+        if (sendAlertEmail && newlyInvalid && account) {
+          alertEmailSent = Boolean(
+            await alertEmailSender({
+              subject: `[账号失效] ${account.email}`,
+              text: `账号已标记为失效并自动下架。\n账号 ID: ${accountId}\n邮箱: ${account.email}\n失效原因: ${reason}\n已删除未使用兑换码: ${cleanup.deletedCount || 0}\n\n该操作会重置到期日期为 1970 年，前端管理列表将显示为“过期”状态。`
+            })
+          )
+        }
+      } catch (mailError) {
+        console.error('[AccountSync] 发送账号失效告警邮件失败', mailError)
+      }
+    })
   } catch (error) {
     console.error(`[AccountSync] 标记账号失效失败: ID=${accountId}`, error)
   }
@@ -568,7 +599,9 @@ export const markAccountAsInvalid = async (db, accountId, reason, options = {}) 
     accountId: Number(accountId),
     accountEmail: account?.email || cleanup.accountEmail || '',
     deletedUnusedCodeCount: Number(cleanup.deletedCount || 0),
-    reason: String(reason || '').trim()
+    reason: String(reason || '').trim(),
+    newlyInvalid,
+    alertEmailSent
   }
 }
 
