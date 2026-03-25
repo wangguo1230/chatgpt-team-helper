@@ -4,11 +4,13 @@ import { getDatabase, saveDatabase } from '../database/init.js'
 import { authenticateToken } from '../middleware/auth.js'
 import { apiKeyAuth } from '../middleware/api-key-auth.js'
 import { requireMenu } from '../middleware/rbac.js'
+import { userHasRoleKey } from '../services/rbac.js'
 import { syncAccountUserCount, syncAccountInviteCount, fetchOpenAiAccountInfo, fetchAccountUsersList, AccountSyncError, deleteAccountUser, inviteAccountUser, deleteAccountInvite, refreshAccessTokenWithRefreshToken, persistAccountTokens, deleteUnusedCodesByAccountId } from '../services/account-sync.js'
 import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
 import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 import { withLocks } from '../utils/locks.js'
 import { performDirectInvite } from '../services/direct-invite.js'
+import { decryptSensitiveText, encryptSensitiveText } from '../utils/sensitive-crypto.js'
 
 const router = express.Router()
 const OPENAI_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
@@ -142,6 +144,8 @@ const mapGptAccountRow = (row) => {
   if (!row) return null
   const isBanned = Boolean(row[10])
   const bannedAt = row[11] || null
+  const gptPasswordCipher = row[15] ? String(row[15]) : ''
+  const emailPasswordCipher = row[16] ? String(row[16]) : ''
   return {
     id: row[0],
     email: row[1],
@@ -158,6 +162,8 @@ const mapGptAccountRow = (row) => {
     bannedAt,
     bannedDays: calculateBannedDays(isBanned, bannedAt),
     riskNote: row[12] || null,
+    hasGptPassword: Boolean(gptPasswordCipher),
+    hasEmailPassword: Boolean(emailPasswordCipher),
     createdAt: row[13],
     updatedAt: row[14]
   }
@@ -231,6 +237,35 @@ const normalizeRiskNote = (value) => {
   const normalized = String(value).trim()
   if (!normalized) return null
   return normalized.slice(0, RISK_NOTE_MAX_LENGTH)
+}
+const normalizeSensitivePasswordInput = (value) => {
+  if (value == null) return null
+  const normalized = String(value).trim()
+  if (!normalized) return ''
+  return normalized.slice(0, 500)
+}
+const resolveSensitivePasswordPatch = (body, camelKey, snakeKey) => {
+  const hasValue = Object.prototype.hasOwnProperty.call(body, camelKey) || Object.prototype.hasOwnProperty.call(body, snakeKey)
+  if (!hasValue) return { hasValue: false, cipherValue: null }
+  const normalized = normalizeSensitivePasswordInput(
+    Object.prototype.hasOwnProperty.call(body, camelKey) ? body[camelKey] : body[snakeKey]
+  )
+  if (normalized === null) return { hasValue: true, cipherValue: null }
+  if (!normalized) return { hasValue: true, cipherValue: null }
+  return { hasValue: true, cipherValue: encryptSensitiveText(normalized) }
+}
+const appendSensitiveFieldsForAdmin = (account, row) => {
+  if (!account || !row) return account
+  return {
+    ...account,
+    gptPassword: decryptSensitiveText(row[15]) || '',
+    emailPassword: decryptSensitiveText(row[16]) || '',
+  }
+}
+const isCurrentUserSuperAdmin = async (db, req) => {
+  const userId = Number(req?.user?.id || 0)
+  if (!db || !Number.isFinite(userId) || userId <= 0) return false
+  return userHasRoleKey(userId, 'super_admin', db)
 }
 
 const loadDirectInviteCodeStatsByEmails = (db, emails) => {
@@ -969,6 +1004,7 @@ router.get('/check-status/stream', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
     const page = Math.max(1, Number(req.query.page) || 1)
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
     const search = (req.query.search || '').trim().toLowerCase()
@@ -1003,14 +1039,19 @@ router.get('/', async (req, res) => {
 	             COALESCE(is_banned, 0) AS is_banned,
 	             banned_at,
 	             risk_note,
-	             created_at, updated_at
+	             created_at, updated_at,
+	             gpt_password_cipher,
+	             email_password_cipher
 	      FROM gpt_accounts
 	      ${whereClause}
 	      ORDER BY created_at DESC
 	      LIMIT ? OFFSET ?
 	    `, [...params, pageSize, offset])
 
-	    const accounts = (dataResult[0]?.values || []).map(mapGptAccountRow)
+	    const accounts = (dataResult[0]?.values || []).map((row) => {
+      const base = mapGptAccountRow(row)
+      return isSuperAdmin ? appendSensitiveFieldsForAdmin(base, row) : base
+    })
       const capacityLimit = getOpenAccountsCapacityLimit(db)
       const nowMs = Date.now()
       const codeStatsByEmail = loadDirectInviteCodeStatsByEmails(
@@ -1041,12 +1082,15 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
 	    const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
 	    const result = db.exec(`
 	      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
 	             COALESCE(is_banned, 0) AS is_banned,
 	             banned_at,
 	             risk_note,
-	             created_at, updated_at
+	             created_at, updated_at,
+	             gpt_password_cipher,
+	             email_password_cipher
 	      FROM gpt_accounts
 	      WHERE id = ?
 	    `, [req.params.id])
@@ -1056,7 +1100,8 @@ router.get('/:id', async (req, res) => {
     }
 
 	    const row = result[0].values[0]
-	    const account = mapGptAccountRow(row)
+	    const accountBase = mapGptAccountRow(row)
+    const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     res.json(account)
   } catch (error) {
@@ -1096,6 +1141,8 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Invalid isBanned format' })
     }
     const isBannedValue = normalizedIsBanned ? 1 : 0
+    const gptPasswordPatch = resolveSensitivePasswordPatch(body, 'gptPassword', 'gpt_password')
+    const emailPasswordPatch = resolveSensitivePasswordPatch(body, 'emailPassword', 'email_password')
 
     if (!email || !token || !normalizedChatgptAccountId) {
       return res.status(400).json({ error: 'Email, token and ChatGPT ID are required' })
@@ -1111,6 +1158,12 @@ router.post('/', async (req, res) => {
     const normalizedEmail = normalizeEmail(email)
 
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
+    if (!isSuperAdmin && (gptPasswordPatch.hasValue || emailPasswordPatch.hasValue)) {
+      return res.status(403).json({ error: 'Only super_admin can set sensitive password fields' })
+    }
+    const effectiveGptPasswordPatch = isSuperAdmin ? gptPasswordPatch : { hasValue: false, cipherValue: null }
+    const effectiveEmailPasswordPatch = isSuperAdmin ? emailPasswordPatch : { hasValue: false, cipherValue: null }
 
     // 设置默认人数为1而不是0
     const finalUserCount = userCount !== undefined ? userCount : 1
@@ -1127,11 +1180,14 @@ router.post('/', async (req, res) => {
 	          expire_at,
 	          is_banned,
 	          banned_at,
+	          gpt_password_cipher,
+	          email_password_cipher,
 	          created_at,
 	          updated_at
 	        ) VALUES (
 	          ?, ?, ?, ?, ?, ?, ?, ?,
 	          CASE WHEN ? = 1 THEN DATETIME('now', 'localtime') ELSE NULL END,
+	          ?, ?,
 	          DATETIME('now', 'localtime'),
 	          DATETIME('now', 'localtime')
 	        )
@@ -1145,7 +1201,9 @@ router.post('/', async (req, res) => {
 	        normalizedOaiDeviceId || null,
 	        normalizedExpireAt,
 	        isBannedValue,
-	        isBannedValue
+	        isBannedValue,
+          effectiveGptPasswordPatch.cipherValue,
+          effectiveEmailPasswordPatch.cipherValue
 	      ]
 	    )
 
@@ -1155,12 +1213,15 @@ router.post('/', async (req, res) => {
 		             COALESCE(is_banned, 0) AS is_banned,
 		             banned_at,
 		             risk_note,
-		             created_at, updated_at
+		             created_at, updated_at,
+		             gpt_password_cipher,
+		             email_password_cipher
 		      FROM gpt_accounts
 		      WHERE id = last_insert_rowid()
 		    `)
 	    const row = accountResult[0].values[0]
-	    const account = mapGptAccountRow(row)
+	    const accountBase = mapGptAccountRow(row)
+    const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     saveDatabase()
 
@@ -1207,6 +1268,8 @@ router.put('/:id', async (req, res) => {
     const shouldUpdateIsBanned = hasIsBanned
     const isBannedValue = normalizedIsBanned ? 1 : 0
     const shouldApplyBanSideEffects = shouldUpdateIsBanned && isBannedValue === 1
+    const gptPasswordPatch = resolveSensitivePasswordPatch(body, 'gptPassword', 'gpt_password')
+    const emailPasswordPatch = resolveSensitivePasswordPatch(body, 'emailPassword', 'email_password')
 
     if (!email || !token || !normalizedChatgptAccountId) {
       return res.status(400).json({ error: 'Email, token and ChatGPT ID are required' })
@@ -1220,6 +1283,12 @@ router.put('/:id', async (req, res) => {
     }
 
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
+    if (!isSuperAdmin && (gptPasswordPatch.hasValue || emailPasswordPatch.hasValue)) {
+      return res.status(403).json({ error: 'Only super_admin can set sensitive password fields' })
+    }
+    const effectiveGptPasswordPatch = isSuperAdmin ? gptPasswordPatch : { hasValue: false, cipherValue: null }
+    const effectiveEmailPasswordPatch = isSuperAdmin ? emailPasswordPatch : { hasValue: false, cipherValue: null }
 
     // Check if account exists
     const checkResult = db.exec('SELECT id, email FROM gpt_accounts WHERE id = ?', [req.params.id])
@@ -1229,22 +1298,24 @@ router.put('/:id', async (req, res) => {
 
     const existingEmail = checkResult[0].values[0][1]
 
-	    db.run(
-	      `UPDATE gpt_accounts
-	       SET email = ?,
-	           token = ?,
-	           refresh_token = ?,
-	           user_count = ?,
-	           chatgpt_account_id = ?,
-	           oai_device_id = ?,
-	           expire_at = CASE WHEN ? = 1 THEN ? ELSE expire_at END,
-	           is_banned = CASE WHEN ? = 1 THEN ? ELSE is_banned END,
-	           banned_at = CASE WHEN ? = 1 THEN CASE WHEN ? = 1 THEN COALESCE(banned_at, DATETIME('now', 'localtime')) ELSE NULL END ELSE banned_at END,
-	           is_open = CASE WHEN ? = 1 THEN 0 ELSE is_open END,
-	           ban_processed = CASE WHEN ? = 1 THEN 0 ELSE ban_processed END,
-	           updated_at = DATETIME('now', 'localtime')
-	       WHERE id = ?`,
-	      [
+    db.run(
+      `UPDATE gpt_accounts
+       SET email = ?,
+           token = ?,
+           refresh_token = ?,
+           user_count = ?,
+           chatgpt_account_id = ?,
+           oai_device_id = ?,
+           expire_at = CASE WHEN ? = 1 THEN ? ELSE expire_at END,
+           is_banned = CASE WHEN ? = 1 THEN ? ELSE is_banned END,
+           banned_at = CASE WHEN ? = 1 THEN CASE WHEN ? = 1 THEN COALESCE(banned_at, DATETIME('now', 'localtime')) ELSE NULL END ELSE banned_at END,
+           is_open = CASE WHEN ? = 1 THEN 0 ELSE is_open END,
+           ban_processed = CASE WHEN ? = 1 THEN 0 ELSE ban_processed END,
+           gpt_password_cipher = CASE WHEN ? = 1 THEN ? ELSE gpt_password_cipher END,
+           email_password_cipher = CASE WHEN ? = 1 THEN ? ELSE email_password_cipher END,
+           updated_at = DATETIME('now', 'localtime')
+       WHERE id = ?`,
+      [
         email,
         token,
         refreshToken || null,
@@ -1252,16 +1323,20 @@ router.put('/:id', async (req, res) => {
         normalizedChatgptAccountId,
         normalizedOaiDeviceId || null,
         hasExpireAt ? 1 : 0,
-	        normalizedExpireAt,
-	        shouldUpdateIsBanned ? 1 : 0,
-	        isBannedValue,
-	        shouldUpdateIsBanned ? 1 : 0,
-	        isBannedValue,
-	        shouldApplyBanSideEffects ? 1 : 0,
-	        shouldApplyBanSideEffects ? 1 : 0,
-	        req.params.id
-	      ]
-	    )
+        normalizedExpireAt,
+        shouldUpdateIsBanned ? 1 : 0,
+        isBannedValue,
+        shouldUpdateIsBanned ? 1 : 0,
+        isBannedValue,
+        shouldApplyBanSideEffects ? 1 : 0,
+        shouldApplyBanSideEffects ? 1 : 0,
+        effectiveGptPasswordPatch.hasValue ? 1 : 0,
+        effectiveGptPasswordPatch.cipherValue,
+        effectiveEmailPasswordPatch.hasValue ? 1 : 0,
+        effectiveEmailPasswordPatch.cipherValue,
+        req.params.id
+      ]
+    )
 
     if (existingEmail && existingEmail !== email) {
       db.run(
@@ -1277,18 +1352,24 @@ router.put('/:id', async (req, res) => {
 
     saveDatabase()
 
-		    // Get the updated account
-		    const result = db.exec(`
-		      SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
-		             COALESCE(is_banned, 0) AS is_banned,
-		             banned_at,
-		             risk_note,
-		             created_at, updated_at
-		      FROM gpt_accounts
-		      WHERE id = ?
-		    `, [req.params.id])
-	    const row = result[0].values[0]
-	    const account = mapGptAccountRow(row)
+    // Get the updated account
+    const result = db.exec(
+      `
+        SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+               COALESCE(is_banned, 0) AS is_banned,
+               banned_at,
+               risk_note,
+               created_at, updated_at,
+               gpt_password_cipher,
+               email_password_cipher
+        FROM gpt_accounts
+        WHERE id = ?
+      `,
+      [req.params.id]
+    )
+    const row = result[0].values[0]
+    const accountBase = mapGptAccountRow(row)
+    const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     res.json(account)
   } catch (error) {
@@ -1306,6 +1387,7 @@ router.patch('/:id/risk-note', async (req, res) => {
     }
 
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
     const checkResult = db.exec('SELECT id FROM gpt_accounts WHERE id = ?', [accountId])
     if (checkResult.length === 0 || checkResult[0].values.length === 0) {
       return res.status(404).json({ error: 'Account not found' })
@@ -1324,14 +1406,17 @@ router.patch('/:id/risk-note', async (req, res) => {
                COALESCE(is_banned, 0) AS is_banned,
                banned_at,
                risk_note,
-               created_at, updated_at
+               created_at, updated_at,
+               gpt_password_cipher,
+               email_password_cipher
         FROM gpt_accounts
         WHERE id = ?
       `,
       [accountId]
     )
     const row = result[0].values[0]
-    const account = mapGptAccountRow(row)
+    const accountBase = mapGptAccountRow(row)
+    const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     return res.json({
       message: '备注已更新',
@@ -1352,6 +1437,7 @@ router.patch('/:id/open', async (req, res) => {
     }
 
 	    const db = await getDatabase()
+      const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
 
 	    const checkResult = db.exec('SELECT id, COALESCE(is_banned, 0) AS is_banned FROM gpt_accounts WHERE id = ?', [req.params.id])
 	    if (checkResult.length === 0 || checkResult[0].values.length === 0) {
@@ -1375,14 +1461,17 @@ router.patch('/:id/open', async (req, res) => {
 			               COALESCE(is_banned, 0) AS is_banned,
 			               banned_at,
 			               risk_note,
-			               created_at, updated_at
+			               created_at, updated_at,
+			               gpt_password_cipher,
+			               email_password_cipher
 			        FROM gpt_accounts
 			        WHERE id = ?
 			      `,
 			      [req.params.id]
 			    )
 		    const row = result[0].values[0]
-		    const account = mapGptAccountRow(row)
+        const accountBase = mapGptAccountRow(row)
+        const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     res.json(account)
   } catch (error) {
@@ -1400,6 +1489,7 @@ router.patch('/:id/ban', async (req, res) => {
     }
 
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
     const checkResult = db.exec('SELECT id FROM gpt_accounts WHERE id = ?', [accountId])
     if (checkResult.length === 0 || checkResult[0].values.length === 0) {
       return res.status(404).json({ error: 'Account not found' })
@@ -1425,14 +1515,17 @@ router.patch('/:id/ban', async (req, res) => {
 	               COALESCE(is_banned, 0) AS is_banned,
 	               banned_at,
 	               risk_note,
-	               created_at, updated_at
+	               created_at, updated_at,
+	               gpt_password_cipher,
+	               email_password_cipher
 	        FROM gpt_accounts
 	        WHERE id = ?
 	      `,
 	      [accountId]
 	    )
 	    const row = result[0].values[0]
-	    const account = mapGptAccountRow(row)
+      const accountBase = mapGptAccountRow(row)
+      const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, row) : accountBase
 
     res.json(account)
   } catch (error) {
@@ -1801,6 +1894,7 @@ router.delete('/:id/invites', async (req, res) => {
 router.post('/:id/refresh-token', async (req, res) => {
   try {
     const db = await getDatabase()
+    const isSuperAdmin = await isCurrentUserSuperAdmin(db, req)
     const accountId = Number(req.params.id)
 
     const checkResult = db.exec(
@@ -1829,11 +1923,20 @@ router.post('/:id/refresh-token', async (req, res) => {
     const persisted = await persistAccountTokens(db, accountId, tokens)
 
 	    const updatedResult = db.exec(
-	      'SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open, COALESCE(is_banned, 0) AS is_banned, banned_at, risk_note, created_at, updated_at FROM gpt_accounts WHERE id = ?',
+	      `SELECT id, email, token, refresh_token, user_count, invite_count, chatgpt_account_id, oai_device_id, expire_at, is_open,
+                COALESCE(is_banned, 0) AS is_banned,
+                banned_at,
+                risk_note,
+                created_at, updated_at,
+                gpt_password_cipher,
+                email_password_cipher
+         FROM gpt_accounts
+         WHERE id = ?`,
 	      [accountId]
 	    )
 	    const updatedRow = updatedResult[0].values[0]
-	    const account = mapGptAccountRow(updatedRow)
+      const accountBase = mapGptAccountRow(updatedRow)
+      const account = isSuperAdmin ? appendSensitiveFieldsForAdmin(accountBase, updatedRow) : accountBase
 
     res.json({
       message: 'Token 刷新成功',

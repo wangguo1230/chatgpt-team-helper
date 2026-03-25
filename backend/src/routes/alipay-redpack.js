@@ -27,6 +27,17 @@ import {
   releaseAlipayRedpackOrderSupplementExecution,
   AlipayRedpackOrderError,
 } from '../services/alipay-redpack-orders.js'
+import {
+  ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY,
+  ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER,
+  ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE,
+  deleteAlipayRedpackProduct,
+  getAlipayRedpackProductByKey,
+  listAlipayRedpackProducts,
+  normalizeAlipayRedpackPaymentMethod,
+  normalizeAlipayRedpackProductType,
+  upsertAlipayRedpackProduct,
+} from '../services/alipay-redpack-products.js'
 import { performDirectInvite } from '../services/direct-invite.js'
 import {
   fetchAccountUsersList,
@@ -41,13 +52,16 @@ import {
   sendVerificationCodeEmail,
   sendAlipayRedpackOrderProcessedEmail,
   sendAlipayRedpackOrderReturnedEmail,
+  sendAlipayRedpackMotherDeliveryEmail,
 } from '../services/email-service.js'
 import { withLocks } from '../utils/locks.js'
+import { decryptSensitiveText } from '../utils/sensitive-crypto.js'
 
 const router = express.Router()
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const ADMIN_MENU_KEY = 'alipay_redpack_orders'
+const ADMIN_PRODUCT_MENU_KEY = 'alipay_redpack_products'
 const SUPPLEMENT_ADMIN_MENU_KEY = 'alipay_redpack_supplements'
 const SUPPLEMENT_AUTH_PURPOSE = 'alipay_redpack_supplement'
 const parsePositiveIntWithDefault = (value, fallback) => {
@@ -349,6 +363,433 @@ const loadGptAccountIdByEmail = async (email) => {
   const id = toPositiveInt(row?.[0])
   return id || null
 }
+const parseInviteEmailsInput = (value, fallbackEmail = '') => {
+  const rawList = Array.isArray(value)
+    ? value
+    : String(value ?? '')
+      .split(/[\n,;]+/)
+      .map(item => String(item || '').trim())
+  const deduped = []
+  const seen = new Set()
+  for (const raw of rawList) {
+    const normalized = normalizeEmail(raw)
+    if (!EMAIL_REGEX.test(normalized) || seen.has(normalized)) continue
+    seen.add(normalized)
+    deduped.push(normalized)
+  }
+  if (!deduped.length) {
+    const fallback = normalizeEmail(fallbackEmail)
+    if (EMAIL_REGEX.test(fallback)) deduped.push(fallback)
+  }
+  return deduped
+}
+const resolveOrderInviteEmails = (order) => {
+  if (Array.isArray(order?.inviteEmails) && order.inviteEmails.length) {
+    return parseInviteEmailsInput(order.inviteEmails, order?.email)
+  }
+  return parseInviteEmailsInput('', order?.email)
+}
+const resolveOrderProductType = (order) => normalizeAlipayRedpackProductType(
+  order?.productType,
+  ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+)
+const resolveOrderQuantity = (order) => {
+  const quantity = toPositiveInt(order?.quantity)
+  return quantity || 1
+}
+const formatBatchInviteSummary = (results = []) => {
+  const list = Array.isArray(results) ? results : []
+  let success = 0
+  let failed = 0
+  for (const item of list) {
+    if (item?.status === 'success') success += 1
+    else failed += 1
+  }
+  return `批量邀请完成：成功 ${success} / 失败 ${failed}`
+}
+const upsertOrderInviteItems = async (db, orderId, results = []) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  if (!db || !normalizedOrderId) return
+  const nowSql = "DATETIME('now', 'localtime')"
+  db.run('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    db.run('DELETE FROM alipay_redpack_order_invite_items WHERE order_id = ?', [normalizedOrderId])
+    const list = Array.isArray(results) ? results : []
+    list.forEach((item, index) => {
+      const inviteEmail = normalizeEmail(item?.email)
+      if (!EMAIL_REGEX.test(inviteEmail)) return
+      db.run(
+        `
+          INSERT INTO alipay_redpack_order_invite_items (
+            order_id, invite_index, invite_email, status,
+            invited_account_id, invited_account_email,
+            consumed_code_id, consumed_code, invite_result,
+            queue_is_member, queue_is_invited, invite_sent_at,
+            created_at, updated_at
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${nowSql}, ${nowSql}
+          )
+        `,
+        [
+          normalizedOrderId,
+          index + 1,
+          inviteEmail,
+          String(item?.status || 'failed'),
+          toPositiveInt(item?.accountId) || null,
+          String(item?.accountEmail || '').trim() || null,
+          toPositiveInt(item?.consumedCodeId) || null,
+          String(item?.consumedCode || '').trim() || null,
+          String(item?.message || '').trim() || null,
+          item?.queueState?.isMember ? 1 : 0,
+          item?.queueState?.isInvited ? 1 : 0,
+          item?.sentAt || null,
+        ]
+      )
+    })
+    db.run('COMMIT')
+    saveDatabase()
+  } catch (error) {
+    try {
+      db.run('ROLLBACK')
+    } catch {
+      // ignore rollback errors
+    }
+    throw error
+  }
+}
+const listOrderInviteItemsByOrder = (db, orderId) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  if (!db || !normalizedOrderId) return []
+  const result = db.exec(
+    `
+      SELECT invite_email, status,
+             invited_account_id, invited_account_email,
+             consumed_code_id, consumed_code,
+             invite_result, invite_sent_at,
+             COALESCE(queue_is_member, 0), COALESCE(queue_is_invited, 0)
+      FROM alipay_redpack_order_invite_items
+      WHERE order_id = ?
+      ORDER BY invite_index ASC, id ASC
+    `,
+    [normalizedOrderId]
+  )
+  return (result?.[0]?.values || []).map((row) => ({
+    email: normalizeEmail(row[0]),
+    status: String(row[1] || '').trim().toLowerCase() || 'failed',
+    accountId: toPositiveInt(row[2]) || null,
+    accountEmail: String(row[3] || '').trim() || null,
+    consumedCodeId: toPositiveInt(row[4]) || null,
+    consumedCode: String(row[5] || '').trim() || null,
+    message: String(row[6] || '').trim() || '',
+    sentAt: row[7] || null,
+    queueState: {
+      isMember: Number(row[8] || 0) === 1,
+      isInvited: Number(row[9] || 0) === 1,
+    },
+  })).filter(item => EMAIL_REGEX.test(item.email))
+}
+const collectSingleOrderInviteRevokeTargets = (db, order) => {
+  const targets = []
+  const seen = new Set()
+  const pushTarget = (accountId, email) => {
+    const normalizedAccountId = toPositiveInt(accountId)
+    const normalizedEmail = normalizeEmail(email)
+    if (!normalizedAccountId || !EMAIL_REGEX.test(normalizedEmail)) return
+    const dedupeKey = `${normalizedAccountId}:${normalizedEmail}`
+    if (seen.has(dedupeKey)) return
+    seen.add(dedupeKey)
+    targets.push({
+      accountId: normalizedAccountId,
+      email: normalizedEmail,
+    })
+  }
+
+  const existingItems = listOrderInviteItemsByOrder(db, order?.id)
+  for (const item of existingItems) {
+    if (item?.status !== 'success') continue
+    pushTarget(item.accountId, item.email)
+  }
+
+  const invitedAccountId = toPositiveInt(order?.invitedAccountId)
+  if (invitedAccountId) {
+    const inviteEmails = resolveOrderInviteEmails(order)
+    for (const inviteEmail of inviteEmails) {
+      pushTarget(invitedAccountId, inviteEmail)
+    }
+  }
+
+  return targets
+}
+const listMotherAccountRowsByOrder = (db, orderId) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  if (!db || !normalizedOrderId) return []
+  const result = db.exec(
+    `
+      SELECT id, account_id, account_email, status, delivery_email, delivery_sent_at
+      FROM alipay_redpack_order_mother_accounts
+      WHERE order_id = ?
+      ORDER BY id ASC
+    `,
+    [normalizedOrderId]
+  )
+  return result?.[0]?.values || []
+}
+const loadMotherAccountCredentialsByIds = (db, accountIds = []) => {
+  const normalizedIds = [...new Set((accountIds || []).map(item => toPositiveInt(item)).filter(Boolean))]
+  if (!db || !normalizedIds.length) return []
+  const placeholders = normalizedIds.map(() => '?').join(',')
+  const result = db.exec(
+    `
+      SELECT id, email, gpt_password_cipher, email_password_cipher
+      FROM gpt_accounts
+      WHERE id IN (${placeholders})
+      ORDER BY id ASC
+    `,
+    normalizedIds
+  )
+  return (result?.[0]?.values || []).map(row => ({
+    id: Number(row[0] || 0),
+    email: String(row[1] || '').trim().toLowerCase(),
+    gptPassword: decryptSensitiveText(row[2]) || '',
+    emailPassword: decryptSensitiveText(row[3]) || '',
+  }))
+}
+const selectAvailableMotherAccounts = (db, quantity, { excludeAccountIds = [] } = {}) => {
+  const normalizedQuantity = toPositiveInt(quantity) || 1
+  const normalizedExcludeIds = [...new Set((excludeAccountIds || []).map(item => toPositiveInt(item)).filter(Boolean))]
+  const excludeClause = normalizedExcludeIds.length
+    ? `AND ga.id NOT IN (${normalizedExcludeIds.map(() => '?').join(',')})`
+    : ''
+  const params = [...normalizedExcludeIds, normalizedQuantity]
+  const result = db.exec(
+    `
+      SELECT ga.id, ga.email
+      FROM gpt_accounts ga
+      LEFT JOIN redemption_codes rc
+        ON lower(trim(rc.account_email)) = lower(trim(ga.email))
+       AND COALESCE(rc.is_redeemed, 0) = 0
+      LEFT JOIN alipay_redpack_order_mother_accounts ama
+        ON ama.account_id = ga.id
+       AND COALESCE(ama.status, 'reserved') IN ('reserved', 'delivered')
+      WHERE COALESCE(ga.is_open, 0) = 1
+        AND COALESCE(ga.is_banned, 0) = 0
+        AND ama.id IS NULL
+        ${excludeClause}
+      GROUP BY ga.id, ga.email
+      HAVING COUNT(rc.id) = 4
+      ORDER BY ga.id ASC
+      LIMIT ?
+    `,
+    params
+  )
+  return (result?.[0]?.values || []).map(row => ({
+    accountId: Number(row[0] || 0),
+    accountEmail: String(row[1] || '').trim().toLowerCase(),
+  }))
+}
+const reserveMotherAccountsForOrder = async (db, orderId, quantity) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  const normalizedQuantity = toPositiveInt(quantity) || 1
+  if (!db || !normalizedOrderId || !normalizedQuantity) return []
+
+  const orderRows = listMotherAccountRowsByOrder(db, normalizedOrderId)
+  const existingReservedRows = orderRows
+    .filter(row => String(row?.[3] || '').trim().toLowerCase() === 'reserved')
+    .slice(0, normalizedQuantity)
+    .map(row => ({
+      accountId: Number(row[1] || 0),
+      accountEmail: String(row[2] || '').trim().toLowerCase(),
+    }))
+  if (existingReservedRows.length >= normalizedQuantity) return existingReservedRows
+
+  const existingAccountIds = [...new Set(orderRows.map(row => Number(row?.[1] || 0)).filter(Boolean))]
+  const reusableReturnedRows = orderRows
+    .filter(row => String(row?.[3] || '').trim().toLowerCase() === 'returned')
+    .map(row => ({
+      accountId: Number(row?.[1] || 0),
+      accountEmail: String(row?.[2] || '').trim().toLowerCase(),
+    }))
+    .filter(item => item.accountId > 0)
+
+  const neededAfterReserved = normalizedQuantity - existingReservedRows.length
+  const reusedRows = reusableReturnedRows.slice(0, neededAfterReserved)
+  const remainingNeeded = neededAfterReserved - reusedRows.length
+  const candidates = remainingNeeded > 0
+    ? selectAvailableMotherAccounts(db, remainingNeeded, { excludeAccountIds: existingAccountIds })
+    : []
+  if (candidates.length < remainingNeeded) {
+    throw new AlipayRedpackOrderError('可用 GPT 母号不足，请补充后重试', 409, 'alipay_redpack_mother_account_insufficient')
+  }
+
+  const nowSql = "DATETIME('now', 'localtime')"
+  db.run('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    reusedRows.forEach((item) => {
+      db.run(
+        `
+          UPDATE alipay_redpack_order_mother_accounts
+          SET status = 'reserved',
+              delivery_email = NULL,
+              delivery_sent_at = NULL,
+              note = NULL,
+              updated_at = ${nowSql}
+          WHERE order_id = ?
+            AND account_id = ?
+            AND status = 'returned'
+        `,
+        [normalizedOrderId, item.accountId]
+      )
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 0,
+              updated_at = ${nowSql}
+          WHERE id = ?
+        `,
+        [item.accountId]
+      )
+    })
+
+    candidates.forEach((item) => {
+      db.run(
+        `
+          INSERT INTO alipay_redpack_order_mother_accounts (
+            order_id, account_id, account_email, status, created_at, updated_at
+          ) VALUES (?, ?, ?, 'reserved', ${nowSql}, ${nowSql})
+        `,
+        [normalizedOrderId, item.accountId, item.accountEmail]
+      )
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 0,
+              updated_at = ${nowSql}
+          WHERE id = ?
+        `,
+        [item.accountId]
+      )
+    })
+    db.run('COMMIT')
+    await saveDatabase()
+  } catch (error) {
+    try {
+      db.run('ROLLBACK')
+    } catch {
+      // ignore rollback errors
+    }
+    throw error
+  }
+
+  return [...existingReservedRows, ...reusedRows, ...candidates]
+}
+const finalizeDeliveredMotherAccounts = async (db, orderId, deliveryEmail) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  const normalizedDeliveryEmail = normalizeEmail(deliveryEmail)
+  if (!db || !normalizedOrderId) return { affectedAccountEmails: [], deletedCodes: 0 }
+
+  const rows = listMotherAccountRowsByOrder(db, normalizedOrderId)
+  const affectedEmails = rows
+    .map(row => normalizeEmail(row?.[2]))
+    .filter(email => EMAIL_REGEX.test(email))
+
+  db.run('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    db.run(
+      `
+        UPDATE alipay_redpack_order_mother_accounts
+        SET status = 'delivered',
+            delivery_email = ?,
+            delivery_sent_at = DATETIME('now', 'localtime'),
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_id = ?
+      `,
+      [normalizedDeliveryEmail || null, normalizedOrderId]
+    )
+    db.run(
+      `
+        UPDATE alipay_redpack_orders
+        SET mother_delivery_sent_at = DATETIME('now', 'localtime'),
+            mother_delivery_mail_to = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [normalizedDeliveryEmail || null, normalizedOrderId]
+    )
+
+    let deletedCodes = 0
+    if (affectedEmails.length) {
+      const placeholders = affectedEmails.map(() => '?').join(',')
+      db.run(
+        `
+          DELETE FROM redemption_codes
+          WHERE lower(trim(account_email)) IN (${placeholders})
+        `,
+        affectedEmails
+      )
+      deletedCodes = Number(db.getRowsModified?.() || 0)
+    }
+
+    db.run('COMMIT')
+    await saveDatabase()
+    return { affectedAccountEmails: affectedEmails, deletedCodes }
+  } catch (error) {
+    try {
+      db.run('ROLLBACK')
+    } catch {
+      // ignore rollback errors
+    }
+    throw error
+  }
+}
+const rollbackReservedMotherAccounts = async (db, orderId, { note = '' } = {}) => {
+  const normalizedOrderId = toPositiveInt(orderId)
+  if (!db || !normalizedOrderId) return { reopenedCount: 0, deliveredCount: 0 }
+  const rows = listMotherAccountRowsByOrder(db, normalizedOrderId)
+  const reservedIds = rows
+    .filter(row => String(row?.[3] || '').trim().toLowerCase() === 'reserved')
+    .map(row => Number(row[1] || 0))
+    .filter(Boolean)
+  const deliveredCount = rows.filter(row => String(row?.[3] || '').trim().toLowerCase() === 'delivered').length
+
+  db.run('BEGIN IMMEDIATE TRANSACTION')
+  try {
+    if (reservedIds.length) {
+      const placeholders = reservedIds.map(() => '?').join(',')
+      db.run(
+        `
+          UPDATE gpt_accounts
+          SET is_open = 1,
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id IN (${placeholders})
+        `,
+        reservedIds
+      )
+    }
+    db.run(
+      `
+        UPDATE alipay_redpack_order_mother_accounts
+        SET status = CASE
+              WHEN status = 'delivered' THEN status
+              ELSE 'returned'
+            END,
+            note = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE order_id = ?
+      `,
+      [String(note || '').trim() || null, normalizedOrderId]
+    )
+    db.run('COMMIT')
+    await saveDatabase()
+    return { reopenedCount: reservedIds.length, deliveredCount }
+  } catch (error) {
+    try {
+      db.run('ROLLBACK')
+    } catch {
+      // ignore rollback errors
+    }
+    throw error
+  }
+}
 const isGptAccountInvalidForSupplement = (account) => {
   if (!account) return true
   if (account.isBanned) return true
@@ -574,6 +1015,200 @@ const notifyOrderReturnedEmailSafely = async ({ orderId, email, reason } = {}) =
   }
 }
 
+const processBatchSingleOrderInvites = async ({
+  order,
+  operator = {},
+} = {}) => {
+  const orderId = toPositiveInt(order?.id)
+  if (!orderId) {
+    throw new AlipayRedpackOrderError('无效订单ID', 400, 'alipay_redpack_invalid_id')
+  }
+
+  const inviteEmails = resolveOrderInviteEmails(order)
+  if (!inviteEmails.length) {
+    throw new AlipayRedpackOrderError('邀请邮箱不能为空', 400, 'alipay_redpack_missing_invite_emails')
+  }
+
+  const db = await getDatabase()
+  const existingItems = listOrderInviteItemsByOrder(db, orderId)
+  const existingSuccessByEmail = new Map()
+  for (const item of existingItems) {
+    if (item.status !== 'success') continue
+    if (!existingSuccessByEmail.has(item.email)) {
+      existingSuccessByEmail.set(item.email, item)
+    }
+  }
+
+  const results = []
+  let newSuccessCount = 0
+  let reusedSuccessCount = 0
+  let failedCount = 0
+  for (const targetEmail of inviteEmails) {
+    const existingSuccess = existingSuccessByEmail.get(targetEmail)
+    if (existingSuccess) {
+      reusedSuccessCount += 1
+      results.push({
+        email: targetEmail,
+        status: 'success',
+        message: existingSuccess.message || '该邮箱此前已处理成功，已跳过重复邀请',
+        accountId: existingSuccess.accountId,
+        accountEmail: existingSuccess.accountEmail,
+        consumedCodeId: existingSuccess.consumedCodeId,
+        consumedCode: existingSuccess.consumedCode,
+        sentAt: existingSuccess.sentAt || new Date().toISOString(),
+        queueState: existingSuccess.queueState || { isMember: false, isInvited: true },
+        skippedDuplicate: true,
+      })
+      continue
+    }
+
+    const sentAt = new Date().toISOString()
+    try {
+      const invite = await performDirectInvite({
+        email: targetEmail,
+        consumeCode: true,
+        requireAvailableDirectInviteCode: true,
+      })
+      newSuccessCount += 1
+      results.push({
+        email: targetEmail,
+        status: 'success',
+        message: `邀请发送成功（账号：${invite.accountEmail}）`,
+        accountId: invite.accountId,
+        accountEmail: invite.accountEmail,
+        consumedCodeId: invite.consumedCodeId || null,
+        consumedCode: invite.consumedCode || null,
+        sentAt,
+        queueState: { isMember: false, isInvited: true },
+      })
+    } catch (error) {
+      failedCount += 1
+      results.push({
+        email: targetEmail,
+        status: 'failed',
+        message: String(error?.message || '邀请失败'),
+        sentAt,
+        queueState: { isMember: false, isInvited: false },
+      })
+    }
+  }
+
+  await upsertOrderInviteItems(db, orderId, results)
+
+  const successCount = results.filter(item => item.status === 'success').length
+  const summaryText = formatBatchInviteSummary(results)
+  const detailParts = []
+  if (reusedSuccessCount > 0) detailParts.push(`已跳过重复邀请 ${reusedSuccessCount} 个`)
+  if (failedCount > 0) detailParts.push('存在失败项，请补充邀请码后重试')
+  const inviteResultSuffix = detailParts.length ? `（${detailParts.join('；')}）` : ''
+
+  let updatedOrder = null
+  if (successCount > 0) {
+    updatedOrder = await markAlipayRedpackOrderInvited(orderId, {
+      inviteResult: `${summaryText}${inviteResultSuffix}`,
+      ...operator,
+    })
+    if (newSuccessCount > 0) {
+      await notifyOrderProcessedEmailSafely({
+        orderId,
+        email: updatedOrder?.email || order?.email,
+      })
+    }
+  } else {
+    updatedOrder = await markAlipayRedpackOrderInviteFailed(orderId, {
+      inviteResult: `${summaryText}（全部失败）`,
+      ...operator,
+    })
+  }
+
+  return {
+    message: successCount > 0
+      ? (newSuccessCount > 0 ? '批量处理完成' : '已存在成功记录，跳过重复邀请')
+      : '批量处理失败',
+    order: updatedOrder,
+    inviteResults: results,
+    summary: {
+      total: results.length,
+      success: successCount,
+      failed: failedCount,
+      reusedSuccess: reusedSuccessCount,
+      newSuccess: newSuccessCount,
+    },
+  }
+}
+
+const processMotherOrderDelivery = async ({
+  order,
+  operator = {},
+} = {}) => {
+  const orderId = toPositiveInt(order?.id)
+  if (!orderId) {
+    throw new AlipayRedpackOrderError('无效订单ID', 400, 'alipay_redpack_invalid_id')
+  }
+
+  const quantity = resolveOrderQuantity(order)
+  const receiverEmail = normalizeEmail(order?.email)
+  if (!EMAIL_REGEX.test(receiverEmail)) {
+    throw new AlipayRedpackOrderError('订单邮箱格式无效', 400, 'alipay_redpack_invalid_email')
+  }
+
+  const db = await getDatabase()
+  const reserved = await reserveMotherAccountsForOrder(db, orderId, quantity)
+  if (!reserved.length) {
+    throw new AlipayRedpackOrderError('可用 GPT 母号不足，请补充后重试', 409, 'alipay_redpack_mother_account_insufficient')
+  }
+
+  const credentials = loadMotherAccountCredentialsByIds(db, reserved.map(item => item.accountId))
+  const missingCredentials = credentials.filter(item => !item.gptPassword || !item.emailPassword)
+  if (missingCredentials.length > 0) {
+    await rollbackReservedMotherAccounts(db, orderId, {
+      note: '母号交付失败：账号凭据未完整配置（需 GPT 密码 + 邮箱密码）',
+    })
+    const previewEmails = missingCredentials.slice(0, 3).map(item => item.email).join(', ')
+    const extraCount = Math.max(0, missingCredentials.length - 3)
+    const emailHint = extraCount > 0 ? `${previewEmails} 等 ${missingCredentials.length} 个账号` : previewEmails
+    throw new AlipayRedpackOrderError(
+      `母号账号凭据不完整，请先在账号管理补全 GPT 密码和邮箱密码后重试（${emailHint}）`,
+      409,
+      'alipay_redpack_mother_credentials_missing'
+    )
+  }
+  try {
+    const sent = await sendAlipayRedpackMotherDeliveryEmail({
+      to: receiverEmail,
+      orderId,
+      productName: order?.productName || '',
+      accounts: credentials.map(item => ({
+        email: item.email,
+        gptPassword: item.gptPassword,
+        emailPassword: item.emailPassword,
+      })),
+    })
+    if (!sent) {
+      throw new AlipayRedpackOrderError('母号凭据邮件发送失败，请稍后重试', 500, 'alipay_redpack_mother_email_send_failed')
+    }
+  } catch (error) {
+    await rollbackReservedMotherAccounts(db, orderId, {
+      note: `邮件发送失败：${String(error?.message || 'unknown')}`,
+    })
+    throw error
+  }
+
+  const finalizeResult = await finalizeDeliveredMotherAccounts(db, orderId, receiverEmail)
+  const inviteResult = `母号交付完成：数量 ${credentials.length}，已邮件发送，已删除兑换码 ${Number(finalizeResult.deletedCodes || 0)}`
+  const updatedOrder = await markAlipayRedpackOrderRedeemed(orderId, {
+    inviteResult,
+    ...operator,
+  })
+
+  return {
+    message: '母号交付完成',
+    order: updatedOrder,
+    motherAccounts: credentials.map(item => ({ id: item.id, email: item.email })),
+    deletedCodeCount: Number(finalizeResult.deletedCodes || 0),
+  }
+}
+
 const PUBLIC_SUPPLEMENT_AUTH_ERROR = {
   status: 403,
   body: {
@@ -587,6 +1222,14 @@ const sanitizePublicOrder = (order) => {
   return {
     id: Number(order.id || 0) || null,
     email: String(order.email || '').trim(),
+    productKey: String(order.productKey || '').trim() || null,
+    productName: String(order.productName || '').trim() || null,
+    productType: normalizeAlipayRedpackProductType(order.productType, ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE),
+    paymentMethod: normalizeAlipayRedpackPaymentMethod(order.paymentMethod, ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY),
+    quantity: toPositiveInt(order.quantity) || 1,
+    inviteEmails: resolveOrderProductType(order) === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+      ? resolveOrderInviteEmails(order)
+      : [],
     status: String(order.status || '').trim() || 'pending',
     inviteResult: String(order.inviteResult || '').trim() || '',
     createdAt: order.createdAt || null,
@@ -1196,15 +1839,118 @@ const executeAlipayRedpackOrderSupplement = async ({
   }
 }
 
+router.get('/products', async (_req, res) => {
+  try {
+    const products = await listAlipayRedpackProducts(null, { activeOnly: true })
+    res.json({
+      products: products.map(item => ({
+        ...item,
+        productType: normalizeAlipayRedpackProductType(item.productType, ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE),
+        paymentMethod: normalizeAlipayRedpackPaymentMethod(item.paymentMethod, ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY),
+      })),
+    })
+  } catch (error) {
+    console.error('[AlipayRedpack] 查询商品失败:', error)
+    const resolved = resolveRouteError(error, '查询商品失败，请稍后重试')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.get('/admin/products', authenticateToken, requireMenu(ADMIN_PRODUCT_MENU_KEY), async (_req, res) => {
+  try {
+    const products = await listAlipayRedpackProducts()
+    res.json({ products })
+  } catch (error) {
+    console.error('[AlipayRedpack] 管理端查询商品失败:', error)
+    const resolved = resolveRouteError(error, '获取商品列表失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.post('/admin/products', authenticateToken, requireMenu(ADMIN_PRODUCT_MENU_KEY), async (req, res) => {
+  try {
+    const payload = req.body || {}
+    const product = await upsertAlipayRedpackProduct(null, payload)
+    res.status(201).json({ product })
+  } catch (error) {
+    if (String(error?.message || '').includes('invalid_product_key')) {
+      return res.status(400).json({ error: 'productKey 不合法' })
+    }
+    if (String(error?.message || '').includes('missing_product_name')) {
+      return res.status(400).json({ error: '商品名称不能为空' })
+    }
+    if (String(error?.message || '').includes('invalid_amount')) {
+      return res.status(400).json({ error: '价格不合法（需大于 0）' })
+    }
+    console.error('[AlipayRedpack] 管理端创建商品失败:', error)
+    const resolved = resolveRouteError(error, '创建商品失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.patch('/admin/products/:productKey', authenticateToken, requireMenu(ADMIN_PRODUCT_MENU_KEY), async (req, res) => {
+  try {
+    const productKey = String(req.params.productKey || '').trim()
+    const db = await getDatabase()
+    const existing = await getAlipayRedpackProductByKey(db, productKey)
+    if (!existing) {
+      return res.status(404).json({ error: '商品不存在' })
+    }
+    const mergedPayload = {
+      ...existing,
+      ...req.body,
+      productKey: existing.productKey,
+    }
+    const product = await upsertAlipayRedpackProduct(db, mergedPayload)
+    res.json({ product })
+  } catch (error) {
+    if (String(error?.message || '').includes('invalid_product_key')) {
+      return res.status(400).json({ error: 'productKey 不合法' })
+    }
+    if (String(error?.message || '').includes('missing_product_name')) {
+      return res.status(400).json({ error: '商品名称不能为空' })
+    }
+    if (String(error?.message || '').includes('invalid_amount')) {
+      return res.status(400).json({ error: '价格不合法（需大于 0）' })
+    }
+    console.error('[AlipayRedpack] 管理端更新商品失败:', error)
+    const resolved = resolveRouteError(error, '更新商品失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
+router.delete('/admin/products/:productKey', authenticateToken, requireMenu(ADMIN_PRODUCT_MENU_KEY), async (req, res) => {
+  try {
+    const productKey = String(req.params.productKey || '').trim()
+    const product = await deleteAlipayRedpackProduct(null, productKey)
+    if (!product) {
+      return res.status(404).json({ error: '商品不存在' })
+    }
+    res.json({ ok: true, product })
+  } catch (error) {
+    if (String(error?.message || '').includes('invalid_product_key')) {
+      return res.status(400).json({ error: 'productKey 不合法' })
+    }
+    console.error('[AlipayRedpack] 管理端删除商品失败:', error)
+    const resolved = resolveRouteError(error, '删除商品失败')
+    res.status(resolved.status).json(resolved.body)
+  }
+})
+
 router.post('/orders', async (req, res) => {
   try {
     if (enforcePublicRateLimit(req, res)) return
 
-    const { email, alipayPassphrase, note } = req.body || {}
+    const { email, alipayPassphrase, note, productKey, productType, quantity, paymentMethod, inviteEmails } = req.body || {}
     const order = await createAlipayRedpackOrderPublic({
       email,
       alipayPassphrase,
       note,
+      productKey,
+      productType,
+      quantity,
+      paymentMethod,
+      inviteEmails,
     })
 
     enqueueOrderAlertSummary({ action: '公开提交', order })
@@ -1222,7 +1968,10 @@ router.post('/orders', async (req, res) => {
 
 router.get('/stock', async (_req, res) => {
   try {
-    const stock = await getAlipayRedpackRedemptionCodeStockSummary()
+    const productKey = String(_req?.query?.productKey || '').trim()
+    const product = productKey ? await getAlipayRedpackProductByKey(null, productKey, { activeOnly: true }) : null
+    const productType = normalizeAlipayRedpackProductType(product?.productType, ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE)
+    const stock = await getAlipayRedpackRedemptionCodeStockSummary({ productType })
     const availableCount = Number.isFinite(Number(stock?.availableCount))
       ? Math.max(0, Number(stock.availableCount))
       : 0
@@ -1239,6 +1988,7 @@ router.get('/stock', async (_req, res) => {
       pendingReservationCount: reservedCount,
       reservedCount,
       totalUnusedCount,
+      productType,
       updatedAt: new Date().toISOString(),
     })
   } catch (error) {
@@ -1313,7 +2063,7 @@ router.get('/orders/supplement/candidates', async (req, res) => {
     if (!authPass) return
     const data = await listAlipayRedpackSupplementOrdersByEmail(email, {
       limit: 30,
-      onlyPublicSupplementable: true,
+      onlyPublicSupplementable: false,
     })
     res.json(data)
   } catch (error) {
@@ -1461,6 +2211,26 @@ router.post('/admin/orders/:id/quick-invite', authenticateToken, requireMenu(ADM
     }
 
     const operator = resolveOperator(req)
+    const productType = resolveOrderProductType(order)
+    const quantity = resolveOrderQuantity(order)
+    const inviteEmails = resolveOrderInviteEmails(order)
+
+    if (productType === ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER) {
+      const result = await withLocks(
+        ['alipay-redpack:mother-allocation'],
+        async () => processMotherOrderDelivery({ order, operator })
+      )
+      return res.json(result)
+    }
+
+    const needsBatchSingleInvite = (
+      productType === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+      && (quantity > 1 || inviteEmails.length > 1 || normalizeEmail(inviteEmails[0]) !== normalizeEmail(order.email))
+    )
+    if (needsBatchSingleInvite) {
+      const result = await processBatchSingleOrderInvites({ order, operator })
+      return res.json(result)
+    }
 
     let inviteSent = false
     let consumeResult = null
@@ -1638,6 +2408,13 @@ router.post('/admin/orders/:id/sync-status', authenticateToken, requireMenu(ADMI
     if (!order) {
       return res.status(404).json({ error: '订单不存在' })
     }
+    if (
+      resolveOrderProductType(order) !== ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+      || resolveOrderQuantity(order) !== 1
+      || resolveOrderInviteEmails(order).length !== 1
+    ) {
+      return res.status(409).json({ error: '该订单类型不支持状态同步，请改用重新处理', order })
+    }
     if (order.status === 'returned') {
       return res.status(409).json({ error: '该订单已退回，无需同步状态', order })
     }
@@ -1700,30 +2477,31 @@ router.post('/admin/orders/:id/return', authenticateToken, requireMenu(ADMIN_MEN
       return res.status(404).json({ error: '订单不存在' })
     }
 
-    const invitedAccountId = toPositiveInt(order.invitedAccountId)
-    const normalizedOrderEmail = normalizeEmail(order.email)
-    if (invitedAccountId && EMAIL_REGEX.test(normalizedOrderEmail)) {
-      let invites = null
-      try {
-        invites = await fetchAccountInvites(invitedAccountId, {
-          inviteListParams: { offset: 0, limit: 25, query: normalizedOrderEmail },
-        })
-      } catch (error) {
-        const resolved = resolveRouteError(error, '撤销外部邀请前校验失败')
-        return res.status(409).json({
-          error: resolved.body?.error || '撤销外部邀请前校验失败，请人工介入处理',
-          code: 'alipay_redpack_invite_revoke_check_failed',
-          manualInterventionRequired: true,
-          order,
-        })
-      }
-      const hasActiveInvite = (invites?.items || []).some(
-        (item) => normalizeEmail(item?.email_address) === normalizedOrderEmail
-      )
-
-      if (hasActiveInvite) {
+    if (resolveOrderProductType(order) === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE) {
+      const db = await getDatabase()
+      const revokeTargets = collectSingleOrderInviteRevokeTargets(db, order)
+      for (const target of revokeTargets) {
+        let invites = null
         try {
-          await revokeAccountInviteByEmail(invitedAccountId, normalizedOrderEmail)
+          invites = await fetchAccountInvites(target.accountId, {
+            inviteListParams: { offset: 0, limit: 25, query: target.email },
+          })
+        } catch (error) {
+          const resolved = resolveRouteError(error, '撤销外部邀请前校验失败')
+          return res.status(409).json({
+            error: resolved.body?.error || '撤销外部邀请前校验失败，请人工介入处理',
+            code: 'alipay_redpack_invite_revoke_check_failed',
+            manualInterventionRequired: true,
+            order,
+            target,
+          })
+        }
+        const hasActiveInvite = (invites?.items || []).some(
+          (item) => normalizeEmail(item?.email_address) === target.email
+        )
+        if (!hasActiveInvite) continue
+        try {
+          await revokeAccountInviteByEmail(target.accountId, target.email)
         } catch (error) {
           const resolved = resolveRouteError(error, '撤销外部邀请失败')
           return res.status(409).json({
@@ -1731,10 +2509,17 @@ router.post('/admin/orders/:id/return', authenticateToken, requireMenu(ADMIN_MEN
             code: 'alipay_redpack_invite_revoke_failed',
             manualInterventionRequired: true,
             order,
+            target,
           })
         }
       }
     }
+
+    const rollbackMotherResult = resolveOrderProductType(order) === ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER
+      ? await rollbackReservedMotherAccounts(await getDatabase(), orderId, {
+        note: `订单退回：${String(req.body?.reason || '').trim() || '口令不可用'}`,
+      })
+      : { reopenedCount: 0, deliveredCount: 0 }
 
     const operator = resolveOperator(req)
     const wasAlreadyReturned = String(order.status || '').trim().toLowerCase() === 'returned'
@@ -1751,7 +2536,10 @@ router.post('/admin/orders/:id/return', authenticateToken, requireMenu(ADMIN_MEN
     }
 	
     res.json({
-      message: '订单已退回并释放占用',
+      message: rollbackMotherResult.deliveredCount > 0
+        ? '订单已退回，母号凭据已下发，保持关闭状态'
+        : '订单已退回并释放占用',
+      rollbackMother: rollbackMotherResult,
       order: returned,
     })
   } catch (error) {

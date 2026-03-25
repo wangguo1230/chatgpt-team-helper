@@ -1,6 +1,13 @@
 import { getDatabase, saveDatabase } from '../database/init.js'
 import crypto from 'crypto'
 import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
+import {
+  ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY,
+  ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER,
+  ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE,
+  countAvailableMotherAccounts,
+  getAlipayRedpackProductByKey,
+} from './alipay-redpack-products.js'
 
 export class AlipayRedpackOrderError extends Error {
   constructor(message, statusCode = 400, code = 'alipay_redpack_bad_request') {
@@ -54,6 +61,8 @@ const ORDER_TYPE_WARRANTY = 'warranty'
 const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
 const ORDER_TYPE_ANTI_BAN = 'anti_ban'
 const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
+const ORDER_PRODUCT_TYPE_SET = new Set([ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE, ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER])
+const ORDER_PAYMENT_METHOD_SET = new Set([ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY, 'zpay'])
 const DAY_MS = 24 * 60 * 60 * 1000
 const SUPPLEMENT_ATTEMPT_WINDOW_SEC_DEFAULT = 24 * 60 * 60
 const SUPPLEMENT_MAX_ATTEMPTS_DEFAULT = 3
@@ -69,11 +78,56 @@ const normalizeOrderType = (value) => {
   if (normalized === 'anti-ban') return ORDER_TYPE_ANTI_BAN
   return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
 }
+const normalizeOrderProductType = (value, fallback = ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ORDER_PRODUCT_TYPE_SET.has(normalized) ? normalized : fallback
+}
+const normalizePaymentMethod = (value, fallback = ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ORDER_PAYMENT_METHOD_SET.has(normalized) ? normalized : fallback
+}
 const isNoWarrantyOrderType = (value) => normalizeOrderType(value) === ORDER_TYPE_NO_WARRANTY
 const toPositiveInt = (value, fallback = 0) => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback
   return Math.floor(parsed)
+}
+const normalizeInviteEmailsInput = (value, fallbackEmail = '') => {
+  const rawList = Array.isArray(value)
+    ? value
+    : String(value ?? '')
+      .split(/[\n,;]+/)
+      .map(item => String(item || '').trim())
+
+  const deduped = []
+  const seen = new Set()
+  for (const item of rawList) {
+    const normalized = normalizeEmail(item)
+    if (!normalized || !EMAIL_REGEX.test(normalized) || seen.has(normalized)) continue
+    seen.add(normalized)
+    deduped.push(normalized)
+  }
+
+  if (!deduped.length) {
+    const normalizedFallback = normalizeEmail(fallbackEmail)
+    if (normalizedFallback && EMAIL_REGEX.test(normalizedFallback)) {
+      deduped.push(normalizedFallback)
+    }
+  }
+
+  return deduped
+}
+const parseInviteEmailsFromStoredValue = (value) => {
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(String(value))
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map(item => normalizeEmail(item))
+      .filter(item => EMAIL_REGEX.test(item))
+  } catch {
+    return normalizeInviteEmailsInput(value, '')
+  }
 }
 const DATE_ONLY_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/
 const parseDateTimeToMs = (value) => {
@@ -128,6 +182,8 @@ const getSupplementOrderLockSec = () => parsePositiveIntWithDefault(
   process.env.ALIPAY_REDPACK_SUPPLEMENT_ORDER_LOCK_SEC,
   SUPPLEMENT_LOCK_SEC_DEFAULT
 )
+const MAX_SINGLE_ORDER_QUANTITY = 100
+const MAX_MOTHER_ORDER_QUANTITY = 20
 
 const ORDER_SELECT_COLUMNS = `
   id, email, alipay_passphrase, redemption_code_id, redemption_code_redeemed_at, note, status, invite_result,
@@ -135,7 +191,9 @@ const ORDER_SELECT_COLUMNS = `
   operator_user_id, operator_username, created_at, updated_at,
   warranty_anchor_at, warranty_service_days_snapshot, supplement_attempt_count, last_supplement_at,
   supplement_lock_until, supplement_lock_token,
-  (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code
+  (SELECT code FROM redemption_codes WHERE id = alipay_redpack_orders.redemption_code_id LIMIT 1) AS redemption_code,
+  product_key, product_name_snapshot, amount_snapshot, quantity, product_type, payment_method, invite_emails,
+  mother_delivery_sent_at, mother_delivery_mail_to
 `
 
 const mapOrderRow = (row = []) => ({
@@ -161,6 +219,15 @@ const mapOrderRow = (row = []) => ({
   lastSupplementAt: row[19] || null,
   supplementLockUntil: row[20] || null,
   redemptionCode: row[22] ? String(row[22]) : null,
+  productKey: row[23] ? String(row[23]) : '',
+  productName: row[24] ? String(row[24]) : '',
+  amount: row[25] ? String(row[25]) : '',
+  quantity: Math.max(1, Number(row[26] || 1)),
+  productType: normalizeOrderProductType(row[27], ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE),
+  paymentMethod: normalizePaymentMethod(row[28], ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY),
+  inviteEmails: parseInviteEmailsFromStoredValue(row[29]),
+  motherDeliverySentAt: row[30] || null,
+  motherDeliveryMailTo: row[31] ? String(row[31]) : null,
 })
 
 const mapSupplementRow = (row = []) => ({
@@ -847,6 +914,88 @@ const ensureNoteLength = (note) => {
   return normalized
 }
 
+const resolveOrderProductPayload = async (
+  db,
+  {
+    productKey,
+    productType,
+    quantity,
+    paymentMethod,
+    inviteEmails,
+    fallbackEmail,
+  } = {}
+) => {
+  let product = null
+  const normalizedProductKey = String(productKey || '').trim()
+  if (normalizedProductKey) {
+    product = await getAlipayRedpackProductByKey(db, normalizedProductKey, { activeOnly: true })
+    if (!product) {
+      throw new AlipayRedpackOrderError('所选商品不存在或已下架', 400, 'alipay_redpack_product_not_found')
+    }
+  }
+
+  const resolvedProductType = normalizeOrderProductType(
+    product?.productType || productType,
+    ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+  )
+  const resolvedPaymentMethod = normalizePaymentMethod(
+    product?.paymentMethod || paymentMethod,
+    ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY
+  )
+  if (resolvedPaymentMethod !== ALIPAY_REDPACK_PAYMENT_METHOD_ALIPAY) {
+    throw new AlipayRedpackOrderError(
+      '当前仅支持支付宝口令支付，易支付后续开放',
+      400,
+      'alipay_redpack_payment_method_not_supported'
+    )
+  }
+
+  let resolvedQuantity = toPositiveInt(quantity, 0)
+  let resolvedInviteEmails = []
+  if (resolvedProductType === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE) {
+    resolvedInviteEmails = normalizeInviteEmailsInput(inviteEmails, fallbackEmail)
+    if (!resolvedQuantity) {
+      resolvedQuantity = Math.max(1, resolvedInviteEmails.length || 1)
+    }
+    if (resolvedQuantity !== resolvedInviteEmails.length) {
+      throw new AlipayRedpackOrderError(
+        'GPT 单号订单的购买数量必须与邀请邮箱数量一致',
+        400,
+        'alipay_redpack_invite_email_count_mismatch'
+      )
+    }
+    if (resolvedQuantity > MAX_SINGLE_ORDER_QUANTITY) {
+      throw new AlipayRedpackOrderError(
+        `GPT 单号订单单次最多支持 ${MAX_SINGLE_ORDER_QUANTITY} 个`,
+        400,
+        'alipay_redpack_quantity_too_large'
+      )
+    }
+  } else {
+    resolvedQuantity = resolvedQuantity || 1
+    if (resolvedQuantity > MAX_MOTHER_ORDER_QUANTITY) {
+      throw new AlipayRedpackOrderError(
+        `GPT 母号订单单次最多支持 ${MAX_MOTHER_ORDER_QUANTITY} 个`,
+        400,
+        'alipay_redpack_quantity_too_large'
+      )
+    }
+  }
+
+  const snapshotProductName = String(product?.productName || '支付宝口令红包订单').trim() || '支付宝口令红包订单'
+  const snapshotAmount = String(product?.amount || '').trim()
+  return {
+    productKey: String(product?.productKey || '').trim(),
+    productNameSnapshot: snapshotProductName,
+    amountSnapshot: snapshotAmount,
+    productType: resolvedProductType,
+    paymentMethod: resolvedPaymentMethod,
+    quantity: resolvedQuantity,
+    inviteEmails: resolvedInviteEmails,
+    inviteEmailsJson: resolvedInviteEmails.length ? JSON.stringify(resolvedInviteEmails) : null,
+  }
+}
+
 const buildSearchClause = (search) => {
   const normalized = String(search ?? '').trim().toLowerCase()
   if (!normalized) {
@@ -862,9 +1011,11 @@ const buildSearchClause = (search) => {
         OR lower(COALESCE(note, '')) LIKE ?
         OR lower(COALESCE(invite_result, '')) LIKE ?
         OR lower(COALESCE(operator_username, '')) LIKE ?
+        OR lower(COALESCE(product_name_snapshot, '')) LIKE ?
+        OR lower(COALESCE(invite_emails, '')) LIKE ?
       )
     `,
-    params: [keyword, keyword, keyword, keyword, keyword]
+    params: [keyword, keyword, keyword, keyword, keyword, keyword, keyword]
   }
 }
 
@@ -1071,6 +1222,12 @@ export const getAlipayRedpackSupplementCandidateByEmail = async (email) => {
   }
 
   const order = mapOrderRow(row)
+  if (
+    normalizeOrderProductType(order.productType) !== ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+    || Number(order.quantity || 1) !== 1
+  ) {
+    throw new AlipayRedpackOrderError('该订单类型暂不支持补录，请联系管理员处理', 409, 'alipay_redpack_supplement_not_supported')
+  }
   const warranty = resolveOrderWarrantyInfo(db, order)
   return {
     order,
@@ -1092,8 +1249,15 @@ export const listAlipayRedpackSupplementOrdersByEmail = async (
   const orders = rows
     .map((row) => {
       const order = mapOrderRow(row)
+      const productType = normalizeOrderProductType(order.productType, ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE)
+      const quantity = Number(order.quantity || 1)
+      const supplementSupported = (
+        productType === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+        && quantity === 1
+      )
       const normalizedStatus = normalizeOrderStatus(order.status)
-      if (onlyPublicSupplementable && !PUBLIC_SUPPLEMENTABLE_STATUS_SET.has(normalizedStatus)) {
+      const statusSupplementable = PUBLIC_SUPPLEMENTABLE_STATUS_SET.has(normalizedStatus)
+      if (onlyPublicSupplementable && (!supplementSupported || !statusSupplementable)) {
         return null
       }
       const warranty = resolveOrderWarrantyInfo(db, order)
@@ -1101,9 +1265,13 @@ export const listAlipayRedpackSupplementOrdersByEmail = async (
         orderId: order.id,
         createdAt: order.createdAt || null,
         status: normalizedStatus || 'pending',
+        productType,
+        quantity,
         warrantyDays: Number.isFinite(Number(warranty.serviceDays)) ? Number(warranty.serviceDays) : null,
         withinWarranty: Boolean(warranty.withinWarranty),
         windowEndsAt: warranty.windowEndsAt || null,
+        supplementSupported,
+        supplementSelectable: supplementSupported && statusSupplementable && Boolean(warranty.withinWarranty),
       }
     })
     .filter(Boolean)
@@ -1137,6 +1305,12 @@ export const getAlipayRedpackSupplementCandidateByOrder = async ({
   }
 
   const order = mapOrderRow(row)
+  if (
+    normalizeOrderProductType(order.productType) !== ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+    || Number(order.quantity || 1) !== 1
+  ) {
+    throw new AlipayRedpackOrderError('该订单类型暂不支持补录，请联系管理员处理', 409, 'alipay_redpack_supplement_not_supported')
+  }
   const normalizedStatus = normalizeOrderStatus(order.status)
   if (normalizedStatus === 'returned') {
     throw new AlipayRedpackOrderError('该订单已退回，无法补录，请重新提交有效口令', 409, 'alipay_redpack_order_returned')
@@ -1234,6 +1408,12 @@ export const prepareAlipayRedpackOrderForAutoSupplement = async (
     if (String(existing.status || '').trim().toLowerCase() === 'returned') {
       throw new AlipayRedpackOrderError('该订单已退回，无法补录', 409, 'alipay_redpack_order_returned')
     }
+    if (
+      normalizeOrderProductType(existing.productType) !== ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+      || Number(existing.quantity || 1) !== 1
+    ) {
+      throw new AlipayRedpackOrderError('该订单类型暂不支持补录', 409, 'alipay_redpack_supplement_not_supported')
+    }
 
     releaseAlipayRedpackOrderCodeReservation(db, existing, { recoverRedeemed: false })
 
@@ -1295,7 +1475,20 @@ export const prepareAlipayRedpackOrderForAutoSupplement = async (
   }
 }
 
-export const getAlipayRedpackRedemptionCodeStockSummary = async () => {
+export const getAlipayRedpackRedemptionCodeStockSummary = async ({
+  productType = ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE,
+} = {}) => {
+  const resolvedProductType = normalizeOrderProductType(productType, ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE)
+  if (resolvedProductType === ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER) {
+    const availableMotherCount = await countAvailableMotherAccounts()
+    return {
+      availableCount: Number(availableMotherCount || 0),
+      reservedCount: 0,
+      totalUnusedCount: Number(availableMotherCount || 0),
+      productType: ALIPAY_REDPACK_PRODUCT_TYPE_MOTHER,
+    }
+  }
+
   const db = await getDatabase()
   const capacityLimit = getOpenAccountsCapacityLimit(db)
   const nowMs = Date.now()
@@ -1352,6 +1545,7 @@ export const getAlipayRedpackRedemptionCodeStockSummary = async () => {
     availableCount: Number(availableCount || 0),
     reservedCount: Number(row[0] || 0),
     totalUnusedCount: Number(row[1] || 0),
+    productType: ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE,
   }
 }
 
@@ -1589,7 +1783,16 @@ export const listAlipayRedpackSupplementsAdmin = async (
   }
 }
 
-export const createAlipayRedpackOrderPublic = async ({ email, alipayPassphrase, note = '' } = {}) => {
+export const createAlipayRedpackOrderPublic = async ({
+  email,
+  alipayPassphrase,
+  note = '',
+  productKey = '',
+  productType = '',
+  quantity = 1,
+  paymentMethod = '',
+  inviteEmails = [],
+} = {}) => {
   const { normalizedEmail, passphrase } = ensureEmailAndPassphrase({ email, alipayPassphrase })
   const normalizedNote = ensureNoteLength(note)
 
@@ -1601,15 +1804,38 @@ export const createAlipayRedpackOrderPublic = async ({ email, alipayPassphrase, 
       throw new AlipayRedpackOrderError('该支付宝口令已存在，请勿重复提交', 409, 'alipay_redpack_passphrase_exists')
     }
 
+    const productPayload = await resolveOrderProductPayload(db, {
+      productKey,
+      productType,
+      quantity,
+      paymentMethod,
+      inviteEmails,
+      fallbackEmail: normalizedEmail,
+    })
+
     db.run(
       `
         INSERT INTO alipay_redpack_orders (
           email, alipay_passphrase, note, status,
+          product_key, product_name_snapshot, amount_snapshot, quantity, product_type, payment_method, invite_emails,
+          mother_delivery_mail_to,
           created_at, updated_at
         )
-        VALUES (?, ?, ?, 'pending', DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
       `,
-      [normalizedEmail, passphrase, normalizedNote || null]
+      [
+        normalizedEmail,
+        passphrase,
+        normalizedNote || null,
+        productPayload.productKey || null,
+        productPayload.productNameSnapshot || null,
+        productPayload.amountSnapshot || null,
+        productPayload.quantity,
+        productPayload.productType,
+        productPayload.paymentMethod,
+        productPayload.inviteEmailsJson,
+        normalizedEmail,
+      ]
     )
 
     const idRow = db.exec('SELECT last_insert_rowid()')[0]?.values?.[0]
@@ -1619,21 +1845,29 @@ export const createAlipayRedpackOrderPublic = async ({ email, alipayPassphrase, 
       throw new AlipayRedpackOrderError('订单创建失败，请稍后重试', 500, 'alipay_redpack_create_failed')
     }
 
-    ensureOrderRedemptionCodeLinked(db, created)
-    const afterLinked = getOrderByIdInternal(db, createdId)
-    if (!afterLinked) {
-      throw new AlipayRedpackOrderError('订单创建失败，请稍后重试', 500, 'alipay_redpack_create_failed')
-    }
-    const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, afterLinked)
-    db.run(
-      `
-        UPDATE alipay_redpack_orders
-        SET warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
-            updated_at = DATETIME('now', 'localtime')
-        WHERE id = ?
-      `,
-      [warrantySnapshotDays, createdId]
+    const shouldBindSingleCode = (
+      productPayload.productType === ALIPAY_REDPACK_PRODUCT_TYPE_SINGLE
+      && productPayload.quantity === 1
+      && productPayload.inviteEmails.length === 1
+      && normalizeEmail(productPayload.inviteEmails[0]) === normalizedEmail
     )
+    if (shouldBindSingleCode) {
+      ensureOrderRedemptionCodeLinked(db, created)
+      const afterLinked = getOrderByIdInternal(db, createdId)
+      if (!afterLinked) {
+        throw new AlipayRedpackOrderError('订单创建失败，请稍后重试', 500, 'alipay_redpack_create_failed')
+      }
+      const warrantySnapshotDays = resolveWarrantyServiceDaysSnapshot(db, afterLinked)
+      db.run(
+        `
+          UPDATE alipay_redpack_orders
+          SET warranty_service_days_snapshot = COALESCE(warranty_service_days_snapshot, ?),
+              updated_at = DATETIME('now', 'localtime')
+          WHERE id = ?
+        `,
+        [warrantySnapshotDays, createdId]
+      )
+    }
     db.run('COMMIT')
     await saveDatabase()
 

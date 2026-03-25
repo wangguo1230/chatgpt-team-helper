@@ -26,6 +26,7 @@ import XhsOrdersView from '../views/XhsOrdersView.vue'
 import XianyuOrdersView from '../views/XianyuOrdersView.vue'
 import AlipayRedpackOrdersView from '../views/AlipayRedpackOrdersView.vue'
 import AlipayRedpackSupplementsAdminView from '../views/AlipayRedpackSupplementsAdminView.vue'
+import AlipayRedpackProductsView from '../views/AlipayRedpackProductsView.vue'
 import PurchaseOrdersView from '../views/PurchaseOrdersView.vue'
 import CreditOrdersView from '../views/CreditOrdersView.vue'
 import AccountRecoveryAdminView from '../views/AccountRecoveryAdminView.vue'
@@ -255,6 +256,12 @@ const router = createRouter({
           name: 'alipay-redpack-orders',
           component: AlipayRedpackOrdersView,
           meta: { requiredMenuKey: 'alipay_redpack_orders' },
+        },
+        {
+          path: 'alipay-redpack-products',
+          name: 'alipay-redpack-products',
+          component: AlipayRedpackProductsView,
+          meta: { requiredMenuKey: 'alipay_redpack_products' },
         },
         {
           path: 'alipay-redpack-supplements',

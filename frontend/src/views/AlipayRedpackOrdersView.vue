@@ -63,6 +63,56 @@ const statusText = (status?: string) => {
   if (status === 'returned') return '已退回'
   return status || '-'
 }
+const productTypeText = (order?: AlipayRedpackOrder | null) => {
+  const type = String(order?.productType || '').trim().toLowerCase()
+  if (type === 'gpt_parent') return 'GPT 母号'
+  return 'GPT 单号'
+}
+const paymentMethodText = (order?: AlipayRedpackOrder | null) => {
+  const method = String(order?.paymentMethod || '').trim().toLowerCase()
+  if (method === 'zpay') return '易支付'
+  return '支付宝口令'
+}
+const resolveOrderQuantity = (order?: AlipayRedpackOrder | null) => {
+  const parsed = Number(order?.quantity || 1)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1
+}
+const resolveOrderInviteEmails = (order?: AlipayRedpackOrder | null) => {
+  const raw = Array.isArray(order?.inviteEmails)
+    ? order?.inviteEmails
+    : []
+  const deduped: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    const email = String(item || '').trim().toLowerCase()
+    if (!email || seen.has(email)) continue
+    seen.add(email)
+    deduped.push(email)
+  }
+  if (!deduped.length && order?.email) {
+    deduped.push(String(order.email).trim().toLowerCase())
+  }
+  return deduped
+}
+const resolveInviteEmailsPreview = (order?: AlipayRedpackOrder | null, max = 3) => {
+  const list = resolveOrderInviteEmails(order)
+  const safeMax = Number.isFinite(max) && max > 0 ? Math.floor(max) : 3
+  return {
+    emails: list.slice(0, safeMax),
+    extra: Math.max(0, list.length - safeMax),
+    total: list.length,
+  }
+}
+const isSingleOrderMode = (order?: AlipayRedpackOrder | null) => {
+  const type = String(order?.productType || 'gpt_single').trim().toLowerCase()
+  return type !== 'gpt_parent'
+}
+const isMotherOrderMode = (order?: AlipayRedpackOrder | null) => !isSingleOrderMode(order)
+const shouldAutoSyncAfterProcess = (order?: AlipayRedpackOrder | null) => {
+  if (!isSingleOrderMode(order)) return false
+  if (resolveOrderQuantity(order) !== 1) return false
+  return resolveOrderInviteEmails(order).length === 1
+}
 
 const statusClass = (status?: string) => {
   if (status === 'pending') return 'bg-yellow-50 text-yellow-700 border-yellow-200'
@@ -133,10 +183,22 @@ const canProcessOrder = (order?: AlipayRedpackOrder | null) => {
 }
 const canSyncOrderStatus = (order?: AlipayRedpackOrder | null) => {
   const status = String(order?.status || '').trim().toLowerCase()
+  if (!shouldAutoSyncAfterProcess(order)) return false
   const accountId = Number(order?.invitedAccountId || 0)
   if (status === 'redeemed' || status === 'returned') return false
   return Number.isFinite(accountId) && accountId > 0
 }
+const processDialogHint = computed(() => {
+  const order = processingOrder.value
+  if (!order) return ''
+  if (isMotherOrderMode(order)) {
+    return '系统将按数量分配 GPT 母号并邮件发送账号凭据；页面仅展示交付结果，不展示账号密码明文。'
+  }
+  if (!shouldAutoSyncAfterProcess(order)) {
+    return '系统将按邀请邮箱列表批量执行邀请，并按成功邀请数量消耗对应兑换码。'
+  }
+  return '系统将按订单绑定兑换码自动定位邀请账号；若兑换码失效会自动尝试重绑可用兑换码后继续处理。'
+})
 
 const applyOrder = (updated: AlipayRedpackOrder) => {
   const index = orders.value.findIndex(item => item.id === updated.id)
@@ -316,12 +378,31 @@ const handleProcessOrder = async () => {
       applyOrder(latestOrder)
     }
 
-    latestOrder = await runAutoSyncAfterProcess(order.id, latestOrder)
-    if (latestOrder) {
-      applyOrder(latestOrder)
+    if (shouldAutoSyncAfterProcess(latestOrder || order)) {
+      latestOrder = await runAutoSyncAfterProcess(order.id, latestOrder)
+      if (latestOrder) {
+        applyOrder(latestOrder)
+      }
     }
 
-    showSuccessToast('处理完成，已自动同步状态并执行账号同步自查')
+    const summary = response?.summary
+    if (summary && Number(summary.total || 0) > 0) {
+      showSuccessToast(`批量处理完成：成功 ${Number(summary.success || 0)} / ${Number(summary.total || 0)}`)
+      if (Number(summary.failed || 0) > 0) {
+        showWarningToast(`有 ${Number(summary.failed || 0)} 个邮箱处理失败，请补充邀请码后重试`)
+      }
+    } else if (Array.isArray(response?.motherAccounts)) {
+      const deliveredCount = response.motherAccounts.length
+      const deletedCodeCount = Number(response?.deletedCodeCount || 0)
+      showSuccessToast(`${response?.message || '母号交付完成'}（交付 ${deliveredCount} 个母号）`)
+      if (deletedCodeCount > 0) {
+        showInfoToast(`已删除母号兑换码 ${deletedCodeCount} 个`)
+      }
+    } else if (shouldAutoSyncAfterProcess(latestOrder || order)) {
+      showSuccessToast('处理完成，已自动同步状态并执行账号同步自查')
+    } else {
+      showSuccessToast(response?.message || '处理完成')
+    }
     shouldCloseDialog = true
   } catch (err: any) {
     if (handleAuthError(err)) {
@@ -366,6 +447,12 @@ const handleReturnOrder = async (order: AlipayRedpackOrder) => {
     })
     if (response?.order) {
       applyOrder(response.order)
+    }
+    const rollbackMother = response?.rollbackMother
+    if (rollbackMother && (Number(rollbackMother.reopenedCount || 0) > 0 || Number(rollbackMother.deliveredCount || 0) > 0)) {
+      showInfoToast(
+        `母号回滚：重新开放 ${Number(rollbackMother.reopenedCount || 0)} 个，已交付保持关闭 ${Number(rollbackMother.deliveredCount || 0)} 个`
+      )
     }
     showSuccessToast(response?.message || '订单已退回')
   } catch (err: any) {
@@ -562,13 +649,14 @@ onUnmounted(() => {
       </div>
 
       <div v-else class="overflow-x-auto">
-        <table class="w-full min-w-[1840px] table-fixed">
+        <table class="w-full min-w-[2380px] table-fixed">
           <colgroup>
+            <col class="w-[210px]" />
             <col class="w-[220px]" />
-            <col class="w-[180px]" />
+            <col class="w-[220px]" />
             <col class="w-[260px]" />
-            <col class="w-[120px]" />
-            <col class="w-[320px]" />
+            <col class="w-[260px]" />
+            <col class="w-[330px]" />
             <col class="w-[210px]" />
             <col class="w-[220px]" />
             <col class="w-[170px]" />
@@ -577,10 +665,11 @@ onUnmounted(() => {
           <thead class="sticky top-0 z-10">
             <tr class="bg-slate-50 border-b border-slate-200 text-xs font-semibold tracking-wide text-slate-600">
               <th class="px-4 py-3 text-left whitespace-nowrap">邮箱</th>
-              <th class="px-4 py-3 text-left whitespace-nowrap">支付宝口令</th>
-              <th class="px-4 py-3 text-left whitespace-nowrap">兑换码记录</th>
-              <th class="px-4 py-3 text-left whitespace-nowrap">状态</th>
-              <th class="px-4 py-3 text-left whitespace-nowrap">邀请结果</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">商品</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">支付与口令</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">邀请邮箱</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">兑换码 / 母号交付</th>
+              <th class="px-4 py-3 text-left whitespace-nowrap">状态与结果</th>
               <th class="px-4 py-3 text-left whitespace-nowrap">时间</th>
               <th class="px-4 py-3 text-left whitespace-nowrap">备注</th>
               <th class="px-4 py-3 text-left whitespace-nowrap">操作人</th>
@@ -593,32 +682,72 @@ onUnmounted(() => {
                 <div class="font-medium text-gray-900 truncate" :title="order.email">{{ order.email }}</div>
                 <div class="text-xs text-gray-400">ID: {{ order.id }}</div>
               </td>
-              <td class="px-4 py-3 align-top">
-                <span class="font-mono text-gray-800 break-all" :title="order.alipayPassphrase">{{ order.alipayPassphrase }}</span>
+              <td class="px-4 py-3 text-xs leading-5 align-top">
+                <div class="rounded-lg border border-slate-100 bg-slate-50 p-2.5 space-y-1">
+                  <p class="font-medium text-slate-700 break-words">{{ order.productName || order.productKey || '-' }}</p>
+                  <p class="text-slate-500">类型：{{ productTypeText(order) }}</p>
+                  <p class="text-slate-500">数量：{{ resolveOrderQuantity(order) }}</p>
+                  <p class="text-slate-500">金额：{{ order.amount || '-' }}</p>
+                </div>
+              </td>
+              <td class="px-4 py-3 text-xs leading-5 align-top">
+                <div class="rounded-lg border border-slate-100 bg-slate-50 p-2.5 space-y-1">
+                  <p class="text-slate-700">支付方式：{{ paymentMethodText(order) }}</p>
+                  <p class="text-slate-500">口令：</p>
+                  <p class="font-mono text-slate-700 break-all">{{ order.alipayPassphrase || '-' }}</p>
+                </div>
               </td>
               <td class="px-4 py-3 text-xs leading-5 align-top">
                 <div class="rounded-lg border border-slate-100 bg-slate-50 p-2.5">
-                  <p class="text-slate-700">兑换码Code：{{ order.redemptionCode || '-' }}</p>
-                  <p class="text-slate-500">兑换码ID：{{ order.redemptionCodeId || '-' }}</p>
+                  <template v-if="isSingleOrderMode(order)">
+                    <p class="text-slate-500 mb-1">
+                      共 {{ resolveInviteEmailsPreview(order).total }} 个
+                    </p>
+                    <div class="space-y-1">
+                      <p
+                        v-for="mail in resolveInviteEmailsPreview(order).emails"
+                        :key="`${order.id}-${mail}`"
+                        class="text-slate-700 break-all"
+                      >
+                        {{ mail }}
+                      </p>
+                      <p v-if="resolveInviteEmailsPreview(order).extra > 0" class="text-slate-400">
+                        另有 {{ resolveInviteEmailsPreview(order).extra }} 个邮箱
+                      </p>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <p class="text-slate-500">母号订单无需邀请邮箱列表</p>
+                    <p class="text-slate-700 break-all mt-1">收件邮箱：{{ order.email }}</p>
+                  </template>
+                </div>
+              </td>
+              <td class="px-4 py-3 text-xs leading-5 align-top">
+                <div v-if="isSingleOrderMode(order)" class="rounded-lg border border-slate-100 bg-slate-50 p-2.5">
+                  <p class="text-slate-700">兑换码 Code：{{ order.redemptionCode || '-' }}</p>
+                  <p class="text-slate-500">兑换码 ID：{{ order.redemptionCodeId || '-' }}</p>
                   <p class="text-slate-500">状态：{{ redemptionCodeStateText(order) }}</p>
                   <p v-if="order.redemptionCodeRedeemedAt" class="text-slate-400">消耗：{{ formatDate(order.redemptionCodeRedeemedAt) }}</p>
+                </div>
+                <div v-else class="rounded-lg border border-slate-100 bg-slate-50 p-2.5">
+                  <p class="text-slate-700">母号交付：{{ order.motherDeliverySentAt ? '已发送' : '未发送' }}</p>
+                  <p class="text-slate-500">收件邮箱：{{ order.motherDeliveryMailTo || order.email }}</p>
+                  <p v-if="order.motherDeliverySentAt" class="text-slate-400">发送时间：{{ formatDate(order.motherDeliverySentAt) }}</p>
                 </div>
               </td>
               <td class="px-4 py-3 align-top">
                 <span class="inline-flex items-center px-2.5 py-1 rounded-full border text-[11px] font-semibold" :class="statusClass(order.status)">
                   {{ statusText(order.status) }}
                 </span>
-              </td>
-              <td class="px-4 py-3 align-top">
-                <p class="text-gray-700 leading-5 break-words">{{ order.inviteResult || '-' }}</p>
+                <p class="text-gray-700 leading-5 break-words mt-2">{{ order.inviteResult || '-' }}</p>
                 <p v-if="order.invitedAccountEmail" class="text-xs text-gray-400 mt-1">账号：{{ order.invitedAccountEmail }}</p>
                 <p v-if="order.invitedAccountId" class="text-xs mt-1" :class="invitedAccountStatusClass(order)">状态：{{ invitedAccountStatusText(order) }}</p>
-                <div v-if="order.invitedAccountId" class="mt-2">
+                <div v-if="canSyncOrderStatus(order)" class="mt-2">
                   <Button
                     size="sm"
                     variant="outline"
                     class="h-7 px-2 text-xs"
-                    :disabled="syncingStatusOrderId === order.id || !canSyncOrderStatus(order)"
+                    :disabled="syncingStatusOrderId === order.id"
                     @click="handleSyncOrderStatus(order)"
                   >
                     <Loader2 v-if="syncingStatusOrderId === order.id" class="w-3 h-3 animate-spin mr-1" />
@@ -686,7 +815,7 @@ onUnmounted(() => {
         <DialogHeader>
           <DialogTitle class="text-xl font-bold text-gray-900">处理支付宝口令订单</DialogTitle>
           <DialogDescription>
-            处理后会自动执行：邀请处理、订单状态同步、账号同步自查（不跳转账号管理页）。
+            按商品类型执行单号邀请或母号交付，兼容历史单号订单流程。
           </DialogDescription>
         </DialogHeader>
 
@@ -694,13 +823,12 @@ onUnmounted(() => {
           <div class="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700 space-y-1">
             <p>订单ID：<span class="font-mono">#{{ processingOrder.id }}</span></p>
             <p>邮箱：{{ processingOrder.email }}</p>
+            <p>商品类型：{{ productTypeText(processingOrder) }}（数量 {{ resolveOrderQuantity(processingOrder) }}）</p>
             <p>当前状态：{{ statusText(processingOrder.status) }}</p>
           </div>
 
           <div class="rounded-lg border border-cyan-100 bg-cyan-50 p-3 text-xs leading-6 text-cyan-800">
-            系统将按订单绑定兑换码自动定位邀请账号。
-            若当前绑定兑换码失效，会自动尝试重绑可用兑换码后继续处理；
-            若仍失败，将直接报错并提示先补充兑换码再处理。
+            {{ processDialogHint }}
           </div>
         </div>
 

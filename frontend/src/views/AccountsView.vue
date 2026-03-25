@@ -49,6 +49,11 @@ const dateFormatOptions = computed(() => ({
   timeZone: appConfigStore.timezone,
   locale: appConfigStore.locale,
 }))
+const isSuperAdmin = computed(() => {
+  const currentUser = authService.getCurrentUser()
+  const roles = Array.isArray(currentUser?.roles) ? currentUser.roles.map(String) : []
+  return roles.includes('super_admin')
+})
 
 // Teleport 目标是否存在
 const teleportReady = ref(false)
@@ -164,7 +169,9 @@ const formData = ref<CreateGptAccountDto>({
   isBanned: false,
   chatgptAccountId: '',
   oaiDeviceId: '',
-  expireAt: ''
+  expireAt: '',
+  gptPassword: '',
+  emailPassword: ''
 })
 
 const checkingAccessToken = ref(false)
@@ -181,6 +188,8 @@ const generatingOpenaiAuthUrl = ref(false)
 const exchangingOpenaiCode = ref(false)
 const cachedApiKey = ref<string>('')
 const cachedApiKeyConfigured = ref<boolean | null>(null)
+const showGptPasswordPlain = ref(false)
+const showEmailPasswordPlain = ref(false)
 let openaiOAuthFlowNonce = 0
 
 const resolveRequestError = (err: any, fallback: string) => {
@@ -1248,6 +1257,8 @@ watch(
 
 const openEditDialog = (account: GptAccount) => {
   editingAccount.value = account
+  showGptPasswordPlain.value = false
+  showEmailPasswordPlain.value = false
 	  formData.value = {
 	    email: account.email,
 	    token: account.token,
@@ -1256,7 +1267,9 @@ const openEditDialog = (account: GptAccount) => {
 	    isBanned: Boolean(account.isBanned),
 	    chatgptAccountId: account.chatgptAccountId || '',
 	    oaiDeviceId: account.oaiDeviceId || '',
-	    expireAt: toDatetimeLocal(account.expireAt || '')
+	    expireAt: toDatetimeLocal(account.expireAt || ''),
+      gptPassword: account.gptPassword || '',
+      emailPassword: account.emailPassword || ''
 	  }
   showDialog.value = true
 }
@@ -1264,7 +1277,9 @@ const openEditDialog = (account: GptAccount) => {
 	const closeDialog = () => {
 	  showDialog.value = false
 	  editingAccount.value = null
-	  formData.value = { email: '', token: '', refreshToken: '', userCount: 0, isBanned: false, chatgptAccountId: '', oaiDeviceId: '', expireAt: '' }
+  showGptPasswordPlain.value = false
+  showEmailPasswordPlain.value = false
+	  formData.value = { email: '', token: '', refreshToken: '', userCount: 0, isBanned: false, chatgptAccountId: '', oaiDeviceId: '', expireAt: '', gptPassword: '', emailPassword: '' }
 	  checkedChatgptAccounts.value = []
 	  checkAccessTokenError.value = ''
 	  checkingAccessToken.value = false
@@ -1302,6 +1317,10 @@ const handleSubmit = async () => {
       chatgptAccountId: normalizedChatgptAccountId,
       oaiDeviceId: formData.value.oaiDeviceId?.trim() || '',
       expireAt: normalizedExpireAt,
+    }
+    if (isSuperAdmin.value) {
+      payload.gptPassword = formData.value.gptPassword?.trim() || ''
+      payload.emailPassword = formData.value.emailPassword?.trim() || ''
     }
 
     if (!payload.chatgptAccountId) {
@@ -2479,6 +2498,52 @@ const handleQuickInviteSubmit = async () => {
 		                    />
 		                 </div>
 		              </div>
+
+                  <div v-if="isSuperAdmin" class="grid grid-cols-1 gap-4">
+                    <div class="space-y-2">
+                      <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">GPT 密码</Label>
+                      <div class="flex items-center gap-2">
+                        <Input
+                          v-model="formData.gptPassword"
+                          :type="showGptPasswordPlain ? 'text' : 'password'"
+                          placeholder="可选，留空表示清空"
+                          class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all"
+                        />
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="outline"
+                          class="h-11 w-11 rounded-xl border-gray-200"
+                          @click="showGptPasswordPlain = !showGptPasswordPlain"
+                        >
+                          <Eye v-if="showGptPasswordPlain" class="w-4 h-4" />
+                          <EyeOff v-else class="w-4 h-4" />
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div class="space-y-2">
+                      <Label class="text-xs font-semibold text-gray-500 uppercase tracking-wider">邮箱密码</Label>
+                      <div class="flex items-center gap-2">
+                        <Input
+                          v-model="formData.emailPassword"
+                          :type="showEmailPasswordPlain ? 'text' : 'password'"
+                          placeholder="可选，留空表示清空"
+                          class="h-11 flex-1 bg-gray-50 border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-100 focus:border-blue-500 transition-all"
+                        />
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="outline"
+                          class="h-11 w-11 rounded-xl border-gray-200"
+                          @click="showEmailPasswordPlain = !showEmailPasswordPlain"
+                        >
+                          <Eye v-if="showEmailPasswordPlain" class="w-4 h-4" />
+                          <EyeOff v-else class="w-4 h-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
 
 	                  <div class="grid grid-cols-1 gap-4">
 	                    <div class="space-y-2">

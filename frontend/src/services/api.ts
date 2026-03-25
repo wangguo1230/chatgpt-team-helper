@@ -383,6 +383,10 @@ export interface GptAccount {
   quickInviteCapacityLimit?: number
   directInviteCodeTotal?: number
   directInviteCodeAvailable?: number
+  hasGptPassword?: boolean
+  hasEmailPassword?: boolean
+  gptPassword?: string
+  emailPassword?: string
   createdAt: string
   updatedAt: string
 }
@@ -398,6 +402,8 @@ export interface CreateGptAccountDto {
   chatgptAccountId: string
   oaiDeviceId?: string
   expireAt?: string
+  gptPassword?: string
+  emailPassword?: string
 }
 
 export interface ChatgptAccountCheckInfo {
@@ -880,6 +886,13 @@ export interface AlipayRedpackOrder {
   id: number
   email: string
   alipayPassphrase?: string
+  productKey?: string | null
+  productName?: string | null
+  amount?: string | null
+  quantity?: number
+  productType?: 'gpt_single' | 'gpt_parent' | string
+  paymentMethod?: 'alipay_passphrase' | 'zpay' | string
+  inviteEmails?: string[]
   redemptionCodeId?: number | null
   redemptionCode?: string | null
   redemptionCodeRedeemedAt?: string | null
@@ -892,6 +905,23 @@ export interface AlipayRedpackOrder {
   redeemedAt?: string | null
   operatorUserId?: number | null
   operatorUsername?: string | null
+  motherDeliverySentAt?: string | null
+  motherDeliveryMailTo?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface AlipayRedpackProduct {
+  id?: number
+  productKey: string
+  productName: string
+  amount: string
+  serviceDays: number
+  orderType?: PurchaseOrderType
+  isActive: boolean
+  sortOrder: number
+  productType: 'gpt_single' | 'gpt_parent' | string
+  paymentMethod: 'alipay_passphrase' | 'zpay' | string
   createdAt?: string | null
   updatedAt?: string | null
 }
@@ -916,9 +946,13 @@ export interface AlipayRedpackSupplementCandidateOrder {
   orderId: number
   createdAt?: string | null
   status: 'pending' | 'invited' | 'redeemed' | 'returned' | string
+  productType?: 'gpt_single' | 'gpt_parent' | string
+  quantity?: number
   warrantyDays?: number | null
   withinWarranty: boolean
   windowEndsAt?: string | null
+  supplementSupported?: boolean
+  supplementSelectable?: boolean
 }
 
 export interface AlipayRedpackSupplementCandidateResponse {
@@ -2958,8 +2992,9 @@ export const xianyuService = {
 }
 
 export const alipayRedpackService = {
-  async getPublicStock(): Promise<AlipayRedpackStock> {
+  async getPublicStock(productKey?: string): Promise<AlipayRedpackStock> {
     const response = await axios.get(`${API_URL}/alipay-redpack/stock`, {
+      params: productKey ? { productKey } : undefined,
       headers: {
         'Content-Type': 'application/json'
       }
@@ -2967,7 +3002,25 @@ export const alipayRedpackService = {
     return response.data
   },
 
-  async createOrderPublic(payload: { email: string; alipayPassphrase: string; note?: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
+  async getPublicProducts(): Promise<{ products: AlipayRedpackProduct[] }> {
+    const response = await axios.get(`${API_URL}/alipay-redpack/products`, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    return response.data
+  },
+
+  async createOrderPublic(payload: {
+    email: string
+    alipayPassphrase: string
+    note?: string
+    productKey?: string
+    productType?: string
+    quantity?: number
+    paymentMethod?: string
+    inviteEmails?: string[]
+  }): Promise<{ message: string; order: AlipayRedpackOrder }> {
     const response = await axios.post(`${API_URL}/alipay-redpack/orders`, payload, {
       headers: {
         'Content-Type': 'application/json'
@@ -3020,12 +3073,12 @@ export const alipayRedpackService = {
     return response.data
   },
 
-  async adminQuickInvite(id: number, payload?: { accountId?: number }): Promise<{ message: string; order: AlipayRedpackOrder; queueState?: { isMember: boolean; isInvited: boolean }; redemptionCode?: RedemptionCode | null }> {
+  async adminQuickInvite(id: number, payload?: { accountId?: number }): Promise<{ message: string; order: AlipayRedpackOrder; queueState?: { isMember: boolean; isInvited: boolean }; redemptionCode?: RedemptionCode | null; inviteResults?: any[]; summary?: { total: number; success: number; failed: number }; motherAccounts?: Array<{ id: number; email: string }>; deletedCodeCount?: number }> {
     const response = await api.post(`/alipay-redpack/admin/orders/${id}/quick-invite`, payload || {})
     return response.data
   },
 
-  async adminReturnOrder(id: number, payload?: { reason?: string }): Promise<{ message: string; order: AlipayRedpackOrder }> {
+  async adminReturnOrder(id: number, payload?: { reason?: string }): Promise<{ message: string; order: AlipayRedpackOrder; rollbackMother?: { reopenedCount: number; deliveredCount: number } }> {
     const response = await api.post(`/alipay-redpack/admin/orders/${id}/return`, payload || {})
     return response.data
   },
@@ -3052,6 +3105,36 @@ export const alipayRedpackService = {
 
   async adminManualCloseSupplement(id: number, payload?: { detail?: string }): Promise<{ message: string; record: AlipayRedpackSupplementRecord }> {
     const response = await api.patch(`/alipay-redpack/admin/supplements/${id}/manual-close`, payload || {})
+    return response.data
+  },
+
+  async adminListProducts(): Promise<{ products: AlipayRedpackProduct[] }> {
+    const response = await api.get('/alipay-redpack/admin/products')
+    return response.data
+  },
+
+  async adminCreateProduct(payload: {
+    productKey: string
+    productName: string
+    amount: string
+    serviceDays?: number
+    orderType?: PurchaseOrderType
+    isActive?: boolean
+    sortOrder?: number
+    productType: 'gpt_single' | 'gpt_parent' | string
+    paymentMethod?: 'alipay_passphrase' | 'zpay' | string
+  }): Promise<{ product: AlipayRedpackProduct }> {
+    const response = await api.post('/alipay-redpack/admin/products', payload)
+    return response.data
+  },
+
+  async adminUpdateProduct(productKey: string, payload: Partial<AlipayRedpackProduct>): Promise<{ product: AlipayRedpackProduct }> {
+    const response = await api.patch(`/alipay-redpack/admin/products/${encodeURIComponent(productKey)}`, payload)
+    return response.data
+  },
+
+  async adminDeleteProduct(productKey: string): Promise<{ ok: boolean; product?: AlipayRedpackProduct }> {
+    const response = await api.delete(`/alipay-redpack/admin/products/${encodeURIComponent(productKey)}`)
     return response.data
   }
 }

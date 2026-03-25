@@ -401,6 +401,7 @@ const ensureRbacTables = (database) => {
       { key: 'credit_orders', label: 'Credit 订单', path: '/admin/credit-orders', parentKey: 'order_management', sortOrder: 5 },
       { key: 'account_recovery', label: '补号管理', path: '/admin/account-recovery', parentKey: 'order_management', sortOrder: 6 },
       { key: 'alipay_redpack_supplements', label: '支付宝口令补录管理', path: '/admin/alipay-redpack-supplements', parentKey: 'order_management', sortOrder: 7 },
+      { key: 'alipay_redpack_products', label: '支付宝口令商品管理', path: '/admin/alipay-redpack-products', parentKey: 'order_management', sortOrder: 8 },
       { key: 'permission_management', label: '权限管理', path: '', sortOrder: 7 },
       { key: 'user_management', label: '用户管理', path: '/admin/users', parentKey: 'permission_management', sortOrder: 1 },
       { key: 'role_management', label: '角色管理', path: '/admin/roles', parentKey: 'permission_management', sortOrder: 2 },
@@ -1179,6 +1180,15 @@ const ensureAlipayRedpackOrdersTable = (database) => {
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL,
           alipay_passphrase TEXT NOT NULL UNIQUE,
+          product_key TEXT,
+          product_name_snapshot TEXT,
+          amount_snapshot TEXT,
+          quantity INTEGER DEFAULT 1,
+          product_type TEXT DEFAULT 'gpt_single',
+          payment_method TEXT DEFAULT 'alipay_passphrase',
+          invite_emails TEXT,
+          mother_delivery_sent_at DATETIME,
+          mother_delivery_mail_to TEXT,
           redemption_code_id INTEGER,
           redemption_code_redeemed_at DATETIME,
           note TEXT,
@@ -1207,6 +1217,42 @@ const ensureAlipayRedpackOrdersTable = (database) => {
         const columns = tableInfo[0].values.map(row => row[1])
         if (!columns.includes('invite_result')) {
           database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invite_result TEXT')
+          changed = true
+        }
+        if (!columns.includes('product_key')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN product_key TEXT')
+          changed = true
+        }
+        if (!columns.includes('product_name_snapshot')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN product_name_snapshot TEXT')
+          changed = true
+        }
+        if (!columns.includes('amount_snapshot')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN amount_snapshot TEXT')
+          changed = true
+        }
+        if (!columns.includes('quantity')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN quantity INTEGER DEFAULT 1')
+          changed = true
+        }
+        if (!columns.includes('product_type')) {
+          database.run("ALTER TABLE alipay_redpack_orders ADD COLUMN product_type TEXT DEFAULT 'gpt_single'")
+          changed = true
+        }
+        if (!columns.includes('payment_method')) {
+          database.run("ALTER TABLE alipay_redpack_orders ADD COLUMN payment_method TEXT DEFAULT 'alipay_passphrase'")
+          changed = true
+        }
+        if (!columns.includes('invite_emails')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN invite_emails TEXT')
+          changed = true
+        }
+        if (!columns.includes('mother_delivery_sent_at')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN mother_delivery_sent_at DATETIME')
+          changed = true
+        }
+        if (!columns.includes('mother_delivery_mail_to')) {
+          database.run('ALTER TABLE alipay_redpack_orders ADD COLUMN mother_delivery_mail_to TEXT')
           changed = true
         }
         if (!columns.includes('invited_account_id')) {
@@ -1284,6 +1330,36 @@ const ensureAlipayRedpackOrdersTable = (database) => {
     database.run(
       `
         UPDATE alipay_redpack_orders
+        SET quantity = CASE
+              WHEN quantity IS NULL OR quantity <= 0 THEN 1
+              ELSE quantity
+            END,
+            product_type = CASE
+              WHEN LOWER(TRIM(COALESCE(product_type, ''))) IN ('gpt_single', 'gpt_parent')
+                THEN LOWER(TRIM(product_type))
+              ELSE 'gpt_single'
+            END,
+            payment_method = CASE
+              WHEN LOWER(TRIM(COALESCE(payment_method, ''))) IN ('alipay_passphrase', 'zpay')
+                THEN LOWER(TRIM(payment_method))
+              ELSE 'alipay_passphrase'
+            END,
+            mother_delivery_mail_to = CASE
+              WHEN mother_delivery_mail_to IS NULL OR trim(mother_delivery_mail_to) = ''
+                THEN lower(trim(email))
+              ELSE lower(trim(mother_delivery_mail_to))
+            END
+        WHERE quantity IS NULL OR quantity <= 0
+           OR product_type IS NULL OR trim(product_type) = ''
+           OR payment_method IS NULL OR trim(payment_method) = ''
+           OR mother_delivery_mail_to IS NULL OR trim(mother_delivery_mail_to) = ''
+      `
+    )
+    if (Number(database.getRowsModified?.() || 0) > 0) changed = true
+
+    database.run(
+      `
+        UPDATE alipay_redpack_orders
         SET warranty_anchor_at = COALESCE(redeemed_at, invite_sent_at, created_at)
         WHERE warranty_anchor_at IS NULL
           AND (
@@ -1354,6 +1430,11 @@ const ensureAlipayRedpackOrdersTable = (database) => {
       database,
       'idx_alipay_redpack_orders_warranty_anchor_at',
       'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_warranty_anchor_at ON alipay_redpack_orders(warranty_anchor_at)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_orders_product_type_created_at',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_orders_product_type_created_at ON alipay_redpack_orders(product_type, created_at)'
     ) || changed
   } catch (error) {
     console.warn('[DB] 无法初始化 alipay_redpack_orders 表:', error)
@@ -1443,6 +1524,169 @@ const ensureAlipayRedpackSupplementsTable = (database) => {
     ) || changed
   } catch (error) {
     console.warn('[DB] 无法初始化 alipay_redpack_supplements 表:', error)
+  }
+
+  return changed
+}
+
+const ensureAlipayRedpackOrderInviteItemsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'alipay_redpack_order_invite_items')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS alipay_redpack_order_invite_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id INTEGER NOT NULL,
+          invite_index INTEGER NOT NULL DEFAULT 0,
+          invite_email TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          invited_account_id INTEGER,
+          invited_account_email TEXT,
+          consumed_code_id INTEGER,
+          consumed_code TEXT,
+          invite_result TEXT,
+          queue_is_member INTEGER DEFAULT 0,
+          queue_is_invited INTEGER DEFAULT 0,
+          invite_sent_at DATETIME,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          UNIQUE(order_id, invite_index),
+          FOREIGN KEY (order_id) REFERENCES alipay_redpack_orders(id)
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'alipay_redpack_order_invite_items')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE alipay_redpack_order_invite_items ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('order_id', 'order_id INTEGER')
+      addColumn('invite_index', 'invite_index INTEGER NOT NULL DEFAULT 0')
+      addColumn('invite_email', 'invite_email TEXT')
+      addColumn('status', "status TEXT NOT NULL DEFAULT 'pending'")
+      addColumn('invited_account_id', 'invited_account_id INTEGER')
+      addColumn('invited_account_email', 'invited_account_email TEXT')
+      addColumn('consumed_code_id', 'consumed_code_id INTEGER')
+      addColumn('consumed_code', 'consumed_code TEXT')
+      addColumn('invite_result', 'invite_result TEXT')
+      addColumn('queue_is_member', 'queue_is_member INTEGER DEFAULT 0')
+      addColumn('queue_is_invited', 'queue_is_invited INTEGER DEFAULT 0')
+      addColumn('invite_sent_at', 'invite_sent_at DATETIME')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_invite_items_order_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_invite_items_order_id ON alipay_redpack_order_invite_items(order_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_invite_items_email',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_invite_items_email ON alipay_redpack_order_invite_items(invite_email)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_invite_items_status',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_invite_items_status ON alipay_redpack_order_invite_items(status)'
+    ) || changed
+  } catch (error) {
+    console.warn('[DB] 无法初始化 alipay_redpack_order_invite_items 表:', error)
+  }
+
+  return changed
+}
+
+const ensureAlipayRedpackOrderMotherAccountsTable = (database) => {
+  if (!database) return false
+  let changed = false
+
+  try {
+    if (!tableExists(database, 'alipay_redpack_order_mother_accounts')) {
+      database.run(`
+        CREATE TABLE IF NOT EXISTS alipay_redpack_order_mother_accounts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id INTEGER NOT NULL,
+          account_id INTEGER NOT NULL,
+          account_email TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'reserved',
+          delivery_email TEXT,
+          delivery_sent_at DATETIME,
+          note TEXT,
+          created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          updated_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+          UNIQUE(order_id, account_id),
+          FOREIGN KEY (order_id) REFERENCES alipay_redpack_orders(id),
+          FOREIGN KEY (account_id) REFERENCES gpt_accounts(id)
+        )
+      `)
+      changed = true
+    } else {
+      const columns = getTableColumns(database, 'alipay_redpack_order_mother_accounts')
+      const addColumn = (name, ddl) => {
+        if (columns.has(name)) return
+        database.run(`ALTER TABLE alipay_redpack_order_mother_accounts ADD COLUMN ${ddl}`)
+        changed = true
+        columns.add(name)
+      }
+
+      addColumn('order_id', 'order_id INTEGER')
+      addColumn('account_id', 'account_id INTEGER')
+      addColumn('account_email', 'account_email TEXT')
+      addColumn('status', "status TEXT NOT NULL DEFAULT 'reserved'")
+      addColumn('delivery_email', 'delivery_email TEXT')
+      addColumn('delivery_sent_at', 'delivery_sent_at DATETIME')
+      addColumn('note', 'note TEXT')
+      addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+      addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
+    }
+
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_mother_accounts_order_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_mother_accounts_order_id ON alipay_redpack_order_mother_accounts(order_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_mother_accounts_account_id',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_mother_accounts_account_id ON alipay_redpack_order_mother_accounts(account_id)'
+    ) || changed
+    changed = ensureIndex(
+      database,
+      'idx_alipay_redpack_order_mother_accounts_status',
+      'CREATE INDEX IF NOT EXISTS idx_alipay_redpack_order_mother_accounts_status ON alipay_redpack_order_mother_accounts(status)'
+    ) || changed
+  } catch (error) {
+    console.warn('[DB] 无法初始化 alipay_redpack_order_mother_accounts 表:', error)
+  }
+
+  return changed
+}
+
+const ensureGptAccountsSensitiveColumns = (database) => {
+  if (!database || !tableExists(database, 'gpt_accounts')) return false
+  let changed = false
+
+  try {
+    const columns = getTableColumns(database, 'gpt_accounts')
+    const addColumn = (name, ddl) => {
+      if (columns.has(name)) return
+      database.run(`ALTER TABLE gpt_accounts ADD COLUMN ${ddl}`)
+      changed = true
+      columns.add(name)
+    }
+
+    addColumn('gpt_password_cipher', 'gpt_password_cipher TEXT')
+    addColumn('email_password_cipher', 'email_password_cipher TEXT')
+  } catch (error) {
+    console.warn('[DB] 无法初始化 gpt_accounts 密码字段:', error)
   }
 
   return changed
@@ -1679,6 +1923,9 @@ const ensurePurchaseProductsTable = (database) => {
           delivery_mode TEXT NOT NULL DEFAULT 'email',
           fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool',
           redeem_provider TEXT,
+          sales_channel TEXT NOT NULL DEFAULT 'purchase',
+          payment_method TEXT NOT NULL DEFAULT 'alipay_passphrase',
+          alipay_product_type TEXT,
           created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
           updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
         )
@@ -1705,6 +1952,9 @@ const ensurePurchaseProductsTable = (database) => {
       addColumn('delivery_mode', "delivery_mode TEXT NOT NULL DEFAULT 'email'")
       addColumn('fulfillment_mode', "fulfillment_mode TEXT NOT NULL DEFAULT 'item_pool'")
       addColumn('redeem_provider', 'redeem_provider TEXT')
+      addColumn('sales_channel', "sales_channel TEXT NOT NULL DEFAULT 'purchase'")
+      addColumn('payment_method', "payment_method TEXT NOT NULL DEFAULT 'alipay_passphrase'")
+      addColumn('alipay_product_type', 'alipay_product_type TEXT')
       addColumn('created_at', "created_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
       addColumn('updated_at', "updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))")
     }
@@ -1724,10 +1974,23 @@ const ensurePurchaseProductsTable = (database) => {
                 END
               ELSE NULLIF(TRIM(redeem_provider), '')
             END,
+            sales_channel = COALESCE(NULLIF(TRIM(sales_channel), ''), 'purchase'),
+            payment_method = COALESCE(NULLIF(TRIM(payment_method), ''), 'alipay_passphrase'),
+            alipay_product_type = CASE
+              WHEN COALESCE(NULLIF(TRIM(sales_channel), ''), 'purchase') = 'alipay_redpack'
+                THEN CASE
+                  WHEN LOWER(TRIM(COALESCE(alipay_product_type, ''))) IN ('gpt_single', 'gpt_parent')
+                    THEN LOWER(TRIM(alipay_product_type))
+                  ELSE 'gpt_single'
+                END
+              ELSE NULL
+            END,
             updated_at = DATETIME('now', 'localtime')
         WHERE category IS NULL OR TRIM(category) = ''
            OR delivery_mode IS NULL OR TRIM(delivery_mode) = ''
            OR fulfillment_mode IS NULL OR TRIM(fulfillment_mode) = ''
+           OR sales_channel IS NULL OR TRIM(sales_channel) = ''
+           OR payment_method IS NULL OR TRIM(payment_method) = ''
            OR (
              COALESCE(NULLIF(TRIM(fulfillment_mode), ''), 'item_pool') = 'redeem_api'
              AND (
@@ -1742,6 +2005,7 @@ const ensurePurchaseProductsTable = (database) => {
     database.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_products_key ON purchase_products(product_key)')
     database.run('CREATE INDEX IF NOT EXISTS idx_purchase_products_active_sort ON purchase_products(is_active, sort_order, id)')
     database.run('CREATE INDEX IF NOT EXISTS idx_purchase_products_category_active_sort ON purchase_products(category, is_active, sort_order, id)')
+    database.run('CREATE INDEX IF NOT EXISTS idx_purchase_products_sales_channel_active_sort ON purchase_products(sales_channel, is_active, sort_order, id)')
   } catch (error) {
     console.warn('[DB] 无法初始化 purchase_products 表:', error)
   }
@@ -2995,14 +3259,16 @@ export async function initDatabase() {
 	      expire_at TEXT,
 		      is_open INTEGER DEFAULT 0,
 		      is_demoted INTEGER DEFAULT 0,
-		      is_banned INTEGER DEFAULT 0,
-		      ban_processed INTEGER DEFAULT 0,
-		      banned_at DATETIME,
-		      risk_note TEXT,
-		      created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
-		      updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
-		    )
-		  `)
+	      is_banned INTEGER DEFAULT 0,
+	      ban_processed INTEGER DEFAULT 0,
+	      banned_at DATETIME,
+	      risk_note TEXT,
+	      gpt_password_cipher TEXT,
+	      email_password_cipher TEXT,
+	      created_at DATETIME DEFAULT (DATETIME('now', 'localtime')),
+	      updated_at DATETIME DEFAULT (DATETIME('now', 'localtime'))
+	    )
+	  `)
 
   // Create redemption_codes table to manage redemption codes
 	  database.run(`
@@ -3034,6 +3300,8 @@ export async function initDatabase() {
   const xhsTablesInitialized = ensureXhsTables(database)
   const xianyuTablesInitialized = ensureXianyuTables(database)
   const alipayRedpackOrdersInitialized = ensureAlipayRedpackOrdersTable(database)
+  const alipayRedpackInviteItemsInitialized = ensureAlipayRedpackOrderInviteItemsTable(database)
+  const alipayRedpackMotherAccountsInitialized = ensureAlipayRedpackOrderMotherAccountsTable(database)
   const alipayRedpackSupplementsInitialized = ensureAlipayRedpackSupplementsTable(database)
   const alipayRedpackSupplementTicketsInitialized = ensureAlipayRedpackSupplementTicketsTable(database)
   const linuxDoUsersInitialized = ensureLinuxDoUsersTable(database)
@@ -3049,11 +3317,14 @@ export async function initDatabase() {
   const pointsWithdrawalsInitialized = ensurePointsWithdrawalsTable(database)
   const pointsLedgerInitialized = ensurePointsLedgerTable(database)
   const announcementsInitialized = ensureAnnouncementsTables(database)
+  const gptAccountsSensitiveColumnsInitialized = ensureGptAccountsSensitiveColumns(database)
   if (
     waitingRoomInitialized ||
     xhsTablesInitialized ||
     xianyuTablesInitialized ||
     alipayRedpackOrdersInitialized ||
+    alipayRedpackInviteItemsInitialized ||
+    alipayRedpackMotherAccountsInitialized ||
     alipayRedpackSupplementsInitialized ||
     alipayRedpackSupplementTicketsInitialized ||
     linuxDoUsersInitialized ||
@@ -3068,7 +3339,8 @@ export async function initDatabase() {
     purchaseProductsInitialized ||
     pointsWithdrawalsInitialized ||
     pointsLedgerInitialized ||
-    announcementsInitialized
+    announcementsInitialized ||
+    gptAccountsSensitiveColumnsInitialized
   ) {
     saveDatabase()
   }

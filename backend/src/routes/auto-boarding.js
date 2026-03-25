@@ -6,12 +6,33 @@ import { extractOpenAiAccountPayload } from '../utils/openai-account-payload.js'
 import { getChannels, normalizeChannelKey } from '../utils/channels.js'
 import { getOpenAccountsCapacityLimit } from '../utils/open-accounts-capacity-settings.js'
 import { withLocks } from '../utils/locks.js'
+import { encryptSensitiveText } from '../utils/sensitive-crypto.js'
 
 const router = express.Router()
 
 const EXPIRE_AT_REGEX = /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/
 
 const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
+
+const normalizeSensitivePasswordInput = (value) => {
+  if (value == null) return null
+  const normalized = String(value).trim()
+  if (!normalized) return ''
+  return normalized.slice(0, 500)
+}
+
+const resolveSensitivePasswordPayload = (body, camelKey, snakeKey) => {
+  const hasValue = Object.prototype.hasOwnProperty.call(body, camelKey)
+    || Object.prototype.hasOwnProperty.call(body, snakeKey)
+  if (!hasValue) return { hasValue: false, cipherValue: null }
+
+  const normalized = normalizeSensitivePasswordInput(
+    Object.prototype.hasOwnProperty.call(body, camelKey) ? body[camelKey] : body[snakeKey]
+  )
+  if (normalized === null) return { hasValue: true, cipherValue: null }
+  if (!normalized) return { hasValue: true, cipherValue: null }
+  return { hasValue: true, cipherValue: encryptSensitiveText(normalized) }
+}
 
 const normalizeBoolean = (value) => {
   if (typeof value === 'boolean') return value
@@ -464,6 +485,8 @@ router.post('/', apiKeyAuth, async (req, res) => {
     const derivedExpireAt = shouldUpdateExpireAt && !hasExpireAt ? deriveExpireAtFromToken(token) : null
     const expireAt = hasExpireAt ? normalizedExpireAt : (derivedExpireAt || null)
     const codePlans = resolveCodePlansFromPayload(body)
+    const gptPasswordPatch = resolveSensitivePasswordPayload(body, 'gptPassword', 'gpt_password')
+    const emailPasswordPatch = resolveSensitivePasswordPayload(body, 'emailPassword', 'email_password')
     // isDemoted/is_demoted: deprecated (ignored). Keep request compatibility.
 
     if (hasExpireAt && expireAtInput != null && String(expireAtInput).trim() && !normalizedExpireAt) {
@@ -541,24 +564,50 @@ router.post('/', apiKeyAuth, async (req, res) => {
                  oai_device_id = ?,
                  is_open = ?,
                  expire_at = CASE WHEN ? = 1 THEN ? ELSE expire_at END,
+                 gpt_password_cipher = CASE WHEN ? = 1 THEN ? ELSE gpt_password_cipher END,
+                 email_password_cipher = CASE WHEN ? = 1 THEN ? ELSE email_password_cipher END,
                  updated_at = DATETIME('now', 'localtime')
              WHERE id = ?`,
-            [token, refreshToken || null, chatgptAccountId || null, oaiDeviceId || null, isOpen ? 1 : 0, shouldUpdateExpireAt ? 1 : 0, expireAt, existingAccount.id]
+            [
+              token,
+              refreshToken || null,
+              chatgptAccountId || null,
+              oaiDeviceId || null,
+              isOpen ? 1 : 0,
+              shouldUpdateExpireAt ? 1 : 0,
+              expireAt,
+              gptPasswordPatch.hasValue ? 1 : 0,
+              gptPasswordPatch.cipherValue,
+              emailPasswordPatch.hasValue ? 1 : 0,
+              emailPasswordPatch.cipherValue,
+              existingAccount.id
+            ]
           )
         } else {
           action = 'created'
           db.run(
             `INSERT INTO gpt_accounts
-             (email, token, refresh_token, user_count, chatgpt_account_id, oai_device_id, expire_at, is_open, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
-            [normalizedEmail, token, refreshToken || null, 1, chatgptAccountId || null, oaiDeviceId || null, expireAt, isOpen ? 1 : 0]
+             (email, token, refresh_token, user_count, chatgpt_account_id, oai_device_id, expire_at, is_open, gpt_password_cipher, email_password_cipher, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))`,
+            [
+              normalizedEmail,
+              token,
+              refreshToken || null,
+              1,
+              chatgptAccountId || null,
+              oaiDeviceId || null,
+              expireAt,
+              isOpen ? 1 : 0,
+              gptPasswordPatch.cipherValue,
+              emailPasswordPatch.cipherValue
+            ]
           )
           accountId = Number(db.exec('SELECT last_insert_rowid()')[0]?.values?.[0]?.[0] || 0)
         }
 
         const accountResult = db.exec(
           `
-            SELECT id, email, token, refresh_token, COALESCE(user_count, 0), COALESCE(invite_count, 0), chatgpt_account_id, oai_device_id, expire_at, COALESCE(is_open, 0), created_at, updated_at
+            SELECT id, email, token, refresh_token, COALESCE(user_count, 0), COALESCE(invite_count, 0), chatgpt_account_id, oai_device_id, expire_at, COALESCE(is_open, 0), created_at, updated_at, gpt_password_cipher, email_password_cipher
             FROM gpt_accounts
             WHERE id = ?
             LIMIT 1
@@ -582,6 +631,8 @@ router.post('/', apiKeyAuth, async (req, res) => {
           expireAt: accountRow[8] || null,
           isOpen: Number(accountRow[9] || 0) === 1,
           isDemoted: false,
+          hasGptPassword: Boolean(accountRow[12]),
+          hasEmailPassword: Boolean(accountRow[13]),
           createdAt: accountRow[10],
           updatedAt: accountRow[11]
         }
@@ -602,6 +653,11 @@ router.post('/', apiKeyAuth, async (req, res) => {
     saveDatabase()
 
     const { account: syncedAccount, syncResult, removedUsers } = await syncAccountAndCleanup(result.account)
+    const responseAccount = {
+      ...(syncedAccount || result.account),
+      hasGptPassword: Boolean(result.account?.hasGptPassword),
+      hasEmailPassword: Boolean(result.account?.hasEmailPassword)
+    }
     const createdCount = result.codeCreation.generatedCodes.length
     const message = result.action === 'created'
       ? '自动上车成功！账号已添加到系统'
@@ -611,7 +667,7 @@ router.post('/', apiKeyAuth, async (req, res) => {
       success: true,
       message,
       action: result.action,
-      account: syncedAccount,
+      account: responseAccount,
       generatedCodes: result.codeCreation.generatedCodes,
       generatedCodesByChannel: result.codeCreation.generatedCodesByChannel,
       generatedCodesCount: createdCount,

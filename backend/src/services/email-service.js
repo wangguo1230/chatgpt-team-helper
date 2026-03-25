@@ -974,3 +974,97 @@ export async function sendAlipayRedpackOrderReturnedEmail({ to, orderId, reason 
     return false
   }
 }
+
+export async function sendAlipayRedpackMotherDeliveryEmail({ to, orderId, productName, accounts = [] } = {}) {
+  const settings = await getSmtpSettings()
+  const smtpConfig = buildSmtpConfig(settings)
+  if (!smtpConfig) {
+    console.warn('[AlipayRedpackMotherEmail] SMTP 配置不完整，跳过发送母号交付邮件')
+    return false
+  }
+
+  const recipient = String(to || '').trim()
+  if (!recipient) {
+    console.warn('[AlipayRedpackMotherEmail] 缺少收件邮箱，跳过发送母号交付邮件')
+    return false
+  }
+
+  const normalizedAccounts = Array.isArray(accounts)
+    ? accounts
+      .map((item) => ({
+        email: String(item?.email || '').trim().toLowerCase(),
+        gptPassword: String(item?.gptPassword || '').trim(),
+        emailPassword: String(item?.emailPassword || '').trim(),
+      }))
+      .filter(item => item.email)
+    : []
+
+  if (!normalizedAccounts.length) {
+    console.warn('[AlipayRedpackMotherEmail] 缺少可交付母号，跳过发送母号交付邮件')
+    return false
+  }
+
+  const subject = String(
+    process.env.ALIPAY_REDPACK_MOTHER_DELIVERY_SUBJECT || 'GPT 母号交付通知'
+  ).trim() || 'GPT 母号交付通知'
+  const orderLabel = Number(orderId || 0) > 0 ? `#${Math.floor(Number(orderId))}` : '-'
+  const productLabel = String(productName || '').trim() || 'GPT 母号'
+
+  const accountLines = normalizedAccounts.map((item, index) => {
+    return [
+      `${index + 1}. 账号邮箱：${item.email}`,
+      `   GPT 密码：${item.gptPassword || '(未配置)'}`,
+      `   邮箱密码：${item.emailPassword || '(未配置)'}`,
+    ].join('\n')
+  })
+
+  const text = [
+    '您的 GPT 母号订单已完成交付，账号信息如下：',
+    `订单ID：${orderLabel}`,
+    `商品：${productLabel}`,
+    '',
+    ...accountLines,
+    '',
+    '请妥善保存以上凭据，避免泄露。',
+  ].join('\n')
+
+  const accountHtml = normalizedAccounts.map((item, index) => `
+    <div style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin-bottom:10px;background:#f9fafb;">
+      <p style="margin:0 0 6px;"><strong>${index + 1}. 账号邮箱：</strong>${escapeHtml(item.email)}</p>
+      <p style="margin:0 0 6px;"><strong>GPT 密码：</strong>${escapeHtml(item.gptPassword || '(未配置)')}</p>
+      <p style="margin:0;"><strong>邮箱密码：</strong>${escapeHtml(item.emailPassword || '(未配置)')}</p>
+    </div>
+  `).join('\n')
+
+  const html = `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; line-height: 1.7;">
+      <h2 style="margin: 0 0 12px;">GPT 母号交付通知</h2>
+      <p style="margin: 0 0 8px;">您的 GPT 母号订单已完成交付，账号信息如下：</p>
+      <p style="margin: 0 0 6px;">订单ID：<strong>${escapeHtml(orderLabel)}</strong></p>
+      <p style="margin: 0 0 12px;">商品：${escapeHtml(productLabel)}</p>
+      ${accountHtml}
+      <p style="margin: 12px 0 0;color:#374151;">请妥善保存以上凭据，避免泄露。</p>
+    </div>
+  `
+
+  const from = String(settings?.smtp?.from || '').trim() || smtpConfig.auth.user
+  const transporter = nodemailer.createTransport(smtpConfig)
+  try {
+    await transporter.sendMail({
+      from,
+      to: recipient,
+      subject,
+      text,
+      html,
+    })
+    console.log('[AlipayRedpackMotherEmail] 母号交付邮件已发送', {
+      to: recipient,
+      orderId: orderLabel,
+      accountCount: normalizedAccounts.length,
+    })
+    return true
+  } catch (error) {
+    console.warn('[AlipayRedpackMotherEmail] 母号交付邮件发送失败', error?.message || error)
+    return false
+  }
+}

@@ -17,16 +17,16 @@ const toTriad = (total, today, yesterday) => ({
 })
 
 const buildNormalizedDateExpr = (columnName) => `
-  COALESCE(
-    DATE(${columnName}),
-    DATE(REPLACE(TRIM(COALESCE(${columnName}, '')), '/', '-')),
-    CASE
-      WHEN TRIM(COALESCE(${columnName}, '')) GLOB '[0-9]*'
-        AND LENGTH(TRIM(COALESCE(${columnName}, ''))) >= 10
-      THEN DATE(CAST(TRIM(COALESCE(${columnName}, '')) AS INTEGER), 'unixepoch', 'localtime')
-      ELSE NULL
-    END
-  )
+  CASE
+    WHEN TRIM(COALESCE(${columnName}, '')) != ''
+      AND TRIM(COALESCE(${columnName}, '')) NOT GLOB '*[^0-9]*'
+      AND LENGTH(TRIM(COALESCE(${columnName}, ''))) >= 10
+    THEN DATE(CAST(TRIM(COALESCE(${columnName}, '')) AS INTEGER), 'unixepoch')
+    ELSE COALESCE(
+      DATE(${columnName}),
+      DATE(REPLACE(TRIM(COALESCE(${columnName}, '')), '/', '-'))
+    )
+  END
 `
 
 const queryOrderStats = (db) => {

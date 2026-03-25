@@ -56,6 +56,8 @@ API Key 的读取优先级：
 | `chatgptAccountId` | 否 | string | ChatGPT account id（用于优先匹配已有账号） |
 | `oaiDeviceId` | 否 | string | `oai-did` |
 | `expireAt` | 否 | string/number | 过期时间：支持 `YYYY/MM/DD HH:mm`、`YYYY-MM-DD HH:mm`、毫秒时间戳 |
+| `gptPassword` / `gpt_password` | 否 | string | GPT 密码（明文传入，后端加密存储；传空字符串可清空） |
+| `emailPassword` / `email_password` | 否 | string | 邮箱密码（明文传入，后端加密存储；传空字符串可清空） |
 | `isOpen` / `is_open` | 否 | boolean/number/string | 是否设为开放账号；默认 `true`（`1/true/yes` 为开，`0/false/no` 为关） |
 | `codePlans` / `code_plans` | 否 | array | 按渠道批量建码计划（见下方） |
 | `channel` / `channelKey` / `channel_key` | 否 | string | 单渠道建码简写；当未传 `codePlans` 时生效 |
@@ -86,6 +88,7 @@ API Key 的读取优先级：
 - `expireAt`：如果未显式传入，后端会尝试从 `token` 的 JWT `exp` 字段推导并写入。
 - `isOpen`：默认 `true`；如账号已封号且请求要设为开放，会返回 `400`。
 - 账号封号时不允许通过该接口创建兑换码。
+- `gptPassword` / `emailPassword`：仅写入密文，不会在对外 API 响应中回传明文。
 - `codePlans`：可一次请求按多渠道创建兑换码；不传则只创建/更新账号，不自动建码。
 - `channel`：若未传 `codePlans`，可使用单渠道简写参数创建兑换码（底层会转换为单条 `codePlans`）。
 - 容量上限读取优先级：`system_config.open_accounts_capacity_limit` > `OPEN_ACCOUNTS_CAPACITY_LIMIT`（`.env`）> 默认 `5`。
@@ -194,7 +197,9 @@ curl -X POST "https://<host>/api/auto-boarding" \
     "chatgptAccountId": "acct_xxx",
     "oaiDeviceId": "oai-did-xxx",
     "expireAt": "2026/03/23 11:27",
-    "isOpen": true
+    "isOpen": true,
+    "hasGptPassword": true,
+    "hasEmailPassword": true
   },
   "generatedCodesCount": 2,
   "capacityLimit": 5,

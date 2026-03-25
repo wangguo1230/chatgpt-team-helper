@@ -96,6 +96,7 @@
                   状态：{{ statusText(item.status) }}
                   <span v-if="!isOrderSelectable(item)" class="text-rose-600">（不可补录）</span>
                 </p>
+                <p>商品类型：{{ productTypeText(item.productType) }}（数量 {{ resolveOrderQuantity(item) }}）</p>
                 <p>质保天数：{{ formatWarrantyDays(item.warrantyDays) }}</p>
                 <p>
                   质保：
@@ -208,7 +209,19 @@ const statusText = (status?: string) => {
   if (status === 'returned') return '已退回'
   return status || '-'
 }
+const productTypeText = (productType?: string) => {
+  const normalized = String(productType || '').trim().toLowerCase()
+  if (normalized === 'gpt_parent') return 'GPT 母号'
+  return 'GPT 单号'
+}
+const resolveOrderQuantity = (item?: AlipayRedpackSupplementCandidateOrder | null) => {
+  const parsed = Number(item?.quantity || 1)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1
+}
 const isOrderSelectable = (item?: AlipayRedpackSupplementCandidateOrder | null) => {
+  if (!item) return false
+  if (item.supplementSelectable != null) return Boolean(item.supplementSelectable)
+  if (item.supplementSupported != null && !item.supplementSupported) return false
   const status = String(item?.status || '').trim().toLowerCase()
   return status === 'redeemed' && Boolean(item?.withinWarranty)
 }
